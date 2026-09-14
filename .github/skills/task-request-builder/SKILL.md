@@ -15,6 +15,12 @@ metadata:
 
 Use when a reviewed request is needed without creating task state.
 
+## Prerequisite
+
+```powershell
+./scripts/Restore-TaskScaffoldDependencies.ps1
+```
+
 ## Run
 
 ```powershell

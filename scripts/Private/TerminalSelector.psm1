@@ -1,16 +1,34 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-TaskScaffoldDependencyPath {
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        throw 'Terminal.Gui dependencies are missing; add dotnet to PATH and run ./scripts/Restore-TaskScaffoldDependencies.ps1'
+    }
+    $packageRoot = ((& dotnet nuget locals global-packages --list) -replace '^global-packages:\s*', '').Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($packageRoot)) {
+        throw 'cannot locate the NuGet package cache; run ./scripts/Restore-TaskScaffoldDependencies.ps1'
+    }
+    $path = Join-Path $packageRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Terminal.Gui dependencies are missing; run ./scripts/Restore-TaskScaffoldDependencies.ps1"
+    }
+    return $path
+}
+
 function Initialize-TerminalGui {
-    $dependencyRoot = Join-Path $PSScriptRoot '../../lib/Terminal.Gui/1.17.1'
+    $nstack = Get-TaskScaffoldDependencyPath -RelativePath 'nstack.core/1.1.1/lib/netstandard2.0/NStack.dll'
+    $terminalGui = Get-TaskScaffoldDependencyPath -RelativePath 'terminal.gui/1.17.1/lib/net8.0/Terminal.Gui.dll'
     if (-not ('Terminal.Gui.Application' -as [type])) {
-        Add-Type -Path (Join-Path $dependencyRoot 'NStack.dll')
-        Add-Type -Path (Join-Path $dependencyRoot 'Terminal.Gui.dll')
+        Add-Type -Path $nstack
+        Add-Type -Path $terminalGui
     }
     if ('TaskScaffold.RepositoryPicker' -as [type]) {
         return
     }
-    Add-Type -ReferencedAssemblies (Join-Path $dependencyRoot 'Terminal.Gui.dll'), (Join-Path $dependencyRoot 'NStack.dll'), ([System.Linq.Enumerable].Assembly.Location), ([System.Runtime.GCSettings].Assembly.Location), ([System.Console].Assembly.Location) -TypeDefinition @'
+    Add-Type -ReferencedAssemblies $terminalGui, $nstack, ([System.Linq.Enumerable].Assembly.Location), ([System.Runtime.GCSettings].Assembly.Location), ([System.Console].Assembly.Location) -TypeDefinition @'
 using System;
 using System.Linq;
 using Terminal.Gui;

@@ -15,6 +15,12 @@ metadata:
 
 Use for a new local multi-repository task.
 
+## Prerequisite
+
+```powershell
+./scripts/Restore-TaskScaffoldDependencies.ps1
+```
+
 ## Run
 
 ```powershell

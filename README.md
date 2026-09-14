@@ -48,10 +48,13 @@ Run the full terminal wizard from PowerShell. In the repository picker, use **Up
 ./scripts/Start-TaskScaffold.ps1 -WorkspaceRoot C:/work/product
 ```
 
-`Terminal.Gui` 1.17.1 and NStack.Core 1.1.1 are bundled as MIT-licensed dependencies under `lib/Terminal.Gui/1.17.1/`.
+`Terminal.Gui` 1.17.1 and its `NStack.Core` 1.1.1 dependency are restored from NuGet using the committed `packages.lock.json`; DLLs are not committed.
 
-The repository is local-only; it intentionally has no remote. Run the offline suite with:
+Restore the exact locked dependencies before using the picker or running its tests:
 
 ```powershell
+./scripts/Restore-TaskScaffoldDependencies.ps1
 pwsh -NoProfile -Command "Invoke-Pester -Path ./tests -Output Detailed"
 ```
+
+The repository is local-only; it intentionally has no remote.
