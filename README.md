@@ -21,6 +21,7 @@ Local-first PowerShell tooling for deterministic multi-repository task workspace
 
 ## Commands
 
+- `scripts/Start-TaskScaffold.ps1` — terminal wizard: requires a ready PRD, lets you navigate and check canon repositories, previews the request and worktree plan, then separately confirms scaffold/PRD-copy apply.
 - `scripts/Invoke-TaskRequestBuilder.ps1` — interactively suggests configured `canons/` repositories, shows the full request, and writes `task-request.json` only after confirmation; it never applies task state.
 - `scripts/Invoke-TaskScaffold.ps1` — validate a request, produce a deterministic plan, then create/reuse task state and worktrees only with `-Apply`.
 - `scripts/Invoke-TaskTeardown.ps1` — plan or, only with `-Apply`, remove clean registered task worktrees and their task directory; it leaves branches and canons intact.
@@ -41,11 +42,13 @@ Place `task-scaffold.settings.json` at the workspace root. Only canon directorie
 }
 ```
 
-Run the builder from PowerShell, review the printed JSON, and answer `y` to write it. It creates no task directory or worktree:
+Run the full terminal wizard from PowerShell. In the repository picker, use **Up/Down** to navigate, **Space** to check/uncheck, then **Enter** to continue. It verifies the PRD is ready, shows the request and scaffold plan, and asks once more before it copies `PRD.md` and creates task/worktree state:
 
 ```powershell
-./scripts/Invoke-TaskRequestBuilder.ps1 -WorkspaceRoot C:/work/product
+./scripts/Start-TaskScaffold.ps1 -WorkspaceRoot C:/work/product
 ```
+
+`Terminal.Gui` 1.17.1 and NStack.Core 1.1.1 are bundled as MIT-licensed dependencies under `lib/Terminal.Gui/1.17.1/`.
 
 The repository is local-only; it intentionally has no remote. Run the offline suite with:
 

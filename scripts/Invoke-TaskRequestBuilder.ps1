@@ -2,11 +2,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$WorkspaceRoot,
-    [string]$OutputPath
+    [string]$OutputPath,
+    [string[]]$RepositoryNames
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot 'Private/TerminalSelector.psm1') -Force
 
 $workspaceRootPath = (Resolve-Path -LiteralPath $WorkspaceRoot -ErrorAction Stop).Path
 $settingsPath = Join-Path $workspaceRootPath 'task-scaffold.settings.json'
@@ -37,18 +40,14 @@ if ($available.Count -eq 0) {
     throw "no configured canons found under '$canonsPath'"
 }
 
-Write-Host "Configured canons: $($available.Name -join ', ')"
+Write-Host 'Choose repositories:'
 $key = Read-Host 'Task key'
 if ($key -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
     throw "invalid task key '$key'"
 }
 $title = Read-Host 'Task title'
 $prdPath = Read-Host 'PRD path'
-$selectedNames = @(
-    (Read-Host 'Repositories (comma-separated)') -split ',' |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ }
-)
+$selectedNames = @(if (@($RepositoryNames).Count -gt 0) { $RepositoryNames } else { Select-TaskRepositories -Names @($available.Name) })
 if ($selectedNames.Count -eq 0) {
     throw 'select at least one configured canon'
 }
@@ -56,7 +55,7 @@ $unknown = @($selectedNames | Where-Object { $_ -notin $available.Name })
 if ($unknown.Count -gt 0) {
     throw "unknown configured canon '$($unknown -join ', ')}'"
 }
-if (($selectedNames | Select-Object -Unique).Count -ne $selectedNames.Count) {
+if (@($selectedNames | Select-Object -Unique).Count -ne $selectedNames.Count) {
     throw 'duplicate repository selection'
 }
 

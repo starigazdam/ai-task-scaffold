@@ -9,6 +9,12 @@ user-invocable: true
 
 ## Outcome
 
+`Start-TaskScaffold.ps1` is the interactive entry point. It first confirms that a PRD is ready, then uses a keyboard-navigable Terminal.Gui checklist for configured canons (Up/Down, Space, Enter). It writes and displays the request, displays the plan, and asks before it applies the scaffold or copies `PRD.md`.
+
+```powershell
+./scripts/Start-TaskScaffold.ps1 -WorkspaceRoot C:/work/product
+```
+
 `Invoke-TaskScaffold.ps1` is the generic, project-agnostic entry point. It reads an explicit
 `task-request.json`, plans local Git worktrees, and optionally creates only local task/worktree
 state. It never calls external services, pushes, creates pull requests, or edits a VS Code workspace.

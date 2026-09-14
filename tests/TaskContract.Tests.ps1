@@ -76,7 +76,7 @@ Describe 'Invoke-TaskRequestBuilder' {
 }
 '@ | Set-Content -LiteralPath (Join-Path $workspaceRoot 'task-scaffold.settings.json') -NoNewline
         $outputPath = Join-Path $workspaceRoot 'task-request.json'
-        $global:taskRequestBuilderAnswers = @('FEATURE-123', 'Add endpoint', $prdPath, 'api, web', 'y')
+        $global:taskRequestBuilderAnswers = @('FEATURE-123', 'Add endpoint', $prdPath, 'y')
         Mock Read-Host {
             $answer = $global:taskRequestBuilderAnswers[0]
             $global:taskRequestBuilderAnswers = @($global:taskRequestBuilderAnswers | Select-Object -Skip 1)
@@ -84,7 +84,7 @@ Describe 'Invoke-TaskRequestBuilder' {
         }
 
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskRequestBuilder.ps1'
-        & $script -WorkspaceRoot $workspaceRoot -OutputPath $outputPath | Out-Null
+        & $script -WorkspaceRoot $workspaceRoot -OutputPath $outputPath -RepositoryNames api, web | Out-Null
         $request = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
 
         $request.task.key | Should -Be 'FEATURE-123'
