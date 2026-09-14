@@ -2,7 +2,6 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$RequestPath,
-    [Parameter(Mandatory)][string]$WorkspaceRoot,
     [Parameter(Mandatory)][string]$TasksRoot,
     [switch]$Apply
 )
@@ -16,7 +15,7 @@ Import-Module (Join-Path $PSScriptRoot 'Private/GitWorktree.psm1') -Force
 $request = ConvertTo-TaskRequest -Path $RequestPath
 $worktreeOperations = @($request.Repositories |
     Sort-Object Name |
-    ForEach-Object { New-TaskWorktreePlan -Repository $_ -TaskKey $request.Task.Key -WorkspaceRoot $WorkspaceRoot })
+    ForEach-Object { New-TaskWorktreePlan -Repository $_ -TaskKey $request.Task.Key -TasksRoot $TasksRoot })
 $workspaceFolderPlan = $null
 if ($request.Workspace) {
     $folders = @($worktreeOperations |

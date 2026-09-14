@@ -21,7 +21,7 @@ function New-TaskWorktreePlan {
     param(
         [Parameter(Mandatory)][psobject]$Repository,
         [Parameter(Mandatory)][string]$TaskKey,
-        [Parameter(Mandatory)][string]$WorkspaceRoot
+        [Parameter(Mandatory)][string]$TasksRoot
     )
 
     & git -C $Repository.Path rev-parse --is-inside-work-tree 2>$null | Out-Null
@@ -29,7 +29,7 @@ function New-TaskWorktreePlan {
         throw "repository '$($Repository.Name)' is not a Git worktree"
     }
 
-    $destination = Join-Path $WorkspaceRoot (Join-Path (Join-Path 'worktrees' $TaskKey) $Repository.Name)
+    $destination = Join-Path $TasksRoot (Join-Path (Join-Path $TaskKey 'worktrees') $Repository.Name)
     if (Test-Path -LiteralPath $destination) {
         $repositoryCommonDir = Get-GitCommonDir -RepositoryPath $Repository.Path
         $destinationCommonDir = Get-GitCommonDir -RepositoryPath $destination

@@ -37,7 +37,7 @@ Every repository supplies its own branch; there is no global task branch.
 
    ```powershell
    $plan = ./scripts/Invoke-TaskScaffold.ps1 `
-     -RequestPath ./task-request.json -WorkspaceRoot ./work -TasksRoot ./tasks | ConvertFrom-Json
+     -RequestPath ./task-request.json -TasksRoot ./tasks | ConvertFrom-Json
    $plan | ConvertTo-Json -Depth 8
    ```
 
@@ -46,7 +46,7 @@ Every repository supplies its own branch; there is no global task branch.
 
    ```powershell
    ./scripts/Invoke-TaskScaffold.ps1 `
-     -RequestPath ./task-request.json -WorkspaceRoot ./work -TasksRoot ./tasks -Apply
+     -RequestPath ./task-request.json -TasksRoot ./tasks -Apply
    ```
 
 5. When the request includes `workspace.file`, review `WorkspaceFolderPlan`. It is an add-only
@@ -55,7 +55,7 @@ Every repository supplies its own branch; there is no global task branch.
 
    ```powershell
    $folders = @(
-     [ordered]@{ path = './work/worktrees/FEATURE-123/api'; name = '🔧 worktree: FEATURE-123 api' }
+     [ordered]@{ path = './tasks/FEATURE-123/worktrees/api'; name = '🔧 worktree: FEATURE-123 api' }
    ) | ConvertTo-Json -Compress
    ./scripts/Update-WorkspaceFolders.ps1 `
      -WorkspaceFile ./work/product.code-workspace -FoldersJson $folders -Apply `

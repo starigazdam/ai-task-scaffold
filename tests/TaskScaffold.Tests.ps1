@@ -23,13 +23,13 @@ Describe 'Invoke-TaskScaffold' {
         $workspaceRoot = Join-Path $TestDrive 'workspace'
         $tasksRoot = Join-Path $TestDrive 'tasks'
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
-        $plan = & $script -RequestPath $requestPath -WorkspaceRoot $workspaceRoot -TasksRoot $tasksRoot | ConvertFrom-Json
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
 
         $plan.TaskKey | Should -Be 'FEATURE-123'
         $plan.WorktreeOperations.Count | Should -Be 1
         $plan.WorktreeOperations[0].Action | Should -Be 'create-local'
         Test-Path -LiteralPath $tasksRoot | Should -BeFalse
-        Test-Path -LiteralPath (Join-Path $workspaceRoot 'worktrees/FEATURE-123/api') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
     }
 
     It 'applies the task skeleton and planned worktree after explicit confirmation' {
@@ -58,7 +58,7 @@ Describe 'Invoke-TaskScaffold' {
         $workspaceRoot = Join-Path $TestDrive 'workspace-apply'
         $tasksRoot = Join-Path $TestDrive 'tasks-apply'
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
-        & $script -RequestPath $requestPath -WorkspaceRoot $workspaceRoot -TasksRoot $tasksRoot -Apply | Out-Null
+        & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply | Out-Null
 
         $taskPath = Join-Path $tasksRoot 'FEATURE-123'
         (Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw) | Should -Be "# Add endpoint`n"
@@ -66,7 +66,7 @@ Describe 'Invoke-TaskScaffold' {
         Test-Path -LiteralPath (Join-Path $taskPath 'STATUS.md') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $taskPath 'task.json') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $taskPath 'artifacts') | Should -BeTrue
-        (& git -C (Join-Path $workspaceRoot 'worktrees/FEATURE-123/api') branch --show-current) | Should -Be 'feature/FEATURE-123'
+        (& git -C (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') branch --show-current) | Should -Be 'feature/FEATURE-123'
     }
 
     It 'only proposes workspace folders until the dedicated workspace script applies them' {
@@ -99,14 +99,14 @@ Describe 'Invoke-TaskScaffold' {
         $tasksRoot = Join-Path $TestDrive 'workspace-tasks'
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
         $before = Get-Content -LiteralPath $workspaceFile -Raw
-        $plan = & $script -RequestPath $requestPath -WorkspaceRoot $workspaceRoot -TasksRoot $tasksRoot | ConvertFrom-Json
-        & $script -RequestPath $requestPath -WorkspaceRoot $workspaceRoot -TasksRoot $tasksRoot -Apply | Out-Null
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply | Out-Null
 
         $plan.WorkspaceFolderPlan.Action | Should -Be 'add'
         $plan.WorkspaceFolderPlan.RequiresConfirmation | Should -BeTrue
         (Get-Content -LiteralPath $workspaceFile -Raw) | Should -Be $before
 
-        $foldersJson = @([ordered]@{ path = (Join-Path $workspaceRoot 'worktrees/FEATURE-123/api'); name = '🔧 worktree: FEATURE-123 api' }) | ConvertTo-Json -Compress
+        $foldersJson = @([ordered]@{ path = (Join-Path $tasksRoot 'FEATURE-123/worktrees/api'); name = '🔧 worktree: FEATURE-123 api' }) | ConvertTo-Json -Compress
         $workspaceScript = Join-Path $PSScriptRoot '../scripts/Update-WorkspaceFolders.ps1'
         & $workspaceScript -WorkspaceFile $workspaceFile -FoldersJson $foldersJson -Apply -ExpectedSha256 $plan.WorkspaceFolderPlan.OriginalSha256 | Out-Null
         (Get-Content -LiteralPath $workspaceFile -Raw) | Should -Be $plan.WorkspaceFolderPlan.ProposedContent
@@ -140,7 +140,7 @@ Describe 'Invoke-TaskScaffold' {
 "@ | Set-Content -LiteralPath $requestPath -NoNewline
 
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
-        { & $script -RequestPath $requestPath -WorkspaceRoot (Join-Path $TestDrive 'workspace-collision') -TasksRoot $tasksRoot -Apply } | Should -Throw '*different PRD.md*'
-        Test-Path -LiteralPath (Join-Path $TestDrive 'workspace-collision/worktrees/FEATURE-123/api') | Should -BeFalse
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply } | Should -Throw '*different PRD.md*'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
     }
 }

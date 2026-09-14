@@ -22,10 +22,10 @@ Describe 'New-TaskWorktreePlan' {
             Branch = 'feature/FEATURE-123'
         }
 
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -WorkspaceRoot $workspaceRoot
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $workspaceRoot
 
         $plan.Action | Should -Be 'create-local'
-        $plan.Destination | Should -Be (Join-Path $workspaceRoot 'worktrees/FEATURE-123/api')
+        $plan.Destination | Should -Be (Join-Path $workspaceRoot 'FEATURE-123/worktrees/api')
         Test-Path -LiteralPath $plan.Destination | Should -BeFalse
         (& git -C $repositoryPath branch --format '%(refname:short)') | Should -Not -Contain 'feature/FEATURE-123'
     }
@@ -42,7 +42,7 @@ Describe 'New-TaskWorktreePlan' {
         & git -C $repositoryPath branch feature/FEATURE-123
 
         $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -WorkspaceRoot (Join-Path $TestDrive 'workspace')
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace')
 
         $plan.Action | Should -Be 'create-local'
         $plan.Source | Should -Be 'feature/FEATURE-123'
@@ -60,11 +60,11 @@ Describe 'New-TaskWorktreePlan' {
         & git -C $repositoryPath commit -m fixture | Out-Null
 
         $workspaceRoot = Join-Path $TestDrive 'workspace'
-        $destination = Join-Path $workspaceRoot 'worktrees/FEATURE-123/api'
+        $destination = Join-Path $workspaceRoot 'FEATURE-123/worktrees/api'
         New-Item -ItemType Directory -Path $destination -Force | Out-Null
         $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
 
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -WorkspaceRoot $workspaceRoot
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $workspaceRoot
 
         $plan.Action | Should -Be 'blocked'
         $plan.Reason | Should -Be 'destination-exists'
@@ -90,7 +90,7 @@ Describe 'New-TaskWorktreePlan' {
         & git -C $repositoryPath checkout main | Out-Null
 
         $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'origin/main'; Branch = 'feature/FEATURE-123' }
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -WorkspaceRoot (Join-Path $TestDrive 'workspace-origin')
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-origin')
 
         $plan.Action | Should -Be 'create-local'
         $plan.Source | Should -Be 'origin/main'
@@ -110,7 +110,7 @@ Describe 'Invoke-TaskWorktreePlan' {
         & git -C $repositoryPath commit -m fixture | Out-Null
 
         $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -WorkspaceRoot (Join-Path $TestDrive 'workspace')
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace')
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
@@ -130,10 +130,10 @@ Describe 'Invoke-TaskWorktreePlan' {
         & git -C $repositoryPath commit -m fixture | Out-Null
 
         $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $initialPlan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -WorkspaceRoot (Join-Path $TestDrive 'workspace-reuse')
+        $initialPlan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-reuse')
         Invoke-TaskWorktreePlan -Repository $repository -Plan $initialPlan
 
-        $repeatPlan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -WorkspaceRoot (Join-Path $TestDrive 'workspace-reuse')
+        $repeatPlan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-reuse')
         Invoke-TaskWorktreePlan -Repository $repository -Plan $repeatPlan
 
         $repeatPlan.Action | Should -Be 'reuse'
