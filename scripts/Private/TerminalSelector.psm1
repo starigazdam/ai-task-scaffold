@@ -17,6 +17,19 @@ using Terminal.Gui;
 
 namespace TaskScaffold {
     public static class RepositoryPicker {
+        public static string[] SelectForKeys(string[] names, ConsoleKey[] keys) {
+            var marked = new bool[names.Length];
+            var highlighted = 0;
+            foreach (var key in keys) {
+                if (key == ConsoleKey.DownArrow && highlighted < names.Length - 1) highlighted++;
+                else if (key == ConsoleKey.UpArrow && highlighted > 0) highlighted--;
+                else if (key == ConsoleKey.Spacebar) marked[highlighted] = !marked[highlighted];
+                else if (key == ConsoleKey.Enter) return names.Where((name, index) => marked[index]).ToArray();
+                else if (key == ConsoleKey.Escape) return Array.Empty<string>();
+            }
+            return Array.Empty<string>();
+        }
+
         public static string[] Select(string[] names) {
             Application.Init();
             var selected = Array.Empty<string>();

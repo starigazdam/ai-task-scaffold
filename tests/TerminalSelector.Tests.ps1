@@ -1,10 +1,14 @@
 Describe 'TerminalSelector' {
-    It 'loads the bundled Terminal.Gui repository picker' {
+    It 'selects the highlighted repository after Down, Space, Enter' {
         $module = Join-Path $PSScriptRoot '../scripts/Private/TerminalSelector.psm1'
         Import-Module $module -Force
-
         Initialize-TerminalGui
 
-        ('TaskScaffold.RepositoryPicker' -as [type]).FullName | Should -Be 'TaskScaffold.RepositoryPicker'
+        $selected = [TaskScaffold.RepositoryPicker]::SelectForKeys(
+            [string[]]@('api', 'web'),
+            [ConsoleKey[]]@([ConsoleKey]::DownArrow, [ConsoleKey]::Spacebar, [ConsoleKey]::Enter)
+        )
+
+        $selected | Should -Be @('web')
     }
 }
