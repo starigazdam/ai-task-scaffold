@@ -27,6 +27,16 @@ if ($request.Workspace) {
     }
 }
 $taskPath = Join-Path $TasksRoot $request.Task.Key
+$taskExists = Test-Path -LiteralPath $taskPath
+$manifestPath = Join-Path $taskPath 'task.json'
+$expectedRepositories = @($request.Repositories | Sort-Object Name | ForEach-Object {
+    [ordered]@{ name = $_.Name; path = $_.Path; branch = $_.Branch; baseBranch = $_.BaseBranch }
+})
+$expectedContract = [ordered]@{
+    schemaVersion = 1
+    task = [ordered]@{ key = $request.Task.Key; title = $request.Task.Title; prdPath = 'PRD.md' }
+    repositories = $expectedRepositories
+}
 
 if ($Apply) {
     if (-not (Test-Path -LiteralPath $request.Task.PrdPath -PathType Leaf)) {
@@ -37,8 +47,29 @@ if ($Apply) {
         throw "cannot apply blocked worktree plan for '$($blockedOperation.Repository)': $($blockedOperation.Reason)"
     }
 
+    if ($taskExists) {
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "existing task '$($request.Task.Key)' has no task.json"
+        }
+        $existingManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 6
+        $existingContract = [ordered]@{
+            schemaVersion = [int]$existingManifest.schemaVersion
+            task = [ordered]@{
+                key = [string]$existingManifest.task.key
+                title = [string]$existingManifest.task.title
+                prdPath = [string]$existingManifest.task.prdPath
+            }
+            repositories = @($existingManifest.repositories | Sort-Object name | ForEach-Object {
+                [ordered]@{ name = [string]$_.name; path = [string]$_.path; branch = [string]$_.branch; baseBranch = [string]$_.baseBranch }
+            })
+        }
+        if (($existingContract | ConvertTo-Json -Depth 6 -Compress) -ne ($expectedContract | ConvertTo-Json -Depth 6 -Compress)) {
+            throw "existing task '$($request.Task.Key)' manifest differs from the request"
+        }
+    }
+
     $prdDestination = Join-Path $taskPath 'PRD.md'
-    if (Test-Path -LiteralPath $taskPath) {
+    if ($taskExists) {
         if (-not (Test-Path -LiteralPath $prdDestination -PathType Leaf)) {
             throw "existing task '$($request.Task.Key)' has no PRD.md"
         }
@@ -75,12 +106,11 @@ phases:
 "@ | Set-Content -LiteralPath $statusPath -NoNewline
     }
 
-    $manifestPath = Join-Path $taskPath 'task.json'
     if (-not (Test-Path -LiteralPath $manifestPath)) {
         [ordered]@{
-            schemaVersion = 1
-            task = [ordered]@{ key = $request.Task.Key; title = $request.Task.Title; prdPath = 'PRD.md' }
-            repositories = @($request.Repositories | ForEach-Object { [ordered]@{ name = $_.Name; branch = $_.Branch; baseBranch = $_.BaseBranch } })
+            schemaVersion = $expectedContract.schemaVersion
+            task = $expectedContract.task
+            repositories = $expectedContract.repositories
             phases = @()
         } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
     }
@@ -92,7 +122,7 @@ phases:
 
 [ordered]@{
     TaskKey = $request.Task.Key
-    TaskOperation = if (Test-Path -LiteralPath $taskPath) { 'reuse' } else { 'create' }
+    TaskOperation = if ($taskExists) { 'reuse' } else { 'create' }
     WorktreeOperations = $worktreeOperations
     WorkspaceFolderPlan = $workspaceFolderPlan
     RequiresConfirmation = $true

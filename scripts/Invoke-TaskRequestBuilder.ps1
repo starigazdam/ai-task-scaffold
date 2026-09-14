@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'Private/TerminalSelector.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Private/TaskContract.psm1') -Force
 
 $workspaceRootPath = (Resolve-Path -LiteralPath $WorkspaceRoot -ErrorAction Stop).Path
 $settingsPath = Join-Path $workspaceRootPath 'task-scaffold.settings.json'
@@ -61,16 +62,23 @@ if (@($selectedNames | Select-Object -Unique).Count -ne $selectedNames.Count) {
 
 $repositories = @($selectedNames | Sort-Object | ForEach-Object {
     $name = $_
+    if (-not (Test-TaskRepositoryName -Name $name)) {
+        throw "invalid repository name '$name'"
+    }
     $configuration = $settings.repositories.$name
     $baseBranch = [string]$configuration.baseBranch
-    if ([string]::IsNullOrWhiteSpace($baseBranch)) {
-        throw "configured canon '$name' has no baseBranch"
+    if (-not (Test-GitBranchName -Name $baseBranch)) {
+        throw "configured canon '$name' has invalid baseBranch '$baseBranch'"
+    }
+    $branch = "feature/$key"
+    if (-not (Test-GitBranchName -Name $branch)) {
+        throw "task key '$key' produces invalid Git branch '$branch'"
     }
     [ordered]@{
         name = $name
         path = Join-Path $canonsPath $name
         baseBranch = $baseBranch
-        branch = "feature/$key"
+        branch = $branch
     }
 })
 $request = [ordered]@{

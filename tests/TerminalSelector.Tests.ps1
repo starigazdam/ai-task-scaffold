@@ -4,7 +4,7 @@ Describe 'TerminalSelector' {
         & $restore
 
         $packagesRoot = ((& dotnet nuget locals global-packages --list) -replace '^global-packages:\s*', '').Trim()
-        Test-Path (Join-Path $packagesRoot 'terminal.gui/1.17.1/lib/net8.0/Terminal.Gui.dll') | Should -BeTrue
+        Test-Path (Join-Path $packagesRoot 'terminal.gui/1.17.1/lib/netstandard2.0/Terminal.Gui.dll') | Should -BeTrue
         Test-Path (Join-Path $packagesRoot 'nstack.core/1.1.1/lib/netstandard2.0/NStack.dll') | Should -BeTrue
     }
 

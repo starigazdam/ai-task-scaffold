@@ -128,6 +128,16 @@ Describe 'Invoke-TaskScaffold' {
         $existingTask = Join-Path $tasksRoot 'FEATURE-123'
         New-Item -ItemType Directory -Path $existingTask -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $existingTask 'PRD.md') -Value '# Different PRD'
+        @"
+{
+  "schemaVersion": 1,
+  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "PRD.md" },
+  "repositories": [
+    { "name": "api", "path": "$repositoryPath", "baseBranch": "main", "branch": "feature/FEATURE-123" }
+  ],
+  "phases": []
+}
+"@ | Set-Content -LiteralPath (Join-Path $existingTask 'task.json') -NoNewline
         $requestPath = Join-Path $TestDrive 'collision-request.json'
         @"
 {
@@ -142,5 +152,34 @@ Describe 'Invoke-TaskScaffold' {
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply } | Should -Throw '*different PRD.md*'
         Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
+    }
+
+    It 'refuses an existing task whose manifest differs from the request' {
+        $repositoryPath = Join-Path $TestDrive 'api-manifest-collision'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $prdPath = Join-Path $TestDrive 'manifest-prd.md'
+        Set-Content -LiteralPath $prdPath -Value '# Same PRD'
+        $tasksRoot = Join-Path $TestDrive 'tasks-manifest-collision'
+        $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+        New-Item -ItemType Directory -Path $taskPath -Force | Out-Null
+        Copy-Item -LiteralPath $prdPath -Destination (Join-Path $taskPath 'PRD.md')
+        '{"schemaVersion":1,"task":{"key":"FEATURE-123","title":"Old title","prdPath":"PRD.md"},"repositories":[],"phases":[]}' | Set-Content -LiteralPath (Join-Path $taskPath 'task.json') -NoNewline
+        $requestPath = Join-Path $TestDrive 'manifest-collision-request.json'
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = $prdPath }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply } | Should -Throw '*manifest differs*'
+        Test-Path -LiteralPath (Join-Path $taskPath 'worktrees/api') | Should -BeFalse
     }
 }

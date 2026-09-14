@@ -55,6 +55,35 @@ Describe 'ConvertTo-TaskRequest' {
 
         { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid task key*'
     }
+    It 'rejects repository names that escape the worktrees directory' {
+        $requestPath = Join-Path $TestDrive 'unsafe-repository.json'
+        @'
+{
+  "schemaVersion": 1,
+  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "C:/input/FEATURE-123.md" },
+  "repositories": [
+    { "name": "../../outside", "path": "C:/work/canons/api", "baseBranch": "main", "branch": "feature/FEATURE-123" }
+  ]
+}
+'@ | Set-Content -LiteralPath $requestPath -NoNewline
+
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid repository name*'
+    }
+
+    It 'rejects invalid Git branch names' {
+        $requestPath = Join-Path $TestDrive 'unsafe-branch.json'
+        @'
+{
+  "schemaVersion": 1,
+  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "C:/input/FEATURE-123.md" },
+  "repositories": [
+    { "name": "api", "path": "C:/work/canons/api", "baseBranch": "main", "branch": "feature/a..b" }
+  ]
+}
+'@ | Set-Content -LiteralPath $requestPath -NoNewline
+
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid Git branch*'
+    }
 }
 
 Describe 'Invoke-TaskRequestBuilder' {

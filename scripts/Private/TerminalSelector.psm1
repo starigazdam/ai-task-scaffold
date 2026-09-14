@@ -20,7 +20,7 @@ function Get-TaskScaffoldDependencyPath {
 
 function Initialize-TerminalGui {
     $nstack = Get-TaskScaffoldDependencyPath -RelativePath 'nstack.core/1.1.1/lib/netstandard2.0/NStack.dll'
-    $terminalGui = Get-TaskScaffoldDependencyPath -RelativePath 'terminal.gui/1.17.1/lib/net8.0/Terminal.Gui.dll'
+    $terminalGui = Get-TaskScaffoldDependencyPath -RelativePath 'terminal.gui/1.17.1/lib/netstandard2.0/Terminal.Gui.dll'
     if (-not ('Terminal.Gui.Application' -as [type])) {
         Add-Type -Path $nstack
         Add-Type -Path $terminalGui
@@ -28,7 +28,7 @@ function Initialize-TerminalGui {
     if ('TaskScaffold.RepositoryPicker' -as [type]) {
         return
     }
-    Add-Type -ReferencedAssemblies $terminalGui, $nstack, ([System.Linq.Enumerable].Assembly.Location), ([System.Runtime.GCSettings].Assembly.Location), ([System.Console].Assembly.Location) -TypeDefinition @'
+    Add-Type -ReferencedAssemblies $terminalGui, $nstack, ([System.Linq.Enumerable].Assembly.Location), ([System.Runtime.GCSettings].Assembly.Location), ([System.Console].Assembly.Location), (Join-Path ([System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'netstandard.dll') -TypeDefinition @'
 using System;
 using System.Linq;
 using Terminal.Gui;

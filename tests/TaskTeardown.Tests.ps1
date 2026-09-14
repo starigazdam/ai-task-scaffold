@@ -14,7 +14,12 @@ Describe 'Invoke-TaskTeardown' {
         & git -C $script:repositoryPath commit -m fixture | Out-Null
 
         New-Item -ItemType Directory -Path (Join-Path $script:taskPath 'artifacts') -Force | Out-Null
-        '{"schemaVersion":1,"task":{"key":"FEATURE-123"}}' | Set-Content -LiteralPath (Join-Path $script:taskPath 'task.json') -NoNewline
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = $script:taskKey; title = 'Fixture'; prdPath = 'PRD.md' }
+            repositories = @([ordered]@{ name = 'api'; path = $script:repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            phases = @()
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $script:taskPath 'task.json') -NoNewline
         '# PRD' | Set-Content -LiteralPath (Join-Path $script:taskPath 'PRD.md') -NoNewline
         '# Plan' | Set-Content -LiteralPath (Join-Path $script:taskPath 'PLAN.md') -NoNewline
         '# Status' | Set-Content -LiteralPath (Join-Path $script:taskPath 'STATUS.md') -NoNewline
@@ -47,6 +52,17 @@ Describe 'Invoke-TaskTeardown' {
         { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*dirty-worktree*'
         Test-Path -LiteralPath $script:taskPath | Should -BeTrue
         Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
+    }
+
+    It 'refuses an unregistered worktree without removing it' {
+        $unregisteredPath = Join-Path $script:taskPath 'worktrees/unregistered'
+        & git -C $script:repositoryPath worktree add -b feature/UNREGISTERED $unregisteredPath main | Out-Null
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        ($plan.WorktreeOperations | Where-Object Repository -eq 'unregistered').Reason | Should -Be 'unregistered-worktree'
+        Test-Path -LiteralPath $unregisteredPath | Should -BeTrue
     }
 
     It 'refuses a symlinked worktree entry without following it' {

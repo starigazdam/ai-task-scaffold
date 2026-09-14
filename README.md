@@ -54,7 +54,7 @@ Restore the exact locked dependencies before using the picker or running its tes
 
 ```powershell
 ./scripts/Restore-TaskScaffoldDependencies.ps1
-pwsh -NoProfile -Command "Invoke-Pester -Path ./tests -Output Detailed"
+pwsh -NoProfile -Command "Invoke-Pester -Path ./tests -CI -Output Detailed"
 ```
 
 The repository is local-only; it intentionally has no remote.

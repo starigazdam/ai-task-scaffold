@@ -96,4 +96,4 @@ function Invoke-TaskWorktreePlan {
     }
 }
 
-Export-ModuleMember -Function New-TaskWorktreePlan, Invoke-TaskWorktreePlan
+Export-ModuleMember -Function Get-GitCommonDir, New-TaskWorktreePlan, Invoke-TaskWorktreePlan

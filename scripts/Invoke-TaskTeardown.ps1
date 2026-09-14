@@ -9,6 +9,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'Private/GitWorktree.psm1') -Force
+
 if ($TaskKey -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
     throw "invalid task key '$TaskKey'"
 }
@@ -44,20 +46,40 @@ if (Test-Path -LiteralPath $taskPath -PathType Container) {
                     if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                         $reason = 'symlink-worktree-entry'
                     }
-                    elseif ($entry.PSIsContainer) {
-                        $isWorktree = (& git -C $entry.FullName rev-parse --is-inside-work-tree 2>$null) -eq 'true'
-                        if ($isWorktree) {
-                            $dirty = @(& git -C $entry.FullName status --porcelain)
-                            if ($dirty.Count -eq 0) {
-                                $action = 'remove'
-                                $reason = $null
-                            }
-                            else {
-                                $reason = 'dirty-worktree'
-                            }
+                    elseif (-not $entry.PSIsContainer) {
+                        $reason = 'unexpected-worktree-entry'
+                    }
+                    else {
+                        $registration = @($manifest.repositories | Where-Object { [string]$_.name -ceq $entry.Name })
+                        if ($registration.Count -ne 1) {
+                            $reason = 'unregistered-worktree'
                         }
                         else {
-                            $reason = 'not-a-git-worktree'
+                            $isWorktree = (& git -C $entry.FullName rev-parse --is-inside-work-tree 2>$null) -eq 'true'
+                            if (-not $isWorktree) {
+                                $reason = 'not-a-git-worktree'
+                            }
+                            else {
+                                $expectedCommonDir = Get-GitCommonDir -RepositoryPath ([string]$registration[0].path)
+                                $actualCommonDir = Get-GitCommonDir -RepositoryPath $entry.FullName
+                                $actualBranch = (& git -C $entry.FullName branch --show-current 2>$null | Select-Object -First 1)
+                                if (-not $expectedCommonDir -or $expectedCommonDir -ne $actualCommonDir) {
+                                    $reason = 'repository-mismatch'
+                                }
+                                elseif ([string]$registration[0].branch -cne [string]$actualBranch) {
+                                    $reason = 'branch-mismatch'
+                                }
+                                else {
+                                    $dirty = @(& git -C $entry.FullName status --porcelain)
+                                    if ($dirty.Count -eq 0) {
+                                        $action = 'remove'
+                                        $reason = $null
+                                    }
+                                    else {
+                                        $reason = 'dirty-worktree'
+                                    }
+                                }
+                            }
                         }
                     }
                     $operations += [ordered]@{ Repository = $entry.Name; Path = $entry.FullName; Action = $action; Reason = $reason }
