@@ -1,7 +1,7 @@
 ---
 name: task-scaffold
 description: "Plan or explicitly create a local task folder and safe Git worktrees from task-request.json. Use when a user supplies a PRD, ticket, or asks to start multi-repository work."
-argument-hint: "task-request.json path, workspace root, and tasks root"
+argument-hint: "task-request.json path and tasks root"
 user-invocable: true
 ---
 
@@ -31,7 +31,7 @@ Every repository supplies its own branch; there is no global task branch.
 
 ## Procedure
 
-1. Confirm the request's repositories, paths, base branches, target branches, PRD, workspace root,
+1. Confirm the request's repositories, paths, base branches, target branches, PRD, optional workspace file,
    and tasks root. Do not infer repositories or paths from a PRD.
 2. Run plan-only first:
 
@@ -62,6 +62,14 @@ Every repository supplies its own branch; there is no global task branch.
      -ExpectedSha256 $plan.WorkspaceFolderPlan.OriginalSha256
    ```
 
+6. Teardown is also plan-first. It removes only clean worktrees registered beneath the task and then the task directory; it does not delete branches or canons:
+
+   ```powershell
+   $teardown = ./scripts/Invoke-TaskTeardown.ps1 -TasksRoot ./tasks -TaskKey FEATURE-123 | ConvertFrom-Json
+   $teardown | ConvertTo-Json -Depth 6
+   ./scripts/Invoke-TaskTeardown.ps1 -TasksRoot ./tasks -TaskKey FEATURE-123 -Apply
+   ```
+
 ## Output
 
 The scaffold returns JSON containing the task key, task operation, sorted worktree operations, and
@@ -70,7 +78,8 @@ an optional `WorkspaceFolderPlan`. Repeated matching requests report existing wo
 ## Guardrails
 
 - Default is plan-only; `-Apply` is an explicit local-state confirmation.
-- Never create a worktree directly or reset, delete, overwrite, or force Git state.
+- Never create a worktree directly or reset, overwrite, or force Git state.
+- Teardown removes only clean registered task worktrees after a reviewed plan and explicit `-Apply`; it never deletes branches or canons.
 - Never overwrite a task PRD; a task directory with a different PRD is an error.
 - Never hand-edit or silently apply a `.code-workspace` change. Only
   `Update-WorkspaceFolders.ps1 -Apply -ExpectedSha256 <reviewed-hash>` may write it.

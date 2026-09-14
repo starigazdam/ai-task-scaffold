@@ -1,0 +1,61 @@
+Describe 'Invoke-TaskTeardown' {
+    BeforeEach {
+        $script:fixtureRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString())
+        $script:tasksRoot = Join-Path $script:fixtureRoot 'tasks'
+        $script:taskKey = 'FEATURE-123'
+        $script:taskPath = Join-Path $script:tasksRoot $script:taskKey
+        $script:repositoryPath = Join-Path $script:fixtureRoot 'api'
+        New-Item -ItemType Directory -Path $script:repositoryPath | Out-Null
+        & git -C $script:repositoryPath init -b main | Out-Null
+        & git -C $script:repositoryPath config user.name Test
+        & git -C $script:repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $script:repositoryPath 'README.md') -Value 'fixture'
+        & git -C $script:repositoryPath add README.md
+        & git -C $script:repositoryPath commit -m fixture | Out-Null
+
+        New-Item -ItemType Directory -Path (Join-Path $script:taskPath 'artifacts') -Force | Out-Null
+        '{"schemaVersion":1,"task":{"key":"FEATURE-123"}}' | Set-Content -LiteralPath (Join-Path $script:taskPath 'task.json') -NoNewline
+        '# PRD' | Set-Content -LiteralPath (Join-Path $script:taskPath 'PRD.md') -NoNewline
+        '# Plan' | Set-Content -LiteralPath (Join-Path $script:taskPath 'PLAN.md') -NoNewline
+        '# Status' | Set-Content -LiteralPath (Join-Path $script:taskPath 'STATUS.md') -NoNewline
+        $script:worktreePath = Join-Path $script:taskPath 'worktrees/api'
+        & git -C $script:repositoryPath worktree add -b feature/FEATURE-123 $script:worktreePath main | Out-Null
+        $script:scriptPath = Join-Path $PSScriptRoot '../scripts/Invoke-TaskTeardown.ps1'
+    }
+
+    It 'emits a removal plan without changing task state' {
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'remove'
+        $plan.WorktreeOperations.Count | Should -Be 1
+        $plan.WorktreeOperations[0].Action | Should -Be 'remove'
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+        Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
+    }
+
+    It 'removes only clean registered worktrees and task state after explicit confirmation' {
+        & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply | Out-Null
+
+        Test-Path -LiteralPath $script:taskPath | Should -BeFalse
+        (& git -C $script:repositoryPath worktree list --porcelain) | Should -Not -Match ([regex]::Escape($script:worktreePath))
+        (& git -C $script:repositoryPath branch --format '%(refname:short)') | Should -Contain 'feature/FEATURE-123'
+    }
+
+    It 'refuses dirty worktrees without deleting any task state' {
+        Add-Content -LiteralPath (Join-Path $script:worktreePath 'README.md') -Value 'dirty'
+
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*dirty-worktree*'
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+        Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
+    }
+
+    It 'refuses a symlinked worktree entry without following it' {
+        New-Item -ItemType SymbolicLink -Path (Join-Path $script:taskPath 'worktrees/external') -Target $script:repositoryPath | Out-Null
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        ($plan.WorktreeOperations | Where-Object Repository -eq 'external').Reason | Should -Be 'symlink-worktree-entry'
+        Test-Path -LiteralPath $script:repositoryPath | Should -BeTrue
+    }
+}
