@@ -13,6 +13,24 @@ user-invocable: true
 `task-request.json`, plans local Git worktrees, and optionally creates only local task/worktree
 state. It never calls external services, pushes, creates pull requests, or edits a VS Code workspace.
 
+## Request builder
+
+For a workspace with `canons/<repo>` and a root `task-scaffold.settings.json`, use the builder before supplying a request. It offers only canon directories explicitly configured with a `baseBranch`, prints the complete JSON, and writes it only after a `y` confirmation. It never calls `Invoke-TaskScaffold.ps1` or `-Apply`.
+
+```powershell
+./scripts/Invoke-TaskRequestBuilder.ps1 -WorkspaceRoot C:/work/product
+```
+
+Settings example:
+
+```json
+{
+  "repositories": {
+    "api": { "baseBranch": "develop" }
+  }
+}
+```
+
 ## Request
 
 ```json
