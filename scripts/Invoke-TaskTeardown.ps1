@@ -133,6 +133,9 @@ if ($Apply) {
             throw "failed to remove worktree '$($operation.Path)'"
         }
     }
+    if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey)) {
+        throw "cannot teardown task '$TaskKey': unsafe-task-path"
+    }
     Remove-Item -LiteralPath $taskPath -Recurse -Force
 }
 

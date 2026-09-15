@@ -38,7 +38,14 @@ $expectedContract = [ordered]@{
     repositories = $expectedRepositories
 }
 
+function Assert-TaskPathSafety {
+    if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $request.Task.Key)) {
+        throw "cannot scaffold task '$($request.Task.Key)': unsafe-task-path"
+    }
+}
+
 if ($Apply) {
+    Assert-TaskPathSafety
     if (-not (Test-Path -LiteralPath $request.Task.PrdPath -PathType Leaf)) {
         throw "PRD '$($request.Task.PrdPath)' does not exist"
     }
@@ -79,11 +86,13 @@ if ($Apply) {
     }
     else {
         New-Item -ItemType Directory -Path $taskPath -Force | Out-Null
+        Assert-TaskPathSafety
         Copy-Item -LiteralPath $request.Task.PrdPath -Destination $prdDestination -ErrorAction Stop
     }
 
     $planPath = Join-Path $taskPath 'PLAN.md'
     if (-not (Test-Path -LiteralPath $planPath)) {
+        Assert-TaskPathSafety
         @"
 # $($request.Task.Key) — $($request.Task.Title)
 
@@ -95,6 +104,7 @@ Source PRD: PRD.md
 
     $statusPath = Join-Path $taskPath 'STATUS.md'
     if (-not (Test-Path -LiteralPath $statusPath)) {
+        Assert-TaskPathSafety
         $repositoryLines = @($request.Repositories | ForEach-Object { "  - $($_.Name): $($_.Branch)" }) -join "`n"
         @"
 # $($request.Task.Key) — $($request.Task.Title)
@@ -107,6 +117,7 @@ phases:
     }
 
     if (-not (Test-Path -LiteralPath $manifestPath)) {
+        Assert-TaskPathSafety
         [ordered]@{
             schemaVersion = $expectedContract.schemaVersion
             task = $expectedContract.task
@@ -114,6 +125,7 @@ phases:
             phases = @()
         } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
     }
+    Assert-TaskPathSafety
     New-Item -ItemType Directory -Path (Join-Path $taskPath 'artifacts') -Force | Out-Null
     foreach ($operation in $worktreeOperations) {
         Invoke-TaskWorktreePlan -Repository ($request.Repositories | Where-Object Name -eq $operation.Repository) -Plan $operation

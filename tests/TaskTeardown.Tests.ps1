@@ -86,6 +86,38 @@ exec "$GIT_REAL" "$@"
         Test-Path -LiteralPath $script:taskPath | Should -BeFalse
     }
 
+    It 'refuses a task directory swapped after the final worktree removal on Linux' -Skip:(-not $IsLinux) {
+        $externalTaskPath = Join-Path $script:fixtureRoot 'external-final-task'
+        $shimPath = Join-Path $script:fixtureRoot 'git'
+        @'
+#!/bin/sh
+"$GIT_REAL" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ "$1" = '-C' ] && [ "$3" = 'worktree' ] && [ "$4" = 'remove' ] && [ "$6" = "$GIT_SHIM_WORKTREE_PATH" ]; then
+    mv "$GIT_SHIM_TASK_PATH" "$GIT_SHIM_EXTERNAL_TASK_PATH"
+    ln -s "$GIT_SHIM_EXTERNAL_TASK_PATH" "$GIT_SHIM_TASK_PATH"
+fi
+exit "$status"
+'@ | Set-Content -LiteralPath $shimPath -NoNewline
+        & /bin/chmod +x $shimPath
+        $originalPath = $env:PATH
+        $env:GIT_REAL = (Get-Command git).Source
+        $env:GIT_SHIM_WORKTREE_PATH = $script:worktreePath
+        $env:GIT_SHIM_TASK_PATH = $script:taskPath
+        $env:GIT_SHIM_EXTERNAL_TASK_PATH = $externalTaskPath
+        $env:PATH = "$script:fixtureRoot$([IO.Path]::PathSeparator)$originalPath"
+
+        try {
+            { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unsafe-task-path*'
+        }
+        finally {
+            $env:PATH = $originalPath
+            Remove-Item Env:GIT_REAL, Env:GIT_SHIM_WORKTREE_PATH, Env:GIT_SHIM_TASK_PATH, Env:GIT_SHIM_EXTERNAL_TASK_PATH -ErrorAction SilentlyContinue
+        }
+
+        Test-Path -LiteralPath (Join-Path $externalTaskPath 'task.json') | Should -BeTrue
+    }
+
     It 'refuses dirty worktrees without deleting any task state' {
         Add-Content -LiteralPath (Join-Path $script:worktreePath 'README.md') -Value 'dirty'
 

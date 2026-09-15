@@ -69,6 +69,48 @@ Describe 'Invoke-TaskScaffold' {
         (& git -C (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') branch --show-current) | Should -Be 'feature/FEATURE-123'
     }
 
+    It 'refuses a task directory swapped to a symlink after creation on Linux' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'api-task-symlink-race'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $prdPath = Join-Path $TestDrive 'task-symlink-race-prd.md'
+        Set-Content -LiteralPath $prdPath -Value '# Add endpoint'
+        $tasksRoot = Join-Path $TestDrive 'tasks-task-symlink-race'
+        $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+        $externalTaskPath = Join-Path $TestDrive 'external-task-symlink-race'
+        $requestPath = Join-Path $TestDrive 'task-symlink-race-request.json'
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = $prdPath }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        function New-Item {
+            param([string]$Path, [string]$ItemType, [switch]$Force)
+            $result = Microsoft.PowerShell.Management\New-Item -ItemType $ItemType -Path $Path -Force:$Force
+            if ($Path -ceq $taskPath) {
+                Move-Item -LiteralPath $taskPath -Destination $externalTaskPath
+                Microsoft.PowerShell.Management\New-Item -ItemType SymbolicLink -Path $taskPath -Target $externalTaskPath | Out-Null
+            }
+            return $result
+        }
+        try {
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply } | Should -Throw '*unsafe-task-path*'
+        }
+        finally {
+            Remove-Item -Path function:New-Item -Force -ErrorAction SilentlyContinue
+        }
+
+        Test-Path -LiteralPath (Join-Path $externalTaskPath 'PRD.md') | Should -BeFalse
+    }
+
     It 'only proposes workspace folders until the dedicated workspace script applies them' {
         $repositoryPath = Join-Path $TestDrive 'api-workspace'
         New-Item -ItemType Directory -Path $repositoryPath | Out-Null
