@@ -57,4 +57,4 @@ Restore the exact locked dependencies before using the picker or running its tes
 pwsh -NoProfile -Command "Invoke-Pester -Path ./tests -CI -Output Detailed"
 ```
 
-The repository is local-only; it intentionally has no remote.
+The repository is published on GitHub; local-first operation does not require network access after dependencies are restored.
