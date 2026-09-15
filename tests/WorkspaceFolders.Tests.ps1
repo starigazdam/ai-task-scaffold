@@ -13,7 +13,7 @@ Describe 'Update-WorkspaceFolders' {
 }
 '@ | Set-Content -LiteralPath $script:workspacePath -NoNewline
         $script:scriptPath = Join-Path $PSScriptRoot '../scripts/Update-WorkspaceFolders.ps1'
-        $script:foldersJson = '[{"path":"worktrees/FEATURE-123/api","name":"🔧 worktree: FEATURE-123 api"}]'
+        $script:foldersJson = '[{"path":"tasks/FEATURE-123/worktrees/api","name":"🔧 worktree: FEATURE-123 api"}]'
     }
 
     It 'proposes an add-only change without rewriting JSONC' {
@@ -25,7 +25,7 @@ Describe 'Update-WorkspaceFolders' {
         $plan.OriginalSha256 | Should -Not -BeNullOrEmpty
         $plan.ProposedContent | Should -Match '// Human notes must survive.'
         $plan.ProposedContent | Should -Match 'https://example.invalid/api'
-        $plan.ProposedContent | Should -Match 'worktrees/FEATURE-123/api'
+        $plan.ProposedContent | Should -Match 'tasks/FEATURE-123/worktrees/api'
         (Get-Content -LiteralPath $workspacePath -Raw) | Should -Be $before
     }
 

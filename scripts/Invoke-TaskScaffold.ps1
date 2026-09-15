@@ -2,7 +2,6 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$RequestPath,
-    [Parameter(Mandatory)][string]$WorkspaceRoot,
     [Parameter(Mandatory)][string]$TasksRoot,
     [switch]$Apply
 )
@@ -16,7 +15,7 @@ Import-Module (Join-Path $PSScriptRoot 'Private/GitWorktree.psm1') -Force
 $request = ConvertTo-TaskRequest -Path $RequestPath
 $worktreeOperations = @($request.Repositories |
     Sort-Object Name |
-    ForEach-Object { New-TaskWorktreePlan -Repository $_ -TaskKey $request.Task.Key -WorkspaceRoot $WorkspaceRoot })
+    ForEach-Object { New-TaskWorktreePlan -Repository $_ -TaskKey $request.Task.Key -TasksRoot $TasksRoot })
 $workspaceFolderPlan = $null
 if ($request.Workspace) {
     $folders = @($worktreeOperations |
@@ -28,8 +27,33 @@ if ($request.Workspace) {
     }
 }
 $taskPath = Join-Path $TasksRoot $request.Task.Key
+$taskExists = Test-Path -LiteralPath $taskPath
+$manifestPath = Join-Path $taskPath 'task.json'
+$expectedRepositories = @($request.Repositories | Sort-Object Name | ForEach-Object {
+    [ordered]@{ name = $_.Name; path = $_.Path; branch = $_.Branch; baseBranch = $_.BaseBranch }
+})
+$expectedContract = [ordered]@{
+    schemaVersion = 1
+    task = [ordered]@{ key = $request.Task.Key; title = $request.Task.Title; prdPath = 'PRD.md' }
+    repositories = $expectedRepositories
+}
+
+function Assert-TaskPathSafety {
+    if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $request.Task.Key)) {
+        throw "cannot scaffold task '$($request.Task.Key)': unsafe-task-path"
+    }
+}
 
 if ($Apply) {
+    $mutationLock = Enter-TaskMutationLock -TasksRoot $TasksRoot
+    try {
+    $worktreeOperations = @($request.Repositories |
+        Sort-Object Name |
+        ForEach-Object { New-TaskWorktreePlan -Repository $_ -TaskKey $request.Task.Key -TasksRoot $TasksRoot })
+    $taskPath = Join-Path $TasksRoot $request.Task.Key
+    $taskExists = Test-Path -LiteralPath $taskPath
+    $manifestPath = Join-Path $taskPath 'task.json'
+    Assert-TaskPathSafety
     if (-not (Test-Path -LiteralPath $request.Task.PrdPath -PathType Leaf)) {
         throw "PRD '$($request.Task.PrdPath)' does not exist"
     }
@@ -38,8 +62,29 @@ if ($Apply) {
         throw "cannot apply blocked worktree plan for '$($blockedOperation.Repository)': $($blockedOperation.Reason)"
     }
 
+    if ($taskExists) {
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "existing task '$($request.Task.Key)' has no task.json"
+        }
+        $existingManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 6
+        $existingContract = [ordered]@{
+            schemaVersion = [int]$existingManifest.schemaVersion
+            task = [ordered]@{
+                key = [string]$existingManifest.task.key
+                title = [string]$existingManifest.task.title
+                prdPath = [string]$existingManifest.task.prdPath
+            }
+            repositories = @($existingManifest.repositories | Sort-Object name | ForEach-Object {
+                [ordered]@{ name = [string]$_.name; path = [string]$_.path; branch = [string]$_.branch; baseBranch = [string]$_.baseBranch }
+            })
+        }
+        if (($existingContract | ConvertTo-Json -Depth 6 -Compress) -cne ($expectedContract | ConvertTo-Json -Depth 6 -Compress)) {
+            throw "existing task '$($request.Task.Key)' manifest differs from the request"
+        }
+    }
+
     $prdDestination = Join-Path $taskPath 'PRD.md'
-    if (Test-Path -LiteralPath $taskPath) {
+    if ($taskExists) {
         if (-not (Test-Path -LiteralPath $prdDestination -PathType Leaf)) {
             throw "existing task '$($request.Task.Key)' has no PRD.md"
         }
@@ -49,11 +94,13 @@ if ($Apply) {
     }
     else {
         New-Item -ItemType Directory -Path $taskPath -Force | Out-Null
+        Assert-TaskPathSafety
         Copy-Item -LiteralPath $request.Task.PrdPath -Destination $prdDestination -ErrorAction Stop
     }
 
     $planPath = Join-Path $taskPath 'PLAN.md'
     if (-not (Test-Path -LiteralPath $planPath)) {
+        Assert-TaskPathSafety
         @"
 # $($request.Task.Key) — $($request.Task.Title)
 
@@ -65,6 +112,7 @@ Source PRD: PRD.md
 
     $statusPath = Join-Path $taskPath 'STATUS.md'
     if (-not (Test-Path -LiteralPath $statusPath)) {
+        Assert-TaskPathSafety
         $repositoryLines = @($request.Repositories | ForEach-Object { "  - $($_.Name): $($_.Branch)" }) -join "`n"
         @"
 # $($request.Task.Key) — $($request.Task.Title)
@@ -76,24 +124,29 @@ phases:
 "@ | Set-Content -LiteralPath $statusPath -NoNewline
     }
 
-    $manifestPath = Join-Path $taskPath 'task.json'
     if (-not (Test-Path -LiteralPath $manifestPath)) {
+        Assert-TaskPathSafety
         [ordered]@{
-            schemaVersion = 1
-            task = [ordered]@{ key = $request.Task.Key; title = $request.Task.Title; prdPath = 'PRD.md' }
-            repositories = @($request.Repositories | ForEach-Object { [ordered]@{ name = $_.Name; branch = $_.Branch; baseBranch = $_.BaseBranch } })
+            schemaVersion = $expectedContract.schemaVersion
+            task = $expectedContract.task
+            repositories = $expectedContract.repositories
             phases = @()
         } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
     }
+    Assert-TaskPathSafety
     New-Item -ItemType Directory -Path (Join-Path $taskPath 'artifacts') -Force | Out-Null
     foreach ($operation in $worktreeOperations) {
         Invoke-TaskWorktreePlan -Repository ($request.Repositories | Where-Object Name -eq $operation.Repository) -Plan $operation
+    }
+    }
+    finally {
+        $mutationLock.Dispose()
     }
 }
 
 [ordered]@{
     TaskKey = $request.Task.Key
-    TaskOperation = if (Test-Path -LiteralPath $taskPath) { 'reuse' } else { 'create' }
+    TaskOperation = if ($taskExists) { 'reuse' } else { 'create' }
     WorktreeOperations = $worktreeOperations
     WorkspaceFolderPlan = $workspaceFolderPlan
     RequiresConfirmation = $true

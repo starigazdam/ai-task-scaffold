@@ -22,4 +22,4 @@ Project-specific repositories, including sprint operations, consume the task man
 - Parallel task isolation is keyed by task directory, not global state or current directory.
 - A task can have different branches for different repositories.
 - Initial clone provisioning and one-off workspace migration are outside this tool.
-- The next implementation checkpoint relocates current worktree destinations from `worktrees/<TASK-KEY>/<repo>` to `tasks/<TASK-KEY>/worktrees/<repo>`.
+- The scaffold creates task worktrees at `tasks/<TASK-KEY>/worktrees/<repo>` from the corresponding canon.
