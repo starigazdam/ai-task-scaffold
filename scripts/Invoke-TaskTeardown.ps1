@@ -116,6 +116,20 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                     }
                 }
             }
+            else {
+                foreach ($missingName in @($manifest.repositories | ForEach-Object { [string]$_.name })) {
+                    $operations += [ordered]@{
+                        Repository = $missingName
+                        RepositoryPath = $null
+                        Path = Join-Path $worktreesPath $missingName
+                        CommonDir = $null
+                        GitDir = $null
+                        Branch = $null
+                        Action = 'blocked'
+                        Reason = 'missing-worktrees-container'
+                    }
+                }
+            }
             if ($operations | Where-Object Action -eq 'blocked') {
                 $taskReason = 'blocked-worktree'
             }

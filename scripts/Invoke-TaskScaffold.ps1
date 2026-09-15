@@ -47,6 +47,12 @@ function Assert-TaskPathSafety {
 if ($Apply) {
     $mutationLock = Enter-TaskMutationLock -TasksRoot $TasksRoot
     try {
+    $worktreeOperations = @($request.Repositories |
+        Sort-Object Name |
+        ForEach-Object { New-TaskWorktreePlan -Repository $_ -TaskKey $request.Task.Key -TasksRoot $TasksRoot })
+    $taskPath = Join-Path $TasksRoot $request.Task.Key
+    $taskExists = Test-Path -LiteralPath $taskPath
+    $manifestPath = Join-Path $taskPath 'task.json'
     Assert-TaskPathSafety
     if (-not (Test-Path -LiteralPath $request.Task.PrdPath -PathType Leaf)) {
         throw "PRD '$($request.Task.PrdPath)' does not exist"
