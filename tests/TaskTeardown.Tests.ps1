@@ -46,6 +46,17 @@ Describe 'Invoke-TaskTeardown' {
         (& git -C $script:repositoryPath branch --format '%(refname:short)') | Should -Contain 'feature/FEATURE-123'
     }
 
+    It 'blocks teardown when a manifest worktree is missing' {
+        Remove-Item -LiteralPath $script:worktreePath -Recurse -Force
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'blocked-worktree'
+        $plan.WorktreeOperations[0].Reason | Should -Be 'missing-worktree'
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+    }
+
     It 'removes each worktree immediately after revalidation' -Skip:(-not $IsLinux) {
         $secondWorktreePath = Join-Path $script:taskPath 'worktrees/api2'
         & git -C $script:repositoryPath worktree add -b feature/FEATURE-124 $secondWorktreePath main | Out-Null

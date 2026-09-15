@@ -64,6 +64,15 @@ function Get-TaskWorktreeDestination {
     return [IO.Path]::GetFullPath((Join-Path $TasksRoot (Join-Path (Join-Path $TaskKey 'worktrees') $RepositoryName)))
 }
 
+function Enter-TaskMutationLock {
+    param([string]$TasksRoot)
+
+    $tasksRootPath = [IO.Path]::GetFullPath($TasksRoot)
+    New-Item -ItemType Directory -Path $tasksRootPath -Force | Out-Null
+    $lockPath = Join-Path $tasksRootPath '.ai-task-scaffold.lock'
+    return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+}
+
 function Test-TaskPathSafety {
     param([string]$TasksRoot, [string]$TaskKey, [string]$RepositoryName)
 
@@ -175,4 +184,4 @@ function Invoke-TaskWorktreePlan {
     }
 }
 
-Export-ModuleMember -Function Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan
+Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan

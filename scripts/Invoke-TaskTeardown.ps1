@@ -43,7 +43,22 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
         else {
             $worktreesPath = Join-Path $taskPath 'worktrees'
             if (Test-Path -LiteralPath $worktreesPath -PathType Container) {
-                foreach ($entry in Get-ChildItem -LiteralPath $worktreesPath -Force) {
+                $entries = @(Get-ChildItem -LiteralPath $worktreesPath -Force)
+                $entryNames = @($entries | ForEach-Object { $_.Name })
+                $registeredNames = @($manifest.repositories | ForEach-Object { [string]$_.name })
+                foreach ($missingName in @($registeredNames | Where-Object { $_ -cnotin $entryNames })) {
+                    $operations += [ordered]@{
+                        Repository = $missingName
+                        RepositoryPath = $null
+                        Path = Join-Path $worktreesPath $missingName
+                        CommonDir = $null
+                        GitDir = $null
+                        Branch = $null
+                        Action = 'blocked'
+                        Reason = 'missing-worktree'
+                    }
+                }
+                foreach ($entry in $entries) {
                     $action = 'blocked'
                     $reason = 'unexpected-worktree-entry'
                     $actualCommonDir = $null
@@ -113,6 +128,8 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
 }
 
 if ($Apply) {
+    $mutationLock = Enter-TaskMutationLock -TasksRoot $TasksRoot
+    try {
     if ($taskOperation -ne 'remove') {
         $blocked = $operations | Where-Object Action -eq 'blocked' | Select-Object -First 1
         $reason = if ($blocked) { $blocked.Reason } else { $taskReason }
@@ -137,6 +154,10 @@ if ($Apply) {
         throw "cannot teardown task '$TaskKey': unsafe-task-path"
     }
     Remove-Item -LiteralPath $taskPath -Recurse -Force
+    }
+    finally {
+        $mutationLock.Dispose()
+    }
 }
 
 [ordered]@{

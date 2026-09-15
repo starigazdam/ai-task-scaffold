@@ -45,6 +45,8 @@ function Assert-TaskPathSafety {
 }
 
 if ($Apply) {
+    $mutationLock = Enter-TaskMutationLock -TasksRoot $TasksRoot
+    try {
     Assert-TaskPathSafety
     if (-not (Test-Path -LiteralPath $request.Task.PrdPath -PathType Leaf)) {
         throw "PRD '$($request.Task.PrdPath)' does not exist"
@@ -129,6 +131,10 @@ phases:
     New-Item -ItemType Directory -Path (Join-Path $taskPath 'artifacts') -Force | Out-Null
     foreach ($operation in $worktreeOperations) {
         Invoke-TaskWorktreePlan -Repository ($request.Repositories | Where-Object Name -eq $operation.Repository) -Plan $operation
+    }
+    }
+    finally {
+        $mutationLock.Dispose()
     }
 }
 
