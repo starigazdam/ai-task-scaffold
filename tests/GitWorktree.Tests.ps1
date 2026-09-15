@@ -97,6 +97,54 @@ Describe 'New-TaskWorktreePlan' {
     }
     }
 
+    It 'blocks a symlinked matching destination on Linux' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'api-symlink-reuse'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $externalPath = Join-Path $TestDrive 'external-worktree'
+        & git -C $repositoryPath worktree add -b feature/FEATURE-123 $externalPath main | Out-Null
+        $workspaceRoot = Join-Path $TestDrive 'workspace-symlink-reuse'
+        $destination = Join-Path $workspaceRoot 'FEATURE-123/worktrees/api'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        New-Item -ItemType SymbolicLink -Path $destination -Target $externalPath | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $workspaceRoot
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'unsafe-worktree-path'
+    }
+
+    It 'blocks a symlinked worktrees ancestor on Linux' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'api-symlink-ancestor'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $workspaceRoot = Join-Path $TestDrive 'workspace-symlink-ancestor'
+        $worktreesPath = Join-Path $workspaceRoot 'FEATURE-123/worktrees'
+        $externalPath = Join-Path $TestDrive 'external-worktrees'
+        New-Item -ItemType Directory -Path $externalPath | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path -Parent $worktreesPath) -Force | Out-Null
+        New-Item -ItemType SymbolicLink -Path $worktreesPath -Target $externalPath | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $workspaceRoot
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'unsafe-worktree-path'
+    }
+
     It 'plans from an explicit origin base branch' {
         $originPath = Join-Path $TestDrive 'origin.git'
         $seedPath = Join-Path $TestDrive 'seed'
@@ -143,6 +191,29 @@ Describe 'Invoke-TaskWorktreePlan' {
         Test-Path -LiteralPath $plan.Destination | Should -BeTrue
         (& git -C $plan.Destination branch --show-current) | Should -Be 'feature/FEATURE-123'
         (& git -C $repositoryPath branch --format '%(refname:short)') | Should -Contain 'feature/FEATURE-123'
+    }
+
+    It 'rechecks the worktree path before applying on Linux' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'api-apply-recheck'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $tasksRoot = Join-Path $TestDrive 'tasks-apply-recheck'
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $worktreesPath = Join-Path $tasksRoot 'FEATURE-123/worktrees'
+        $externalPath = Join-Path $TestDrive 'external-apply-recheck'
+        New-Item -ItemType Directory -Path $externalPath | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path -Parent $worktreesPath) -Force | Out-Null
+        New-Item -ItemType SymbolicLink -Path $worktreesPath -Target $externalPath | Out-Null
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*unsafe worktree destination*'
+        Test-Path -LiteralPath (Join-Path $externalPath 'api') | Should -BeFalse
     }
 
     It 'reuses an existing matching worktree' {

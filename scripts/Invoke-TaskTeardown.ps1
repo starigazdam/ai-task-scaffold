@@ -20,7 +20,10 @@ $operations = @()
 $taskOperation = 'blocked'
 $taskReason = 'task-not-found'
 
-if (Test-Path -LiteralPath $taskPath -PathType Container) {
+if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey)) {
+    $taskReason = 'unsafe-task-path'
+}
+elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
     $expectedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', 'artifacts', 'worktrees')
     $unexpectedEntry = Get-ChildItem -LiteralPath $taskPath -Force |
         Where-Object Name -notin $expectedEntries |
@@ -101,6 +104,9 @@ if ($Apply) {
         $blocked = $operations | Where-Object Action -eq 'blocked' | Select-Object -First 1
         $reason = if ($blocked) { $blocked.Reason } else { $taskReason }
         throw "cannot teardown task '$TaskKey': $reason"
+    }
+    if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey)) {
+        throw "cannot teardown task '$TaskKey': unsafe-task-path"
     }
     foreach ($operation in $operations) {
         & git -C $operation.Path worktree remove -- $operation.Path

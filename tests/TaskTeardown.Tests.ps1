@@ -89,6 +89,29 @@ Describe 'Invoke-TaskTeardown' {
     }
     }
 
+    It 'refuses a symlinked task container on Linux' -Skip:(-not $IsLinux) {
+        $externalTaskPath = Join-Path $script:fixtureRoot 'external-task'
+        Move-Item -LiteralPath $script:taskPath -Destination $externalTaskPath
+        New-Item -ItemType SymbolicLink -Path $script:taskPath -Target $externalTaskPath | Out-Null
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'unsafe-task-path'
+    }
+
+    It 'refuses a symlinked worktrees container on Linux' -Skip:(-not $IsLinux) {
+        $worktreesPath = Join-Path $script:taskPath 'worktrees'
+        $externalWorktreesPath = Join-Path $script:fixtureRoot 'external-worktrees'
+        Move-Item -LiteralPath $worktreesPath -Destination $externalWorktreesPath
+        New-Item -ItemType SymbolicLink -Path $worktreesPath -Target $externalWorktreesPath | Out-Null
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'unsafe-task-path'
+    }
+
     It 'refuses a symlinked worktree entry without following it' {
         New-Item -ItemType SymbolicLink -Path (Join-Path $script:taskPath 'worktrees/external') -Target $script:repositoryPath | Out-Null
 
