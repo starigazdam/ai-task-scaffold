@@ -34,7 +34,7 @@ function New-TaskWorktreePlan {
         $repositoryCommonDir = Get-GitCommonDir -RepositoryPath $Repository.Path
         $destinationCommonDir = Get-GitCommonDir -RepositoryPath $destination
         $destinationBranch = (& git -C $destination branch --show-current 2>$null | Select-Object -First 1)
-        if ($repositoryCommonDir -and $repositoryCommonDir -eq $destinationCommonDir -and $destinationBranch -eq $Repository.Branch) {
+        if ($repositoryCommonDir -and $repositoryCommonDir -ceq $destinationCommonDir -and $destinationBranch -eq $Repository.Branch) {
             return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name }
         }
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'destination-exists'; Repository = $Repository.Name }

@@ -71,6 +71,32 @@ Describe 'New-TaskWorktreePlan' {
         (& git -C $repositoryPath branch --format '%(refname:short)') | Should -Not -Contain 'feature/FEATURE-123'
     }
 
+    if ($IsLinux) {
+    It 'blocks a case-distinct repository at an existing destination' {
+        $upperRepositoryPath = Join-Path $TestDrive 'CaseRepo'
+        $lowerRepositoryPath = Join-Path $TestDrive 'caserepo'
+        foreach ($repositoryPath in @($upperRepositoryPath, $lowerRepositoryPath)) {
+            New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+            & git -C $repositoryPath init -b main | Out-Null
+            & git -C $repositoryPath config user.name Test
+            & git -C $repositoryPath config user.email test@example.invalid
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+            & git -C $repositoryPath add README.md
+            & git -C $repositoryPath commit -m fixture | Out-Null
+        }
+
+        $workspaceRoot = Join-Path $TestDrive 'workspace-case-distinct'
+        $destination = Join-Path $workspaceRoot 'FEATURE-123/worktrees/api'
+        & git -C $lowerRepositoryPath worktree add -b feature/FEATURE-123 $destination main | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $upperRepositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $workspaceRoot
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'destination-exists'
+    }
+    }
+
     It 'plans from an explicit origin base branch' {
         $originPath = Join-Path $TestDrive 'origin.git'
         $seedPath = Join-Path $TestDrive 'seed'

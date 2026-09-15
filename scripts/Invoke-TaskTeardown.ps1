@@ -63,7 +63,7 @@ if (Test-Path -LiteralPath $taskPath -PathType Container) {
                                 $expectedCommonDir = Get-GitCommonDir -RepositoryPath ([string]$registration[0].path)
                                 $actualCommonDir = Get-GitCommonDir -RepositoryPath $entry.FullName
                                 $actualBranch = (& git -C $entry.FullName branch --show-current 2>$null | Select-Object -First 1)
-                                if (-not $expectedCommonDir -or $expectedCommonDir -ne $actualCommonDir) {
+                                if (-not $expectedCommonDir -or $expectedCommonDir -cne $actualCommonDir) {
                                     $reason = 'repository-mismatch'
                                 }
                                 elseif ([string]$registration[0].branch -cne [string]$actualBranch) {

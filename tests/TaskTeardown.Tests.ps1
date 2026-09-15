@@ -65,6 +65,30 @@ Describe 'Invoke-TaskTeardown' {
         Test-Path -LiteralPath $unregisteredPath | Should -BeTrue
     }
 
+    if ($IsLinux) {
+    It 'refuses a case-distinct registered repository' {
+        $upperRepositoryPath = Join-Path $script:fixtureRoot 'Api'
+        New-Item -ItemType Directory -Path $upperRepositoryPath | Out-Null
+        & git -C $upperRepositoryPath init -b main | Out-Null
+        & git -C $upperRepositoryPath config user.name Test
+        & git -C $upperRepositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $upperRepositoryPath 'README.md') -Value 'fixture'
+        & git -C $upperRepositoryPath add README.md
+        & git -C $upperRepositoryPath commit -m fixture | Out-Null
+
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $manifest.repositories[0].path = $upperRepositoryPath
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.WorktreeOperations[0].Reason | Should -Be 'repository-mismatch'
+        Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
+    }
+    }
+
     It 'refuses a symlinked worktree entry without following it' {
         New-Item -ItemType SymbolicLink -Path (Join-Path $script:taskPath 'worktrees/external') -Target $script:repositoryPath | Out-Null
 
