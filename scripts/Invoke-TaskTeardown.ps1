@@ -47,6 +47,7 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                     $action = 'blocked'
                     $reason = 'unexpected-worktree-entry'
                     $actualCommonDir = $null
+                    $actualGitDir = $null
                     $actualBranch = $null
                     if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                         $reason = 'symlink-worktree-entry'
@@ -67,6 +68,7 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                             else {
                                 $expectedCommonDir = Get-GitCommonDir -RepositoryPath ([string]$registration[0].path)
                                 $actualCommonDir = Get-GitCommonDir -RepositoryPath $entry.FullName
+                                $actualGitDir = Get-GitDir -RepositoryPath $entry.FullName
                                 $actualBranch = (& git -C $entry.FullName branch --show-current 2>$null | Select-Object -First 1)
                                 if (-not $expectedCommonDir -or $expectedCommonDir -cne $actualCommonDir) {
                                     $reason = 'repository-mismatch'
@@ -92,6 +94,7 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                         RepositoryPath = if ($registration.Count -eq 1) { [string]$registration[0].path } else { $null }
                         Path = $entry.FullName
                         CommonDir = $actualCommonDir
+                        GitDir = $actualGitDir
                         Branch = $actualBranch
                         Action = $action
                         Reason = $reason
@@ -119,14 +122,12 @@ if ($Apply) {
         throw "cannot teardown task '$TaskKey': unsafe-task-path"
     }
     foreach ($operation in $operations) {
-        if (-not (Test-TaskWorktreeOperationSafety -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $operation.Repository -RepositoryPath $operation.RepositoryPath -WorktreePath $operation.Path -Branch $operation.Branch -ExpectedCommonDir $operation.CommonDir)) {
+        if (-not (Test-TaskWorktreeOperationSafety -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $operation.Repository -RepositoryPath $operation.RepositoryPath -WorktreePath $operation.Path -Branch $operation.Branch -ExpectedCommonDir $operation.CommonDir -ExpectedGitDir $operation.GitDir)) {
             throw "cannot teardown task '$TaskKey': worktree changed since planning"
         }
         if (@(& git -C $operation.Path status --porcelain).Count -ne 0) {
             throw "cannot teardown task '$TaskKey': dirty-worktree"
         }
-    }
-    foreach ($operation in $operations) {
         & git -C $operation.RepositoryPath worktree remove -- $operation.Path
         if ($LASTEXITCODE -ne 0) {
             throw "failed to remove worktree '$($operation.Path)'"

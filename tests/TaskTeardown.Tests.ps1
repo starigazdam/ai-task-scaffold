@@ -46,6 +46,46 @@ Describe 'Invoke-TaskTeardown' {
         (& git -C $script:repositoryPath branch --format '%(refname:short)') | Should -Contain 'feature/FEATURE-123'
     }
 
+    It 'removes each worktree immediately after revalidation' -Skip:(-not $IsLinux) {
+        $secondWorktreePath = Join-Path $script:taskPath 'worktrees/api2'
+        & git -C $script:repositoryPath worktree add -b feature/FEATURE-124 $secondWorktreePath main | Out-Null
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $manifest.repositories += [pscustomobject]@{ name = 'api2'; path = $script:repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-124' }
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -NoNewline
+
+        $shimPath = Join-Path $script:fixtureRoot 'git'
+        @'
+#!/bin/sh
+if [ "$1" = '-C' ] && [ "$3" = 'status' ] && [ "$4" = '--porcelain' ]; then
+    count=$(cat "$GIT_SHIM_COUNT_FILE" 2>/dev/null || printf '0')
+    count=$((count + 1))
+    printf '%s' "$count" > "$GIT_SHIM_COUNT_FILE"
+    if [ "$2" = "$GIT_SHIM_TRIGGER_PATH" ] && [ "$count" -eq 4 ] && [ -d "$GIT_SHIM_DIRTY_PATH" ]; then
+        printf 'race\n' >> "$GIT_SHIM_DIRTY_PATH/README.md"
+    fi
+fi
+exec "$GIT_REAL" "$@"
+'@ | Set-Content -LiteralPath $shimPath -NoNewline
+        & /bin/chmod +x $shimPath
+        $originalPath = $env:PATH
+        $env:GIT_REAL = (Get-Command git).Source
+        $env:GIT_SHIM_COUNT_FILE = Join-Path $script:fixtureRoot 'git-call-count'
+        $env:GIT_SHIM_TRIGGER_PATH = $secondWorktreePath
+        $env:GIT_SHIM_DIRTY_PATH = $script:worktreePath
+        $env:PATH = "$script:fixtureRoot$([IO.Path]::PathSeparator)$originalPath"
+
+        try {
+            { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Not -Throw
+        }
+        finally {
+            $env:PATH = $originalPath
+            Remove-Item Env:GIT_REAL, Env:GIT_SHIM_COUNT_FILE, Env:GIT_SHIM_TRIGGER_PATH, Env:GIT_SHIM_DIRTY_PATH -ErrorAction SilentlyContinue
+        }
+
+        Test-Path -LiteralPath $script:taskPath | Should -BeFalse
+    }
+
     It 'refuses dirty worktrees without deleting any task state' {
         Add-Content -LiteralPath (Join-Path $script:worktreePath 'README.md') -Value 'dirty'
 

@@ -16,18 +16,29 @@ function Get-GitCommonDir {
     return ([string]($output | Select-Object -First 1)).Trim()
 }
 
+function Get-GitDir {
+    param([string]$RepositoryPath)
+
+    $output = & git -C $RepositoryPath rev-parse --path-format=absolute --git-dir 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return ([string]($output | Select-Object -First 1)).Trim()
+}
+
 function Test-TaskWorktreeIdentity {
     param(
         [string]$RepositoryPath,
         [string]$WorktreePath,
         [string]$Branch,
-        [string]$ExpectedCommonDir
+        [string]$ExpectedCommonDir,
+        [string]$ExpectedGitDir
     )
 
     $repositoryCommonDir = if ($ExpectedCommonDir) { $ExpectedCommonDir } else { Get-GitCommonDir -RepositoryPath $RepositoryPath }
     $worktreeCommonDir = Get-GitCommonDir -RepositoryPath $WorktreePath
+    $worktreeGitDir = Get-GitDir -RepositoryPath $WorktreePath
+    $expectedWorktreeGitDir = if ($ExpectedGitDir) { $ExpectedGitDir } else { $worktreeGitDir }
     $worktreeBranch = (& git -C $WorktreePath branch --show-current 2>$null | Select-Object -First 1)
-    return $repositoryCommonDir -and $repositoryCommonDir -ceq $worktreeCommonDir -and $worktreeBranch -ceq $Branch
+    return $repositoryCommonDir -and $repositoryCommonDir -ceq $worktreeCommonDir -and $worktreeGitDir -ceq $expectedWorktreeGitDir -and $worktreeBranch -ceq $Branch
 }
 
 function Test-TaskWorktreeOperationSafety {
@@ -38,12 +49,13 @@ function Test-TaskWorktreeOperationSafety {
         [string]$RepositoryPath,
         [string]$WorktreePath,
         [string]$Branch,
-        [string]$ExpectedCommonDir
+        [string]$ExpectedCommonDir,
+        [string]$ExpectedGitDir
     )
 
     return (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $RepositoryName) -and
         (Get-GitCommonDir -RepositoryPath $RepositoryPath) -ceq $ExpectedCommonDir -and
-        (Test-TaskWorktreeIdentity -RepositoryPath $RepositoryPath -WorktreePath $WorktreePath -Branch $Branch -ExpectedCommonDir $ExpectedCommonDir)
+        (Test-TaskWorktreeIdentity -RepositoryPath $RepositoryPath -WorktreePath $WorktreePath -Branch $Branch -ExpectedCommonDir $ExpectedCommonDir -ExpectedGitDir $ExpectedGitDir)
 }
 
 function Get-TaskWorktreeDestination {
@@ -94,7 +106,7 @@ function New-TaskWorktreePlan {
     }
     if (Test-Path -LiteralPath $destination) {
         if (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $destination -Branch $Repository.Branch -ExpectedCommonDir $repositoryCommonDir) {
-            return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; RepositoryCommonDir = $repositoryCommonDir; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+            return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; RepositoryCommonDir = $repositoryCommonDir; WorktreeGitDir = (Get-GitDir -RepositoryPath $destination); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'destination-exists'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
@@ -135,7 +147,7 @@ function Invoke-TaskWorktreePlan {
     }
     if ($Plan.Action -eq 'reuse') {
         if ((Get-GitCommonDir -RepositoryPath $Repository.Path) -cne $Plan.RepositoryCommonDir -or
-            -not (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $Plan.Destination -Branch $Plan.Source -ExpectedCommonDir $Plan.RepositoryCommonDir)) {
+            -not (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $Plan.Destination -Branch $Plan.Source -ExpectedCommonDir $Plan.RepositoryCommonDir -ExpectedGitDir $Plan.WorktreeGitDir)) {
             throw "reused worktree changed since planning: '$($Plan.Destination)'"
         }
         return
@@ -163,4 +175,4 @@ function Invoke-TaskWorktreePlan {
     }
 }
 
-Export-ModuleMember -Function Get-GitCommonDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan
+Export-ModuleMember -Function Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan

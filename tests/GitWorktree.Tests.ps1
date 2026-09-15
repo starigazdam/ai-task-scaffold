@@ -283,6 +283,26 @@ Describe 'Invoke-TaskWorktreePlan' {
         (@(& git -C $replacementRepositoryPath worktree list --porcelain) -join "`n") | Should -Match ([regex]::Escape($reusePlan.Destination))
     }
 
+    It 'rejects a same-branch worktree with a different Git directory' {
+        $repositoryPath = Join-Path $TestDrive 'api-git-dir-identity'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+        & git -C $repositoryPath branch feature/FEATURE-123
+
+        $firstWorktree = Join-Path $TestDrive 'first-worktree'
+        $secondWorktree = Join-Path $TestDrive 'second-worktree'
+        & git -C $repositoryPath worktree add $firstWorktree feature/FEATURE-123 | Out-Null
+        & git -C $repositoryPath worktree add --force $secondWorktree feature/FEATURE-123 | Out-Null
+        $expectedGitDir = (& git -C $firstWorktree rev-parse --path-format=absolute --git-dir).Trim()
+
+        Test-TaskWorktreeIdentity -RepositoryPath $repositoryPath -WorktreePath $secondWorktree -Branch 'feature/FEATURE-123' -ExpectedCommonDir (Get-GitCommonDir -RepositoryPath $repositoryPath) -ExpectedGitDir $expectedGitDir | Should -BeFalse
+    }
+
     It 'reuses an existing matching worktree' {
         $repositoryPath = Join-Path $TestDrive 'api-reuse'
         New-Item -ItemType Directory -Path $repositoryPath | Out-Null
