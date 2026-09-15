@@ -154,6 +154,40 @@ Describe 'Invoke-TaskScaffold' {
         Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
     }
 
+    It 'refuses a case-distinct existing manifest title' {
+        $repositoryPath = Join-Path $TestDrive 'api-manifest-case'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $prdPath = Join-Path $TestDrive 'manifest-case-prd.md'
+        Set-Content -LiteralPath $prdPath -Value '# Same PRD'
+        $tasksRoot = Join-Path $TestDrive 'tasks-manifest-case'
+        $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+        New-Item -ItemType Directory -Path $taskPath -Force | Out-Null
+        Copy-Item -LiteralPath $prdPath -Destination (Join-Path $taskPath 'PRD.md')
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'add endpoint'; prdPath = 'PRD.md' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            phases = @()
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $taskPath 'task.json') -NoNewline
+        $requestPath = Join-Path $TestDrive 'manifest-case-request.json'
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = $prdPath }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply } | Should -Throw '*manifest differs*'
+        Test-Path -LiteralPath (Join-Path $taskPath 'worktrees/api') | Should -BeFalse
+    }
+
     It 'refuses an existing task whose manifest differs from the request' {
         $repositoryPath = Join-Path $TestDrive 'api-manifest-collision'
         New-Item -ItemType Directory -Path $repositoryPath | Out-Null

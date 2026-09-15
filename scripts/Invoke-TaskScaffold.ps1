@@ -63,7 +63,7 @@ if ($Apply) {
                 [ordered]@{ name = [string]$_.name; path = [string]$_.path; branch = [string]$_.branch; baseBranch = [string]$_.baseBranch }
             })
         }
-        if (($existingContract | ConvertTo-Json -Depth 6 -Compress) -ne ($expectedContract | ConvertTo-Json -Depth 6 -Compress)) {
+        if (($existingContract | ConvertTo-Json -Depth 6 -Compress) -cne ($expectedContract | ConvertTo-Json -Depth 6 -Compress)) {
             throw "existing task '$($request.Task.Key)' manifest differs from the request"
         }
     }

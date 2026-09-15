@@ -16,6 +16,20 @@ function Get-GitCommonDir {
     return ([string]($output | Select-Object -First 1)).Trim()
 }
 
+function Test-TaskWorktreeIdentity {
+    param(
+        [string]$RepositoryPath,
+        [string]$WorktreePath,
+        [string]$Branch,
+        [string]$ExpectedCommonDir
+    )
+
+    $repositoryCommonDir = if ($ExpectedCommonDir) { $ExpectedCommonDir } else { Get-GitCommonDir -RepositoryPath $RepositoryPath }
+    $worktreeCommonDir = Get-GitCommonDir -RepositoryPath $WorktreePath
+    $worktreeBranch = (& git -C $WorktreePath branch --show-current 2>$null | Select-Object -First 1)
+    return $repositoryCommonDir -and $repositoryCommonDir -ceq $worktreeCommonDir -and $worktreeBranch -ceq $Branch
+}
+
 function Get-TaskWorktreeDestination {
     param([string]$TasksRoot, [string]$TaskKey, [string]$RepositoryName)
 
@@ -57,16 +71,14 @@ function New-TaskWorktreePlan {
         throw "repository '$($Repository.Name)' is not a Git worktree"
     }
 
+    $repositoryCommonDir = Get-GitCommonDir -RepositoryPath $Repository.Path
     $destination = Get-TaskWorktreeDestination -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $Repository.Name
     if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $Repository.Name)) {
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'unsafe-worktree-path'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
     if (Test-Path -LiteralPath $destination) {
-        $repositoryCommonDir = Get-GitCommonDir -RepositoryPath $Repository.Path
-        $destinationCommonDir = Get-GitCommonDir -RepositoryPath $destination
-        $destinationBranch = (& git -C $destination branch --show-current 2>$null | Select-Object -First 1)
-        if ($repositoryCommonDir -and $repositoryCommonDir -ceq $destinationCommonDir -and $destinationBranch -eq $Repository.Branch) {
-            return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        if (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $destination -Branch $Repository.Branch -ExpectedCommonDir $repositoryCommonDir) {
+            return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; RepositoryCommonDir = $repositoryCommonDir; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'destination-exists'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
@@ -106,6 +118,10 @@ function Invoke-TaskWorktreePlan {
         throw "refusing unsafe worktree destination '$($Plan.Destination)'"
     }
     if ($Plan.Action -eq 'reuse') {
+        if ((Get-GitCommonDir -RepositoryPath $Repository.Path) -cne $Plan.RepositoryCommonDir -or
+            -not (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $Plan.Destination -Branch $Plan.Source -ExpectedCommonDir $Plan.RepositoryCommonDir)) {
+            throw "reused worktree changed since planning: '$($Plan.Destination)'"
+        }
         return
     }
     if (Test-Path -LiteralPath $Plan.Destination) {
@@ -131,4 +147,4 @@ function Invoke-TaskWorktreePlan {
     }
 }
 
-Export-ModuleMember -Function Get-GitCommonDir, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan
+Export-ModuleMember -Function Get-GitCommonDir, Test-TaskWorktreeIdentity, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan

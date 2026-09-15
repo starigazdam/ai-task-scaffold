@@ -97,6 +97,27 @@ Describe 'New-TaskWorktreePlan' {
     }
     }
 
+    It 'blocks a case-distinct branch at an existing destination' {
+        $repositoryPath = Join-Path $TestDrive 'api-branch-case'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $workspaceRoot = Join-Path $TestDrive 'workspace-branch-case'
+        $destination = Join-Path $workspaceRoot 'FEATURE-123/worktrees/api'
+        & git -C $repositoryPath worktree add -b feature/FEATURE-123 $destination main | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/feature-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $workspaceRoot
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'destination-exists'
+    }
+
     It 'blocks a symlinked matching destination on Linux' -Skip:(-not $IsLinux) {
         $repositoryPath = Join-Path $TestDrive 'api-symlink-reuse'
         New-Item -ItemType Directory -Path $repositoryPath | Out-Null
@@ -214,6 +235,31 @@ Describe 'Invoke-TaskWorktreePlan' {
 
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*unsafe worktree destination*'
         Test-Path -LiteralPath (Join-Path $externalPath 'api') | Should -BeFalse
+    }
+
+    It 'refuses a reused worktree replaced after planning' {
+        $repositoryPath = Join-Path $TestDrive 'api-reuse-replaced'
+        $replacementRepositoryPath = Join-Path $TestDrive 'api-reuse-replacement'
+        foreach ($path in @($repositoryPath, $replacementRepositoryPath)) {
+            New-Item -ItemType Directory -Path $path | Out-Null
+            & git -C $path init -b main | Out-Null
+            & git -C $path config user.name Test
+            & git -C $path config user.email test@example.invalid
+            Set-Content -LiteralPath (Join-Path $path 'README.md') -Value 'fixture'
+            & git -C $path add README.md
+            & git -C $path commit -m fixture | Out-Null
+        }
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $tasksRoot = Join-Path $TestDrive 'workspace-reuse-replaced'
+        $initialPlan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $initialPlan
+        $reusePlan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        & git -C $repositoryPath worktree remove -- $reusePlan.Destination
+        & git -C $replacementRepositoryPath worktree add -b feature/FEATURE-123 $reusePlan.Destination main | Out-Null
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reusePlan } | Should -Throw '*reused worktree changed since planning*'
+        (@(& git -C $replacementRepositoryPath worktree list --porcelain) -join "`n") | Should -Match ([regex]::Escape($reusePlan.Destination))
     }
 
     It 'reuses an existing matching worktree' {
