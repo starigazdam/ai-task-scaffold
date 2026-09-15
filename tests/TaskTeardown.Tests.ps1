@@ -79,7 +79,7 @@ Describe 'Invoke-TaskTeardown' {
         $shimPath = Join-Path $script:fixtureRoot 'git'
         @'
 #!/bin/sh
-if [ "$1" = '-C' ] && [ "$3" = 'status' ] && [ "$4" = '--porcelain' ]; then
+if [ "$1" = '-C' ] && [ "$3" = 'status' ] && [ "$4" = '--porcelain' ] && [ -z "$AI_TASK_SCAFFOLD_REPLAN" ]; then
     count=$(cat "$GIT_SHIM_COUNT_FILE" 2>/dev/null || printf '0')
     count=$((count + 1))
     printf '%s' "$count" > "$GIT_SHIM_COUNT_FILE"

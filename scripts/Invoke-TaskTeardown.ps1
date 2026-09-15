@@ -144,6 +144,17 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
 if ($Apply) {
     $mutationLock = Enter-TaskMutationLock -TasksRoot $TasksRoot
     try {
+    $replanMarker = $env:AI_TASK_SCAFFOLD_REPLAN
+    $env:AI_TASK_SCAFFOLD_REPLAN = '1'
+    try {
+        $lockedPlan = & $PSCommandPath -TasksRoot $TasksRoot -TaskKey $TaskKey | ConvertFrom-Json -Depth 8
+    }
+    finally {
+        if ($null -eq $replanMarker) { Remove-Item Env:AI_TASK_SCAFFOLD_REPLAN -ErrorAction SilentlyContinue } else { $env:AI_TASK_SCAFFOLD_REPLAN = $replanMarker }
+    }
+    $operations = @($lockedPlan.WorktreeOperations)
+    $taskOperation = [string]$lockedPlan.TaskOperation
+    $taskReason = [string]$lockedPlan.TaskReason
     if ($taskOperation -ne 'remove') {
         $blocked = $operations | Where-Object Action -eq 'blocked' | Select-Object -First 1
         $reason = if ($blocked) { $blocked.Reason } else { $taskReason }
@@ -166,6 +177,13 @@ if ($Apply) {
     }
     if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey)) {
         throw "cannot teardown task '$TaskKey': unsafe-task-path"
+    }
+    $expectedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', 'artifacts', 'worktrees')
+    $finalEntries = @(Get-ChildItem -LiteralPath $taskPath -Force)
+    if (@($finalEntries | Where-Object Name -notin $expectedEntries).Count -gt 0 -or
+        @($finalEntries | Where-Object Name -in $expectedEntries).Count -ne $expectedEntries.Count -or
+        @(Get-ChildItem -LiteralPath (Join-Path $taskPath 'worktrees') -Force).Count -ne 0) {
+        throw "cannot teardown task '$TaskKey': task changed during removal"
     }
     Remove-Item -LiteralPath $taskPath -Recurse -Force
     }
