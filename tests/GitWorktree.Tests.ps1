@@ -237,6 +237,27 @@ Describe 'Invoke-TaskWorktreePlan' {
         Test-Path -LiteralPath (Join-Path $externalPath 'api') | Should -BeFalse
     }
 
+    It 'rejects a symlinked worktree swapped after planning on Linux' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'api-operation-symlink'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $tasksRoot = Join-Path $TestDrive 'tasks-operation-symlink'
+        $destination = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
+        $externalPath = Join-Path $TestDrive 'external-operation-symlink'
+        & git -C $repositoryPath worktree add -b feature/FEATURE-123 $externalPath main | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        New-Item -ItemType SymbolicLink -Path $destination -Target $externalPath | Out-Null
+
+        Test-TaskWorktreeOperationSafety -TasksRoot $tasksRoot -TaskKey 'FEATURE-123' -RepositoryName 'api' -RepositoryPath $repositoryPath -WorktreePath $destination -Branch 'feature/FEATURE-123' -ExpectedCommonDir (Get-GitCommonDir -RepositoryPath $repositoryPath) | Should -BeFalse
+        Test-Path -LiteralPath $externalPath | Should -BeTrue
+    }
+
     It 'refuses a reused worktree replaced after planning' {
         $repositoryPath = Join-Path $TestDrive 'api-reuse-replaced'
         $replacementRepositoryPath = Join-Path $TestDrive 'api-reuse-replacement'

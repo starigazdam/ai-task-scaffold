@@ -119,8 +119,7 @@ if ($Apply) {
         throw "cannot teardown task '$TaskKey': unsafe-task-path"
     }
     foreach ($operation in $operations) {
-        if ((Get-GitCommonDir -RepositoryPath $operation.RepositoryPath) -cne $operation.CommonDir -or
-            -not (Test-TaskWorktreeIdentity -RepositoryPath $operation.RepositoryPath -WorktreePath $operation.Path -Branch $operation.Branch -ExpectedCommonDir $operation.CommonDir)) {
+        if (-not (Test-TaskWorktreeOperationSafety -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $operation.Repository -RepositoryPath $operation.RepositoryPath -WorktreePath $operation.Path -Branch $operation.Branch -ExpectedCommonDir $operation.CommonDir)) {
             throw "cannot teardown task '$TaskKey': worktree changed since planning"
         }
         if (@(& git -C $operation.Path status --porcelain).Count -ne 0) {

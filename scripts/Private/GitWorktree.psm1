@@ -30,6 +30,22 @@ function Test-TaskWorktreeIdentity {
     return $repositoryCommonDir -and $repositoryCommonDir -ceq $worktreeCommonDir -and $worktreeBranch -ceq $Branch
 }
 
+function Test-TaskWorktreeOperationSafety {
+    param(
+        [string]$TasksRoot,
+        [string]$TaskKey,
+        [string]$RepositoryName,
+        [string]$RepositoryPath,
+        [string]$WorktreePath,
+        [string]$Branch,
+        [string]$ExpectedCommonDir
+    )
+
+    return (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $RepositoryName) -and
+        (Get-GitCommonDir -RepositoryPath $RepositoryPath) -ceq $ExpectedCommonDir -and
+        (Test-TaskWorktreeIdentity -RepositoryPath $RepositoryPath -WorktreePath $WorktreePath -Branch $Branch -ExpectedCommonDir $ExpectedCommonDir)
+}
+
 function Get-TaskWorktreeDestination {
     param([string]$TasksRoot, [string]$TaskKey, [string]$RepositoryName)
 
@@ -147,4 +163,4 @@ function Invoke-TaskWorktreePlan {
     }
 }
 
-Export-ModuleMember -Function Get-GitCommonDir, Test-TaskWorktreeIdentity, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan
+Export-ModuleMember -Function Get-GitCommonDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan
