@@ -19,6 +19,8 @@ Describe 'Start-TaskScaffold' {
 }
 '@ | Set-Content -LiteralPath (Join-Path $workspaceRoot 'task-scaffold.settings.json') -NoNewline
         $global:taskWizardAnswers = @('y', 'FEATURE-123', 'Add endpoint', $prdPath, 'y', 'y')
+        Import-Module (Join-Path $PSScriptRoot '../scripts/Private/TerminalSelector.psm1') -Force
+        Mock Select-TaskRepositories { @('api') }
         Mock Read-Host {
             $answer = $global:taskWizardAnswers[0]
             $global:taskWizardAnswers = @($global:taskWizardAnswers | Select-Object -Skip 1)
@@ -26,7 +28,7 @@ Describe 'Start-TaskScaffold' {
         }
 
         $script = Join-Path $PSScriptRoot '../scripts/Start-TaskScaffold.ps1'
-        & $script -WorkspaceRoot $workspaceRoot -RepositoryNames api | Out-Null
+        & $script -WorkspaceRoot $workspaceRoot | Out-Null
 
         $taskPath = Join-Path $workspaceRoot 'tasks/FEATURE-123'
         Test-Path -LiteralPath (Join-Path $taskPath 'PRD.md') | Should -BeTrue
