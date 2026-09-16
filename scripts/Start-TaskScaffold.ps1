@@ -32,7 +32,11 @@ if ((Read-Host 'Is PRD.md ready to copy into the task? [y/N]') -notmatch '^(?i:y
 }
 
 $builder = Join-Path $PSScriptRoot 'Invoke-TaskRequestBuilder.ps1'
-& $builder -WorkspaceRoot $workspaceRootPath -OutputPath $RequestPath -RepositoryNames $RepositoryNames | Out-Null
+$builderParameters = @{ WorkspaceRoot = $workspaceRootPath; OutputPath = $RequestPath }
+if ($PSBoundParameters.ContainsKey('RepositoryNames') -and $null -ne $RepositoryNames) {
+    $builderParameters.RepositoryNames = $RepositoryNames
+}
+& $builder @builderParameters | Out-Null
 
 $scaffold = Join-Path $PSScriptRoot 'Invoke-TaskScaffold.ps1'
 $plan = & $scaffold -RequestPath $RequestPath -TasksRoot $TasksRoot | ConvertFrom-Json

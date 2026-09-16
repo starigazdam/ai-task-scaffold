@@ -87,6 +87,32 @@ Describe 'ConvertTo-TaskRequest' {
 }
 
 Describe 'Invoke-TaskRequestBuilder' {
+    It 'selects repositories interactively when RepositoryNames is omitted' {
+        $workspaceRoot = Join-Path $TestDrive 'workspace'
+        $canonsPath = Join-Path $workspaceRoot 'canons'
+        New-Item -ItemType Directory -Path (Join-Path $canonsPath 'api') -Force | Out-Null
+        @'
+{
+  "schemaVersion": 1,
+  "repositories": { "api": { "baseBranch": "develop" } }
+}
+'@ | Set-Content -LiteralPath (Join-Path $workspaceRoot 'task-scaffold.settings.json') -NoNewline
+        $outputPath = Join-Path $workspaceRoot 'omitted-request.json'
+        Import-Module (Join-Path $PSScriptRoot '../scripts/Private/TerminalSelector.psm1') -Force
+        Mock Select-TaskRepositories { @('api') }
+        $global:taskRequestBuilderAnswers = @('FEATURE-123', 'Add endpoint', 'prd.md', 'y')
+        Mock Read-Host {
+            $answer = $global:taskRequestBuilderAnswers[0]
+            $global:taskRequestBuilderAnswers = @($global:taskRequestBuilderAnswers | Select-Object -Skip 1)
+            $answer
+        }
+
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskRequestBuilder.ps1'
+        & $script -WorkspaceRoot $workspaceRoot -OutputPath $outputPath | Out-Null
+
+        (Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json).repositories.Name | Should -Be 'api'
+    }
+
     It 'suggests configured canons and writes a reviewed request without applying task state' {
         $workspaceRoot = Join-Path $TestDrive 'workspace'
         $canonsPath = Join-Path $workspaceRoot 'canons'
