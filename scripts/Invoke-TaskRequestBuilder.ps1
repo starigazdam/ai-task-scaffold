@@ -48,7 +48,7 @@ if ($key -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
 }
 $title = Read-Host 'Task title'
 $prdPath = Read-Host 'PRD path'
-$selectedNames = @(if (@($RepositoryNames).Count -gt 0) { $RepositoryNames } else { Select-TaskRepositories -Names @($available.Name) })
+$selectedNames = @(if ($PSBoundParameters.ContainsKey('RepositoryNames') -and @($RepositoryNames).Count -gt 0) { $RepositoryNames } else { Select-TaskRepositories -Names @($available.Name) })
 if ($selectedNames.Count -eq 0) {
     throw 'select at least one configured canon'
 }
