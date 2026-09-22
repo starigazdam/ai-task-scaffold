@@ -32,7 +32,7 @@ Describe 'Start-TaskScaffold' {
 
         $taskPath = Join-Path $workspaceRoot 'tasks/FEATURE-123'
         Test-Path -LiteralPath (Join-Path $taskPath 'PRD.md') | Should -BeTrue
-        (Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw) | Should -Be "# Add endpoint`n"
+        (Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw) | Should -Be (Get-Content -LiteralPath $prdPath -Raw)
         (& git -C (Join-Path $taskPath 'worktrees/api') branch --show-current) | Should -Be 'feature/FEATURE-123'
     }
 }

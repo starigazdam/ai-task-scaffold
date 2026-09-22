@@ -280,7 +280,8 @@ Describe 'Invoke-TaskWorktreePlan' {
         & git -C $replacementRepositoryPath worktree add -b feature/FEATURE-123 $reusePlan.Destination main | Out-Null
 
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $reusePlan } | Should -Throw '*reused worktree changed since planning*'
-        (@(& git -C $replacementRepositoryPath worktree list --porcelain) -join "`n") | Should -Match ([regex]::Escape($reusePlan.Destination))
+        $expectedDestination = ([IO.Path]::GetFullPath($reusePlan.Destination)).Replace('\', '/')
+        (@(& git -C $replacementRepositoryPath worktree list --porcelain) -join "`n") | Should -Match ([regex]::Escape($expectedDestination))
     }
 
     It 'rejects a same-branch worktree with a different Git directory' {

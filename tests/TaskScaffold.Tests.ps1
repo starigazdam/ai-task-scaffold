@@ -10,15 +10,11 @@ Describe 'Invoke-TaskScaffold' {
         & git -C $repositoryPath commit -m fixture | Out-Null
 
         $requestPath = Join-Path $TestDrive 'task-request.json'
-        @"
-{
-  "schemaVersion": 1,
-  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "$(Join-Path $TestDrive 'prd.md')" },
-  "repositories": [
-    { "name": "api", "path": "$repositoryPath", "baseBranch": "main", "branch": "feature/FEATURE-123" }
-  ]
-}
-"@ | Set-Content -LiteralPath $requestPath -NoNewline
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = (Join-Path $TestDrive 'prd.md') }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
 
         $workspaceRoot = Join-Path $TestDrive 'workspace'
         $tasksRoot = Join-Path $TestDrive 'tasks'
@@ -45,15 +41,11 @@ Describe 'Invoke-TaskScaffold' {
         $prdPath = Join-Path $TestDrive 'prd.md'
         Set-Content -LiteralPath $prdPath -Value '# Add endpoint'
         $requestPath = Join-Path $TestDrive 'apply-request.json'
-        @"
-{
-  "schemaVersion": 1,
-  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "$prdPath" },
-  "repositories": [
-    { "name": "api", "path": "$repositoryPath", "baseBranch": "main", "branch": "feature/FEATURE-123" }
-  ]
-}
-"@ | Set-Content -LiteralPath $requestPath -NoNewline
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = $prdPath }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
 
         $workspaceRoot = Join-Path $TestDrive 'workspace-apply'
         $tasksRoot = Join-Path $TestDrive 'tasks-apply'
@@ -61,7 +53,7 @@ Describe 'Invoke-TaskScaffold' {
         & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply | Out-Null
 
         $taskPath = Join-Path $tasksRoot 'FEATURE-123'
-        (Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw) | Should -Be "# Add endpoint`n"
+        (Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw) | Should -Be (Get-Content -LiteralPath $prdPath -Raw)
         Test-Path -LiteralPath (Join-Path $taskPath 'PLAN.md') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $taskPath 'STATUS.md') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $taskPath 'task.json') | Should -BeTrue
@@ -126,16 +118,12 @@ Describe 'Invoke-TaskScaffold' {
         $workspaceFile = Join-Path $TestDrive 'team.code-workspace'
         '{ "folders": [], "settings": { "keep": true } }' | Set-Content -LiteralPath $workspaceFile -NoNewline
         $requestPath = Join-Path $TestDrive 'workspace-request.json'
-        @"
-{
-  "schemaVersion": 1,
-  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "$prdPath" },
-  "repositories": [
-    { "name": "api", "path": "$repositoryPath", "baseBranch": "main", "branch": "feature/FEATURE-123" }
-  ],
-  "workspace": { "file": "$workspaceFile" }
-}
-"@ | Set-Content -LiteralPath $requestPath -NoNewline
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = $prdPath }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            workspace = [ordered]@{ file = $workspaceFile }
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
 
         $workspaceRoot = Join-Path $TestDrive 'workspace-root'
         $tasksRoot = Join-Path $TestDrive 'workspace-tasks'
@@ -170,26 +158,18 @@ Describe 'Invoke-TaskScaffold' {
         $existingTask = Join-Path $tasksRoot 'FEATURE-123'
         New-Item -ItemType Directory -Path $existingTask -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $existingTask 'PRD.md') -Value '# Different PRD'
-        @"
-{
-  "schemaVersion": 1,
-  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "PRD.md" },
-  "repositories": [
-    { "name": "api", "path": "$repositoryPath", "baseBranch": "main", "branch": "feature/FEATURE-123" }
-  ],
-  "phases": []
-}
-"@ | Set-Content -LiteralPath (Join-Path $existingTask 'task.json') -NoNewline
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = 'PRD.md' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            phases = @()
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $existingTask 'task.json') -NoNewline
         $requestPath = Join-Path $TestDrive 'collision-request.json'
-        @"
-{
-  "schemaVersion": 1,
-  "task": { "key": "FEATURE-123", "title": "Add endpoint", "prdPath": "$prdPath" },
-  "repositories": [
-    { "name": "api", "path": "$repositoryPath", "baseBranch": "main", "branch": "feature/FEATURE-123" }
-  ]
-}
-"@ | Set-Content -LiteralPath $requestPath -NoNewline
+        [ordered]@{
+            schemaVersion = 1
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint'; prdPath = $prdPath }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
 
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply } | Should -Throw '*different PRD.md*'
