@@ -33,3 +33,7 @@ pwsh -NoProfile -Command "Invoke-Pester -Path ./tests -CI -Output Detailed"
 ```
 
 Prefer the narrowest relevant Pester file first, then run the full suite before handing off changes. Do not commit generated NuGet DLLs or other dependency-cache output.
+
+## Shared delivery guidance
+
+Read and follow the root [`.hermes.md`](.hermes.md) before planning or changing this repository.
