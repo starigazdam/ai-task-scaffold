@@ -1,4 +1,19 @@
 Describe 'TerminalSelector' {
+    It 'shows repository candidates before reading redirected selection' {
+        $module = Join-Path $PSScriptRoot '../scripts/Private/TerminalSelector.psm1'
+        Import-Module $module -Force
+
+        InModuleScope TerminalSelector {
+            Mock Read-Host { 'api, web' }
+            Mock Write-Host {}
+
+            $selected = Read-TaskRepositorySelection -Names @('api', 'web')
+
+            $selected | Should -Be @('api', 'web')
+            Should -Invoke Write-Host -Times 1 -ParameterFilter { $Object -eq 'Available repositories: api, web' }
+        }
+    }
+
     It 'restores the locked Terminal.Gui dependency before loading the picker' {
         $restore = Join-Path $PSScriptRoot '../scripts/Restore-TaskScaffoldDependencies.ps1'
         & $restore

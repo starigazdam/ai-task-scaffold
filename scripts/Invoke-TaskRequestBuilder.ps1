@@ -41,13 +41,13 @@ if ($available.Count -eq 0) {
     throw "no configured canons found under '$canonsPath'"
 }
 
-Write-Host 'Choose repositories:'
 $key = Read-Host 'Task key'
 if ($key -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
     throw "invalid task key '$key'"
 }
 $title = Read-Host 'Task title'
-$prdPath = Read-Host 'PRD path'
+$prdPath = Read-Host 'PRD path (leave blank to create a starter)'
+Write-Host 'Choose repositories:'
 $selectedNames = @(if ($PSBoundParameters.ContainsKey('RepositoryNames') -and $null -ne $RepositoryNames -and @($RepositoryNames).Count -gt 0) { $RepositoryNames } else { Select-TaskRepositories -Names @($available.Name) })
 if ($selectedNames.Count -eq 0) {
     throw 'select at least one configured canon'
@@ -82,7 +82,7 @@ $repositories = @($selectedNames | Sort-Object | ForEach-Object {
     }
 })
 $request = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     task = [ordered]@{ key = $key; title = $title; prdPath = $prdPath }
     repositories = $repositories
 }
