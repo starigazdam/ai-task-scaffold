@@ -48,6 +48,15 @@ Describe 'Invoke-TaskTeardown' {
         (& git -C $script:repositoryPath branch --format '%(refname:short)') | Should -Contain 'feature/FEATURE-123'
     }
 
+    It 'removes a legacy task without .ctx after explicit confirmation' {
+        Remove-Item -LiteralPath (Join-Path $script:taskPath '.ctx') -Force
+
+        & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply | Out-Null
+
+        Test-Path -LiteralPath $script:taskPath | Should -BeFalse
+        (& git -C $script:repositoryPath worktree list --porcelain) | Should -Not -Match ([regex]::Escape($script:worktreePath))
+    }
+
     It 'blocks teardown when a manifest worktree is missing' {
         Remove-Item -LiteralPath $script:worktreePath -Recurse -Force
 
