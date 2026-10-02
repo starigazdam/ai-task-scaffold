@@ -139,6 +139,40 @@ Describe 'Invoke-TaskScaffold' {
         Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
     }
 
+    It 'rechecks covered inputs under the mutation lock before mutating state' {
+        $repositoryPath = Join-Path $TestDrive 'api-under-lock'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $requestPath = Join-Path $TestDrive 'under-lock-request.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        $tasksRoot = Join-Path $TestDrive 'under-lock-tasks'
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+        function Enter-TaskMutationLock {
+            param([string]$TasksRoot)
+            $lock = & (Get-Module GitWorktree) { param($root) Enter-TaskMutationLock -TasksRoot $root } $TasksRoot
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'base branch advanced under the mutation lock'
+            & git -C $repositoryPath add README.md
+            & git -C $repositoryPath commit -m 'advance base under lock' | Out-Null
+            return $lock
+        }
+        try {
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*plan identity changed before apply*'
+        }
+        finally {
+            Remove-Item -Path function:Enter-TaskMutationLock -Force -ErrorAction SilentlyContinue
+        }
+
+        (& git -C $repositoryPath log -1 --format=%s) | Should -Be 'advance base under lock'
+        Test-Path -LiteralPath (Join-Path $tasksRoot '.ai-task-scaffold.lock') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
+    }
+
     It 'rejects changed profile instructions before creating task state' {
         $repositoryPath = Join-Path $TestDrive 'api-profile-identity'
         New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
@@ -530,6 +564,21 @@ Describe 'Invoke-TaskScaffold' {
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*reconciliation is required*'
         Test-Path -LiteralPath (Join-Path $tasksRoot '.ai-task-scaffold.lock') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $taskPath 'worktrees/api') | Should -BeFalse
+
+        $manifestPath = Join-Path $taskPath 'task.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $manifest.profiles | Where-Object { $_.name -eq 'team' } | ForEach-Object { $_.path = $newProfilePath }
+        $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
+
+        $reconciledPlan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $reconciledPlan.ProfileIdentityMatches | Should -BeTrue
+        $reconciledPlan.ProfilePathDrift.Count | Should -Be 0
+        & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $reconciledPlan.PlanIdentity | Out-Null
+
+        Test-Path -LiteralPath (Join-Path $taskPath 'worktrees/api') | Should -BeTrue
+        $reconciledManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $reconciledManifest.profiles.name | Should -Be @('team', 'task-scaffold')
+        ([IO.Path]::GetFullPath([string]$reconciledManifest.profiles[0].path)) | Should -Be ([IO.Path]::GetFullPath($newProfilePath))
     }
 
     It 'adds the injected profile when applying a legacy profileless task manifest' {

@@ -65,6 +65,19 @@ Each profile name must be unique and each path must be an absolute path to an ex
 
 The scaffold appends its own `agent-profile/` as `task-scaffold`. Dry-run reports requested, injected, and effective profiles. Apply persists effective `{name, path}` entries in `tasks/<TASK-KEY>/task.json`; legacy manifests without profiles are treated as pre-profile tasks and gain the field when applied. Profile names and order are task identity. If an existing task has the same names/order but different resolved paths, dry-run reports path drift and apply stops pending reconciliation.
 
+### Reconciling profile path drift
+
+When dry-run reports profile path drift, apply fails with a `reconciliation is required` error before any mutation; the scaffold never retargets an existing task's profile path automatically. The supported recovery is exact manual reconciliation followed by a fresh plan and approval:
+
+1. Edit `tasks/<TASK-KEY>/task.json` and change the affected profile's `path` to the new resolved path, preserving each profile's `name` and its position in the ordered `profiles` list.
+2. Re-run the dry-run and confirm `ProfilePathDrift` is empty and `ProfileIdentityMatches` is `true`.
+3. Apply with the freshly issued `PlanIdentity`:
+
+```powershell
+$plan = ./scripts/Invoke-TaskScaffold.ps1 -RequestPath ./task-request.json -TasksRoot ./tasks | ConvertFrom-Json
+./scripts/Invoke-TaskScaffold.ps1 -RequestPath ./task-request.json -TasksRoot ./tasks -Apply -ExpectedPlanIdentity $plan.PlanIdentity
+```
+
 When a workspace file is supplied, the plan proposes `[AI] <name>` folders pointing to the original profile roots, alongside task worktrees. Workspace changes remain a separate add-only, hash-gated operation. The scaffold also plans `.ctx` from the ordered effective profiles, with exactly one existing-format `name:path` entry per profile. Dry-run reports the target and content without creating it; `-Apply` creates or reconciles the file. No `home:` directive is generated. Task-scaffold does not invoke `ctx` or activate CLI profiles; ctx consumes the persisted effective profile list later.
 
 ## Reviewed Plan Identity
