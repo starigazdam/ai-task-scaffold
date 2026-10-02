@@ -23,6 +23,8 @@ Describe 'Invoke-TaskTeardown' {
         '# PRD' | Set-Content -LiteralPath (Join-Path $script:taskPath 'PRD.md') -NoNewline
         '# Plan' | Set-Content -LiteralPath (Join-Path $script:taskPath 'PLAN.md') -NoNewline
         '# Status' | Set-Content -LiteralPath (Join-Path $script:taskPath 'STATUS.md') -NoNewline
+        $taskScaffoldPath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../agent-profile')).Path
+        Set-Content -LiteralPath (Join-Path $script:taskPath '.ctx') -Value "task-scaffold:$taskScaffoldPath`n" -NoNewline
         $script:worktreePath = Join-Path $script:taskPath 'worktrees/api'
         & git -C $script:repositoryPath worktree add -b feature/FEATURE-123 $script:worktreePath main | Out-Null
         $script:scriptPath = Join-Path $PSScriptRoot '../scripts/Invoke-TaskTeardown.ps1'
@@ -44,6 +46,15 @@ Describe 'Invoke-TaskTeardown' {
         Test-Path -LiteralPath $script:taskPath | Should -BeFalse
         (& git -C $script:repositoryPath worktree list --porcelain) | Should -Not -Match ([regex]::Escape($script:worktreePath))
         (& git -C $script:repositoryPath branch --format '%(refname:short)') | Should -Contain 'feature/FEATURE-123'
+    }
+
+    It 'removes a legacy task without .ctx after explicit confirmation' {
+        Remove-Item -LiteralPath (Join-Path $script:taskPath '.ctx') -Force
+
+        & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply | Out-Null
+
+        Test-Path -LiteralPath $script:taskPath | Should -BeFalse
+        (& git -C $script:repositoryPath worktree list --porcelain) | Should -Not -Match ([regex]::Escape($script:worktreePath))
     }
 
     It 'blocks teardown when a manifest worktree is missing' {

@@ -29,4 +29,4 @@ Review every operation. Stop if any operation is `blocked`.
 ./scripts/Invoke-TaskScaffold.ps1 -RequestPath <request.json> -TasksRoot <tasks-root> -Apply
 ```
 
-`-Apply` creates only task-local state and worktrees. It copies the source PRD as `PRD.md` and never changes a canon.
+`-Apply` creates only task-local state and worktrees. For a new task it copies an available source PRD as `PRD.md`, or creates a headed starter when the source is blank or missing. For an existing task it preserves the current PRD and collision checks. It never changes a canon.

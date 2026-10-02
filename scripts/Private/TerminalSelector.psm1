@@ -79,12 +79,20 @@ namespace TaskScaffold {
 '@
 }
 
+function Read-TaskRepositorySelection {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$Names)
+
+    Write-Host "Available repositories: $($Names -join ', ')"
+    return @((Read-Host 'Repositories (comma-separated names)') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
 function Select-TaskRepositories {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string[]]$Names)
 
     if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
-        return @((Read-Host 'Repositories (comma-separated names)') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        return @(Read-TaskRepositorySelection -Names $Names)
     }
 
     Initialize-TerminalGui

@@ -24,7 +24,7 @@ if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey)) {
     $taskReason = 'unsafe-task-path'
 }
 elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
-    $expectedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', 'artifacts', 'worktrees')
+    $expectedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', '.ctx', 'artifacts', 'worktrees')
     $unexpectedEntry = Get-ChildItem -LiteralPath $taskPath -Force |
         Where-Object Name -notin $expectedEntries |
         Select-Object -First 1
@@ -178,10 +178,11 @@ if ($Apply) {
     if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey)) {
         throw "cannot teardown task '$TaskKey': unsafe-task-path"
     }
-    $expectedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', 'artifacts', 'worktrees')
+    $allowedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', '.ctx', 'artifacts', 'worktrees')
+    $requiredEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', 'artifacts', 'worktrees')
     $finalEntries = @(Get-ChildItem -LiteralPath $taskPath -Force)
-    if (@($finalEntries | Where-Object Name -notin $expectedEntries).Count -gt 0 -or
-        @($finalEntries | Where-Object Name -in $expectedEntries).Count -ne $expectedEntries.Count -or
+    if (@($finalEntries | Where-Object Name -notin $allowedEntries).Count -gt 0 -or
+        @($finalEntries | Where-Object Name -in $requiredEntries).Count -ne $requiredEntries.Count -or
         @(Get-ChildItem -LiteralPath (Join-Path $taskPath 'worktrees') -Force).Count -ne 0) {
         throw "cannot teardown task '$TaskKey': task changed during removal"
     }

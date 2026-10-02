@@ -1,5 +1,5 @@
 Describe 'Start-TaskScaffold' {
-    It 'checks selected canons, reviews a plan, and applies only after PRD-copy confirmation' {
+    It 'creates a starter PRD when none is supplied and applies only after confirmation' {
         $workspaceRoot = Join-Path $TestDrive 'workspace'
         $canonsPath = Join-Path $workspaceRoot 'canons'
         $repositoryPath = Join-Path $canonsPath 'api'
@@ -10,17 +10,17 @@ Describe 'Start-TaskScaffold' {
         Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
         & git -C $repositoryPath add README.md
         & git -C $repositoryPath commit -m fixture | Out-Null
-        $prdPath = Join-Path $TestDrive 'prd.md'
-        Set-Content -LiteralPath $prdPath -Value '# Add endpoint'
         @'
 {
   "schemaVersion": 1,
   "repositories": { "api": { "baseBranch": "main" } }
 }
 '@ | Set-Content -LiteralPath (Join-Path $workspaceRoot 'task-scaffold.settings.json') -NoNewline
-        $global:taskWizardAnswers = @('y', 'FEATURE-123', 'Add endpoint', $prdPath, 'y', 'y')
+        $global:taskWizardAnswers = @('FEATURE-123', 'Add endpoint', '', 'y', 'y')
+        $global:taskWizardMessages = @()
         Import-Module (Join-Path $PSScriptRoot '../scripts/Private/TerminalSelector.psm1') -Force
         Mock Select-TaskRepositories { @('api') }
+        Mock Write-Host { $global:taskWizardMessages += [string]$Object }
         Mock Read-Host {
             $answer = $global:taskWizardAnswers[0]
             $global:taskWizardAnswers = @($global:taskWizardAnswers | Select-Object -Skip 1)
@@ -31,8 +31,10 @@ Describe 'Start-TaskScaffold' {
         & $script -WorkspaceRoot $workspaceRoot | Out-Null
 
         $taskPath = Join-Path $workspaceRoot 'tasks/FEATURE-123'
-        Test-Path -LiteralPath (Join-Path $taskPath 'PRD.md') | Should -BeTrue
-        (Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw) | Should -Be (Get-Content -LiteralPath $prdPath -Raw)
+        $prd = Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw
+        $prd | Should -Match '^# Add endpoint'
+        $prd | Should -Match '## Acceptance Criteria'
+        ($global:taskWizardMessages -join "`n") | Should -Match 'No PRD source supplied; a starter PRD.md will be created\.'
         (& git -C (Join-Path $taskPath 'worktrees/api') branch --show-current) | Should -Be 'feature/FEATURE-123'
     }
 }

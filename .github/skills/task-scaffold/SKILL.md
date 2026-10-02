@@ -27,10 +27,10 @@ Use for a new local multi-repository task.
 ./scripts/Start-TaskScaffold.ps1 -WorkspaceRoot <workspace-root>
 ```
 
-The wizard selects configured canons, writes and displays `task-request.json`, displays the plan, then separately confirms copying `PRD.md` and applying worktree creation.
+The wizard collects the task details, then selects configured canons as its final input step. A PRD source is optional: a blank or missing source creates a headed starter `PRD.md`. The wizard writes and displays `task-request.json`, displays the plan, then separately confirms the PRD action and worktree creation.
 
 ## Guardrails
 
-- Prepare the PRD before starting.
+- Review whether the plan copies a source PRD or creates a starter; fill in the starter before implementation.
 - Stop on any blocked plan operation.
 - Do not use canons for mutations.
