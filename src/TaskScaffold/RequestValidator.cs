@@ -38,6 +38,34 @@ public sealed class ProfileEntry
     public string Path { get; init; } = string.Empty;
 }
 
+public sealed class NormalizedRepository
+{
+    public string Name { get; init; } = string.Empty;
+
+    public string Path { get; init; } = string.Empty;
+
+    public string BaseBranch { get; init; } = string.Empty;
+
+    public string Branch { get; init; } = string.Empty;
+}
+
+public sealed class NormalizedRequest
+{
+    public int SchemaVersion { get; init; }
+
+    public string TaskKey { get; init; } = string.Empty;
+
+    public string TaskTitle { get; init; } = string.Empty;
+
+    public string? PrdPath { get; init; }
+
+    public List<NormalizedRepository> Repositories { get; init; } = new();
+
+    public List<ProfileEntry> Profiles { get; init; } = new();
+
+    public string? WorkspaceFile { get; init; }
+}
+
 public sealed class ValidationResult
 {
     [JsonPropertyName("valid")]
@@ -60,6 +88,9 @@ public sealed class ValidationResult
 
     [JsonPropertyName("workspaceFile")]
     public string? WorkspaceFile { get; init; }
+
+    [JsonIgnore]
+    public NormalizedRequest Normalized { get; init; } = new();
 }
 
 public static class RequestValidator
@@ -157,6 +188,7 @@ public static class RequestValidator
             }
 
             var repositories = new List<RepositoryEntry>();
+            var normalizedRepositories = new List<NormalizedRepository>();
             var repositoryNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var repositoryElement in repositoriesElement.EnumerateArray())
             {
@@ -190,10 +222,18 @@ public static class RequestValidator
                     throw new InputException($"invalid Git branch '{branch}'");
                 }
 
+                var resolvedPath = ResolvePath(rawPath, requestDirectory);
                 repositories.Add(new RepositoryEntry
                 {
                     Name = name,
-                    Path = ResolvePath(rawPath, requestDirectory),
+                    Path = resolvedPath,
+                });
+                normalizedRepositories.Add(new NormalizedRepository
+                {
+                    Name = name,
+                    Path = resolvedPath,
+                    BaseBranch = baseBranch,
+                    Branch = branch,
                 });
             }
 
@@ -278,6 +318,16 @@ public static class RequestValidator
                 PrdPath = prdPath,
                 Profiles = profiles,
                 WorkspaceFile = workspaceFile,
+                Normalized = new NormalizedRequest
+                {
+                    SchemaVersion = 3,
+                    TaskKey = key,
+                    TaskTitle = title,
+                    PrdPath = prdPath,
+                    Repositories = normalizedRepositories,
+                    Profiles = profiles,
+                    WorkspaceFile = workspaceFile,
+                },
             };
         }
     }
