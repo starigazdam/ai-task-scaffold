@@ -24,4 +24,18 @@ Describe 'scaffold skill surfaces' {
             Test-Path -LiteralPath (Join-Path $scriptsRoot $expected[$name]) | Should -BeTrue
         }
     }
+
+    It 'declares valid frontmatter for the scaffolded task workflow skill' {
+        $path = Join-Path $PSScriptRoot '../agent-profile/.agents/skills/scaffolded-task-workflow/SKILL.md'
+        Test-Path -LiteralPath $path | Should -BeTrue
+        $content = Get-Content -LiteralPath $path -Raw
+        $frontmatter = [regex]::Match(
+            $content,
+            '\A---\r?\nname: scaffolded-task-workflow\r?\ndescription: (?<description>[A-Za-z][A-Za-z .-]*)\r?\n---\r?\n'
+        )
+        $frontmatter.Success | Should -BeTrue
+        $description = $frontmatter.Groups['description'].Value
+        $description | Should -Not -BeNullOrEmpty
+        $description.Length | Should -BeLessOrEqual 60
+    }
 }
