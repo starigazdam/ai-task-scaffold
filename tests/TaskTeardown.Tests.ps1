@@ -1,4 +1,19 @@
 Describe 'Invoke-TaskTeardown' {
+    BeforeAll {
+        function Add-ManifestTaskFiles {
+            param([string]$ManifestPath, [string[]]$Paths)
+
+            $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+            if ($manifest.PSObject.Properties['taskFiles']) {
+                $manifest.taskFiles = $Paths
+            }
+            else {
+                $manifest | Add-Member -NotePropertyName taskFiles -NotePropertyValue $Paths
+            }
+            $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -NoNewline
+        }
+    }
+
     BeforeEach {
         $script:fixtureRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString())
         $script:tasksRoot = Join-Path $script:fixtureRoot 'tasks'
@@ -225,5 +240,85 @@ exit "$status"
         $plan.TaskOperation | Should -Be 'blocked'
         ($plan.WorktreeOperations | Where-Object Repository -eq 'external').Reason | Should -Be 'symlink-worktree-entry'
         Test-Path -LiteralPath $script:repositoryPath | Should -BeTrue
+    }
+
+    It 'removes recorded caller files and their nested directories after confirmation' {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('AGENTS.md', 'guidance/AGENTS.md')
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'AGENTS.md') -Value 'x' -NoNewline
+        New-Item -ItemType Directory -Path (Join-Path $script:taskPath 'guidance') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'guidance/AGENTS.md') -Value 'y' -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+        $plan.TaskOperation | Should -Be 'remove'
+        & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply | Out-Null
+
+        Test-Path -LiteralPath $script:taskPath | Should -BeFalse
+    }
+
+    It 'blocks teardown when an unrecorded task-root entry exists' {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('AGENTS.md')
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'AGENTS.md') -Value 'x' -NoNewline
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'extra.txt') -Value 'z' -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'unexpected-task-entry:extra.txt'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unexpected-task-entry*'
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+    }
+
+    It 'blocks teardown when a recorded directory holds unrecorded nested content' {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('guidance/AGENTS.md')
+        New-Item -ItemType Directory -Path (Join-Path $script:taskPath 'guidance') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'guidance/AGENTS.md') -Value 'y' -NoNewline
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'guidance/extra.txt') -Value 'z' -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'unrecorded-task-file'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unrecorded-task-file*'
+        Test-Path -LiteralPath (Join-Path $script:taskPath 'guidance/extra.txt') | Should -BeTrue
+    }
+
+    It 'blocks teardown when a recorded caller file is missing' {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('guidance/AGENTS.md')
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'missing-recorded-task-file'
+    }
+
+    It 'rejects an invalid recorded caller path without removing task state' {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('../escape.md')
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'invalid-recorded-task-file'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*invalid-recorded-task-file*'
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+    }
+
+    It 'refuses a recorded caller path that is a symlink without following it' -Skip:(-not $IsLinux) {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('guidance/AGENTS.md')
+        $externalPath = Join-Path $script:fixtureRoot 'external-recorded'
+        New-Item -ItemType Directory -Path $externalPath -Force | Out-Null
+        New-Item -ItemType SymbolicLink -Path (Join-Path $script:taskPath 'guidance') -Target $externalPath | Out-Null
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'unsafe-task-file'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unsafe-task-file*'
+        Test-Path -LiteralPath (Join-Path $externalPath 'AGENTS.md') | Should -BeFalse
     }
 }

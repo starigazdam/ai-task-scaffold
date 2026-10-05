@@ -65,6 +65,26 @@ Each profile name must be unique and each path must be an absolute path to an ex
 
 The scaffold appends its own `agent-profile/` as `task-scaffold`. Dry-run reports requested, injected, and effective profiles. Apply persists effective `{name, path}` entries in `tasks/<TASK-KEY>/task.json`; legacy manifests without profiles are treated as pre-profile tasks and gain the field when applied. Profile names and order are task identity. If an existing task has the same names/order but different resolved paths, dry-run reports path drift and apply stops pending reconciliation.
 
+## Caller-supplied task files
+
+Schema-version-2 requests may include an optional `taskFiles` array of `{ "path": "<relative path>", "content": "<exact text>" }` descriptors. Each `path` is resolved beneath the task root; `content` is written as UTF-8 without a BOM and with no newline or Unicode normalization.
+
+```json
+{
+  "schemaVersion": 2,
+  "task": { "key": "FEATURE-123", "title": "Add endpoint" },
+  "repositories": [
+    { "name": "api", "path": "C:/work/canons/api", "baseBranch": "main", "branch": "feature/FEATURE-123" }
+  ],
+  "taskFiles": [
+    { "path": "AGENTS.md", "content": "Team guidance for this task." },
+    { "path": "guidance/rules.md", "content": "Exact content." }
+  ]
+}
+```
+
+Paths must be relative, must not traverse outside the task root, and any symlink/reparse point along an existing segment is rejected. Destinations may not collide with `task.json`, `PRD.md`, `PLAN.md`, `STATUS.md`, `.ctx`, `artifacts/`, or `worktrees/`, nor duplicate or nest within one another. The plan reports `create`, `noop` (byte-identical existing file), or `conflict` for each destination; a conflict blocks apply before any task or worktree mutation, and existing files are never overwritten. The normalized relative path, the content bytes, and the current destination state are bound into `PlanIdentity`, so any drift between plan and apply requires a fresh approval. Applied paths are recorded in `task.json`'s `taskFiles` array so teardown can remove them while still rejecting unrecorded entries. Requests that omit `taskFiles` are unchanged.
+
 ### Reconciling profile path drift
 
 When dry-run reports profile path drift, apply fails with a `reconciliation is required` error before any mutation; the scaffold never retargets an existing task's profile path automatically. The supported recovery is exact manual reconciliation followed by a fresh plan and approval:

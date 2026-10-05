@@ -83,6 +83,90 @@ function Get-TaskCtxFilePlan {
     return [ordered]@{ Path = $Path; Action = $action; Content = $Content }
 }
 
+function Test-TaskCustomAncestorConflict {
+    param([string]$TaskPath, [string]$RelativePath)
+
+    $segments = @($RelativePath.Split('/'))
+    $current = [IO.Path]::GetFullPath($TaskPath)
+    for ($index = 0; $index -lt ($segments.Count - 1); $index++) {
+        $current = [IO.Path]::GetFullPath((Join-Path $current $segments[$index]))
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and -not $item.PSIsContainer) { return $true }
+    }
+    return $false
+}
+
+function Get-TaskCustomFileOperations {
+    param([object[]]$TaskFiles, [string]$TaskPath)
+
+    $operations = @()
+    foreach ($file in $TaskFiles) {
+        $destination = Get-TaskCustomFileDestination -TaskPath $TaskPath -RelativePath $file.Path
+        $contentHash = Get-TaskFileContentHash -Content $file.Content
+        $action = 'create'
+        $reason = $null
+        if (-not (Test-TaskCustomPathSafety -TaskPath $TaskPath -RelativePath $file.Path)) {
+            $action = 'conflict'
+            $reason = 'unsafe-task-file-path'
+        }
+        else {
+            $state = Get-TaskCustomFileState -TaskPath $TaskPath -RelativePath $file.Path
+            if ($state.Exists) {
+                if ($state.IsReparsePoint) {
+                    $action = 'conflict'
+                    $reason = 'reparse-point'
+                }
+                elseif (-not $state.IsFile) {
+                    $action = 'conflict'
+                    $reason = 'destination-is-directory'
+                }
+                elseif ($state.Sha256 -ceq $contentHash) {
+                    $action = 'noop'
+                }
+                else {
+                    $action = 'conflict'
+                    $reason = 'destination-differs'
+                }
+            }
+            elseif (Test-TaskCustomAncestorConflict -TaskPath $TaskPath -RelativePath $file.Path) {
+                $action = 'conflict'
+                $reason = 'ancestor-is-file'
+            }
+        }
+        $operations += [ordered]@{
+            Path = $file.Path
+            Destination = $destination
+            Action = $action
+            Reason = $reason
+            ContentHash = $contentHash
+        }
+    }
+    return $operations
+}
+
+function Get-RecordedTaskFiles {
+    param([string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { return @() }
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json -Depth 10
+    $property = $manifest.PSObject.Properties['taskFiles']
+    if (-not $property -or $null -eq $property.Value) { return @() }
+    return @($property.Value | ForEach-Object { [string]$_ })
+}
+
+function Merge-TaskFilePaths {
+    param([string[]]$Existing, [string[]]$Requested)
+
+    $comparer = Get-TaskPathComparer
+    $merged = @($Existing)
+    foreach ($path in $Requested) {
+        if (-not ($merged | Where-Object { $comparer.Equals($_, $path) })) {
+            $merged += $path
+        }
+    }
+    return $merged
+}
+
 function Assert-TaskPathSafety {
     if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $request.Task.Key)) {
         throw "cannot scaffold task '$($request.Task.Key)': unsafe-task-path"
@@ -181,7 +265,8 @@ function New-TaskScaffoldPlan {
         [object]$ProfileState,
         [object[]]$WorktreeOperations,
         [object]$WorkspaceFolderPlan,
-        [object]$CtxFilePlan
+        [object]$CtxFilePlan,
+        [object[]]$CustomFileOperations
     )
 
     return [ordered]@{
@@ -197,6 +282,7 @@ function New-TaskScaffoldPlan {
         WorktreeOperations = $WorktreeOperations
         WorkspaceFolderPlan = $WorkspaceFolderPlan
         CtxFilePlan = $CtxFilePlan
+        CustomFileOperations = @($CustomFileOperations)
         RequiresConfirmation = $true
     }
 }
@@ -205,7 +291,8 @@ $prdOperation = Get-TaskPrdOperation -TaskExists $taskExists
 $profileState = Get-TaskProfileState -ManifestPath $manifestPath
 $workspaceFolderPlan = Get-TaskWorkspaceFolderPlan -Request $request -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -ScriptsRoot $PSScriptRoot
 $ctxFilePlan = Get-TaskCtxFilePlan -Path $ctxPath -Content $ctxContent
-$plan = New-TaskScaffoldPlan -TaskExists $taskExists -PrdOperation $prdOperation -ProfileState $profileState -WorktreeOperations $worktreeOperations -WorkspaceFolderPlan $workspaceFolderPlan -CtxFilePlan $ctxFilePlan
+$customFileOperations = @(Get-TaskCustomFileOperations -TaskFiles $request.TaskFiles -TaskPath $taskPath)
+$plan = New-TaskScaffoldPlan -TaskExists $taskExists -PrdOperation $prdOperation -ProfileState $profileState -WorktreeOperations $worktreeOperations -WorkspaceFolderPlan $workspaceFolderPlan -CtxFilePlan $ctxFilePlan -CustomFileOperations $customFileOperations
 $planIdentity = Get-TaskPlanIdentity -Request $request -TasksRoot $TasksRoot -ScaffoldRoot $scaffoldRoot -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -Plan $plan
 
 if ($Apply) {
@@ -241,7 +328,8 @@ if ($Apply) {
     $profileState = Get-TaskProfileState -ManifestPath $manifestPath
     $workspaceFolderPlan = Get-TaskWorkspaceFolderPlan -Request $request -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -ScriptsRoot $PSScriptRoot
     $ctxFilePlan = Get-TaskCtxFilePlan -Path $ctxPath -Content $ctxContent
-    $plan = New-TaskScaffoldPlan -TaskExists $taskExists -PrdOperation $prdOperation -ProfileState $profileState -WorktreeOperations $worktreeOperations -WorkspaceFolderPlan $workspaceFolderPlan -CtxFilePlan $ctxFilePlan
+    $customFileOperations = @(Get-TaskCustomFileOperations -TaskFiles $request.TaskFiles -TaskPath $taskPath)
+    $plan = New-TaskScaffoldPlan -TaskExists $taskExists -PrdOperation $prdOperation -ProfileState $profileState -WorktreeOperations $worktreeOperations -WorkspaceFolderPlan $workspaceFolderPlan -CtxFilePlan $ctxFilePlan -CustomFileOperations $customFileOperations
     $currentPlanIdentity = Get-TaskPlanIdentity -Request $request -TasksRoot $TasksRoot -ScaffoldRoot $scaffoldRoot -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -Plan $plan
     if ($ExpectedPlanIdentity -cne $currentPlanIdentity) {
         throw 'task-scaffold plan identity changed before apply; no task state was changed; replan and approve again'
@@ -253,6 +341,10 @@ if ($Apply) {
     $blockedOperation = $worktreeOperations | Where-Object Action -eq 'blocked' | Select-Object -First 1
     if ($blockedOperation) {
         throw "cannot apply blocked worktree plan for '$($blockedOperation.Repository)': $($blockedOperation.Reason)"
+    }
+    $customConflict = $customFileOperations | Where-Object Action -eq 'conflict' | Select-Object -First 1
+    if ($customConflict) {
+        throw "cannot apply task file '$($customConflict.Path)': $($customConflict.Reason)"
     }
 
     if ($taskExists) {
@@ -331,20 +423,82 @@ phases:
 "@ | Set-Content -LiteralPath $statusPath -NoNewline
     }
 
+    foreach ($operation in $customFileOperations) {
+        if ($operation.Action -eq 'noop') { continue }
+        if (-not (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $operation.Path)) {
+            throw "cannot write task file '$($operation.Path)': unsafe-task-file-path"
+        }
+        $taskFile = $request.TaskFiles | Where-Object { $_.Path -ceq $operation.Path } | Select-Object -First 1
+        New-Item -ItemType Directory -Path (Split-Path -Parent $operation.Destination) -Force | Out-Null
+        if (-not (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $operation.Path)) {
+            throw "cannot write task file '$($operation.Path)': unsafe-task-file-path"
+        }
+        $bytes = Get-TaskFileContentBytes -Content $taskFile.Content
+        $stream = [IO.File]::Open($operation.Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+
+    $recordedTaskFiles = @(Get-RecordedTaskFiles -ManifestPath $manifestPath)
+    $requestedTaskFilePaths = @($request.TaskFiles | ForEach-Object { $_.Path })
+    $mergedTaskFiles = @(Merge-TaskFilePaths -Existing $recordedTaskFiles -Requested $requestedTaskFilePaths)
+    $taskFilesChanged = $false
+    if ($requestedTaskFilePaths.Count -gt 0) {
+        $taskFileComparer = Get-TaskPathComparer
+        if ($mergedTaskFiles.Count -ne $recordedTaskFiles.Count) {
+            $taskFilesChanged = $true
+        }
+        else {
+            for ($index = 0; $index -lt $mergedTaskFiles.Count; $index++) {
+                if (-not $taskFileComparer.Equals($mergedTaskFiles[$index], $recordedTaskFiles[$index])) {
+                    $taskFilesChanged = $true
+                    break
+                }
+            }
+        }
+    }
+
     if (-not (Test-Path -LiteralPath $manifestPath)) {
         Assert-TaskPathSafety
-        [ordered]@{
+        $newManifest = [ordered]@{
             schemaVersion = $expectedContract.schemaVersion
             task = $expectedContract.task
             repositories = $expectedContract.repositories
             profiles = $expectedProfiles
             phases = @()
-        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
+        }
+        if ($mergedTaskFiles.Count -gt 0) {
+            $newManifest['taskFiles'] = $mergedTaskFiles
+        }
+        $newManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
     }
     elseif ($profileState.RequiresMigration) {
         Assert-TaskPathSafety
         $existingManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 10
         $existingManifest | Add-Member -NotePropertyName profiles -NotePropertyValue $expectedProfiles
+        if ($mergedTaskFiles.Count -gt 0) {
+            if ($existingManifest.PSObject.Properties['taskFiles']) {
+                if ($taskFilesChanged) { $existingManifest.taskFiles = $mergedTaskFiles }
+            }
+            else {
+                $existingManifest | Add-Member -NotePropertyName taskFiles -NotePropertyValue $mergedTaskFiles
+            }
+        }
+        $existingManifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -NoNewline
+    }
+    elseif ($taskFilesChanged) {
+        Assert-TaskPathSafety
+        $existingManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 10
+        if ($existingManifest.PSObject.Properties['taskFiles']) {
+            $existingManifest.taskFiles = $mergedTaskFiles
+        }
+        else {
+            $existingManifest | Add-Member -NotePropertyName taskFiles -NotePropertyValue $mergedTaskFiles
+        }
         $existingManifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -NoNewline
     }
     Assert-TaskPathSafety
