@@ -615,4 +615,90 @@ Describe 'Invoke-TaskScaffold' {
         $manifest.profiles.Name | Should -Be 'task-scaffold'
         $manifest.repositories.Name | Should -Be 'api'
     }
+
+    $switcherRoot = $env:AI_CTX_PROFILES_SWITCHER_ROOT
+    $switcherEntryPoint = if ([string]::IsNullOrWhiteSpace($switcherRoot)) { $null } else { Join-Path $switcherRoot 'ctx.sh' }
+    $switcherAvailable = $null -ne $switcherEntryPoint -and (Test-Path -LiteralPath $switcherEntryPoint -PathType Leaf)
+    $switcherRequiredInCi = [bool]$env:CI -and -not $switcherAvailable
+
+    It 'reports and activates the scaffold external profile root for ctx' -Skip:(-not $switcherAvailable -and -not $switcherRequiredInCi) {
+        $switcherRoot = $env:AI_CTX_PROFILES_SWITCHER_ROOT
+        if ($switcherRequiredInCi) {
+            throw 'AI_CTX_PROFILES_SWITCHER_ROOT must point at a merged switcher checkout in CI; refusing to silently skip the external-profile integration test'
+        }
+
+        $scaffoldRoot = Split-Path -Parent $PSScriptRoot
+        $configRoot = Join-Path $TestDrive 'ctx-primary'
+        $syntheticHomeRoot = Join-Path $TestDrive 'ctx-synthetic-home'
+        $homeRoot = Join-Path $TestDrive 'ctx-home'
+        $teamProfilePath = Join-Path $configRoot 'profiles/team'
+        New-Item -ItemType Directory -Path $teamProfilePath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $teamProfilePath 'AGENTS.md') -Value '# Team profile'
+
+        $repositoryPath = Join-Path $TestDrive 'api-external-profiles'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+
+        $requestPath = Join-Path $TestDrive 'external-profiles-request.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            profiles = @([ordered]@{ name = 'team'; path = $teamProfilePath })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        $tasksRoot = Join-Path $TestDrive 'external-profiles-tasks'
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $externalProfilesRootBefore = [Environment]::GetEnvironmentVariable('AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT', 'Process')
+
+        try {
+            $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+            $plan.ExternalProfilesRoot | Should -Be $scaffoldRoot
+            $plan.CurrentExternalProfilesRoot | Should -Be $externalProfilesRootBefore
+            [Environment]::GetEnvironmentVariable('AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT', 'Process') | Should -Be $externalProfilesRootBefore
+
+            $staleExternalProfilesRoot = Join-Path $TestDrive 'ctx-stale-external'
+            [Environment]::SetEnvironmentVariable('AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT', $staleExternalProfilesRoot, 'Process')
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*plan identity changed since review*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+            [Environment]::SetEnvironmentVariable('AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT', $externalProfilesRootBefore, 'Process')
+
+            & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity | Out-Null
+
+            $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT | Should -Be $scaffoldRoot
+            $externalProfilesRoot = $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT
+            $ctxPath = Join-Path (Join-Path $tasksRoot 'FEATURE-123') '.ctx'
+            Test-Path -LiteralPath $ctxPath | Should -BeTrue
+
+            $bashScript = @'
+set -euo pipefail
+export HOME="$1"
+export AI_CTX_PROFILES_CONFIG_ROOT="$2"
+export AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT="$3"
+export AI_CTX_PROFILES_SWITCHER_ROOT="$4"
+export AI_CTX_PROFILES_SYNTHETIC_HOMES_ROOT="$5"
+export AI_CTX_PROFILES_COPILOT_MODE=synthetic-home
+export CTX_AUTO_LOAD=0
+. "$4/ctx.sh"
+ctx load "$6"
+if [ "${AI_CTX_PROFILES:-}" != "team+task-scaffold" ]; then
+    printf 'unexpected AI_CTX_PROFILES=%s\n' "${AI_CTX_PROFILES:-}" >&2
+    exit 1
+fi
+if [ -n "${COPILOT_CUSTOM_INSTRUCTIONS_DIRS:-}" ]; then
+    printf 'unexpected COPILOT_CUSTOM_INSTRUCTIONS_DIRS=%s\n' "$COPILOT_CUSTOM_INSTRUCTIONS_DIRS" >&2
+    exit 1
+fi
+ctx clear --all
+printf 'CTX_EXTERNAL_PROFILES_OK\n'
+'@
+
+            $bashOutput = & bash -c $bashScript 'ctx-profile-test' $homeRoot $configRoot $externalProfilesRoot $switcherRoot $syntheticHomeRoot $ctxPath
+            $LASTEXITCODE | Should -Be 0
+            ($bashOutput -join "`n") | Should -Match 'CTX_EXTERNAL_PROFILES_OK'
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable('AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT', $externalProfilesRootBefore, 'Process')
+        }
+    }
 }

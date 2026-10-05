@@ -191,6 +191,8 @@ function New-TaskScaffoldPlan {
         RequestedProfiles = @($request.Profiles)
         InjectedProfiles = @($taskScaffoldProfile)
         EffectiveProfiles = $effectiveProfiles
+        ExternalProfilesRoot = $scaffoldRoot
+        CurrentExternalProfilesRoot = [Environment]::GetEnvironmentVariable('AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT', 'Process')
         ProfileIdentityMatches = $ProfileState.IdentityMatches
         ProfilePathDrift = $ProfileState.PathDrift
         ProfileManifestMigrationRequired = $ProfileState.RequiresMigration
@@ -364,6 +366,7 @@ phases:
     foreach ($operation in $worktreeOperations) {
         Invoke-TaskWorktreePlan -Repository ($request.Repositories | Where-Object Name -eq $operation.Repository) -Plan $operation
     }
+    $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT = $scaffoldRoot
     }
     finally {
         $mutationLock.Dispose()

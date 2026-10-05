@@ -11,6 +11,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check out merged ai-ctx-profiles-switcher
+        uses: actions/checkout@v4
+        with:
+          repository: starigazdam/ai-ctx-profiles-switcher
+          ref: 22536f532bf63b4a910b79f9ebb0d08f18ba2498
+          path: .deps/ai-ctx-profiles-switcher
+          persist-credentials: false
       - name: Install Pester
         shell: pwsh
         run: Install-Module Pester -RequiredVersion 6.2.0 -Force -Scope CurrentUser
@@ -19,4 +26,6 @@ jobs:
         run: ./scripts/Restore-TaskScaffoldDependencies.ps1
       - name: Run tests
         shell: pwsh
+        env:
+          AI_CTX_PROFILES_SWITCHER_ROOT: ${{ github.workspace }}/.deps/ai-ctx-profiles-switcher
         run: Invoke-Pester -Path ./tests -CI -Output Detailed
