@@ -1110,6 +1110,23 @@ Describe 'Invoke-TaskScaffold task files' {
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
         { & $script -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'task-files-win-dup-tasks') } | Should -Throw '*duplicate task file path*'
     }
+
+    It 'rejects a Windows 8.3 short-name task file path before any mutation' -Skip:(-not $IsWindows) {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-short-name'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $requestPath = Join-Path $TestDrive 'task-files-short-name.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123' })
+            taskFiles = @([ordered]@{ path = 'WORKTR~1/x.md'; content = 'y' })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $tasksRoot = Join-Path $TestDrive 'task-files-short-name-tasks'
+
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot } | Should -Throw '*task file path*'
+        Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+    }
 }
 
 Describe 'ConvertTo-TaskRequest task files' {
@@ -1187,7 +1204,7 @@ Describe 'ConvertTo-TaskRequest task files' {
     }
 
     It 'rejects collisions with scaffold-managed outputs and trees' {
-        $managedPaths = @('task.json', 'PRD.md', 'PLAN.md', 'STATUS.md', '.ctx', 'artifacts', 'artifacts/x.md', 'worktrees', 'worktrees/api/file')
+        $managedPaths = @('task.json', 'PRD.md', 'PRD.MD', 'PLAN.md', 'STATUS.md', '.ctx', 'artifacts', 'artifacts/x.md', 'worktrees', 'worktrees/api/file')
         foreach ($managedPath in $managedPaths) {
             $path = New-TaskFilesContractRequest -TaskFiles @([ordered]@{ path = $managedPath; content = 'x' })
             { ConvertTo-TaskRequest -Path $path } | Should -Throw '*collides with a scaffold-managed path*'

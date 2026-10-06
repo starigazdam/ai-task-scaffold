@@ -49,6 +49,9 @@ function ConvertTo-TaskRelativeFilePath {
             $segment.Contains([char]0) -or $segment.Contains(':')) {
             throw "invalid task file path '$Path'"
         }
+        if ([OperatingSystem]::IsWindows() -and $segment -match '~\d') {
+            throw "task file path must not use a Windows 8.3 short name: '$Path'"
+        }
     }
     return ($segments -join '/')
 }
@@ -138,9 +141,10 @@ function Test-TaskManagedTaskFilePath {
     $comparer = Get-TaskPathComparer
 
     if ([string]::IsNullOrWhiteSpace($TaskPath)) {
+        $firstSegmentComparer = [System.StringComparer]::OrdinalIgnoreCase
         $firstSegment = @($RelativePath.Split('/'))[0]
         foreach ($entry in $managedEntries) {
-            if ($comparer.Equals($firstSegment, $entry)) { return $true }
+            if ($firstSegmentComparer.Equals($firstSegment, $entry)) { return $true }
         }
         return $false
     }
