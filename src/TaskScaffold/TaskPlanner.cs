@@ -51,6 +51,9 @@ public sealed class TaskPlanResult
 
     [JsonPropertyName("plan")]
     public TaskPlan Plan { get; init; } = new();
+
+    [JsonIgnore]
+    public TaskStatePlanned? State { get; init; }
 }
 
 public sealed class CanonicalPlanInput
@@ -72,6 +75,18 @@ public sealed class CanonicalPlanInput
     public string TasksRoot { get; init; } = string.Empty;
 
     public List<CanonicalOperation> WorktreeOperations { get; init; } = new();
+
+    public bool TaskExists { get; init; }
+
+    public List<CanonicalFileIdentity> ManagedFiles { get; init; } = new();
+
+    public bool ArtifactsDirectoryExists { get; init; }
+
+    public CanonicalFileIdentity? PrdSource { get; init; }
+
+    public List<CanonicalProfileIdentity> ProfileIdentities { get; init; } = new();
+
+    public List<CanonicalCustomFile> CustomFiles { get; init; } = new();
 }
 
 public sealed class CanonicalRepository
@@ -117,6 +132,168 @@ public sealed class CanonicalOperation
     public string? DestinationIdentity { get; init; }
 }
 
+public sealed class CanonicalFileIdentity
+{
+    public string Path { get; init; } = string.Empty;
+
+    public bool Exists { get; init; }
+
+    public string? Sha256 { get; init; }
+}
+
+public sealed class CanonicalSkillIdentity
+{
+    public string Name { get; init; } = string.Empty;
+
+    public CanonicalFileIdentity Skill { get; init; } = new();
+}
+
+public sealed class CanonicalProfileIdentity
+{
+    public string Name { get; init; } = string.Empty;
+
+    public string Path { get; init; } = string.Empty;
+
+    public CanonicalFileIdentity Instructions { get; init; } = new();
+
+    public List<CanonicalSkillIdentity> Skills { get; init; } = new();
+}
+
+public sealed class CanonicalDestinationState
+{
+    public string Path { get; init; } = string.Empty;
+
+    public bool Exists { get; init; }
+
+    public bool IsFile { get; init; }
+
+    public bool IsReparsePoint { get; init; }
+
+    public string? Sha256 { get; init; }
+}
+
+public sealed class CanonicalCustomFile
+{
+    public string Path { get; init; } = string.Empty;
+
+    public string ContentSha256 { get; init; } = string.Empty;
+
+    public CanonicalDestinationState Destination { get; init; } = new();
+}
+
+public static class TaskScaffoldPaths
+{
+    public static ScaffoldPaths Resolve()
+    {
+        var directory = AppContext.BaseDirectory;
+        while (!string.IsNullOrEmpty(directory))
+        {
+            var agentProfilePath = Path.Combine(directory, "agent-profile");
+            var prdTemplatePath = Path.Combine(directory, "templates", "PRD.md");
+            if (Directory.Exists(agentProfilePath) && File.Exists(prdTemplatePath))
+            {
+                return new ScaffoldPaths
+                {
+                    RepositoryRoot = directory,
+                    AgentProfilePath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(agentProfilePath)),
+                    PrdTemplatePath = Path.GetFullPath(prdTemplatePath),
+                };
+            }
+
+            directory = Path.GetDirectoryName(directory);
+        }
+
+        throw new OperationalException("could not locate the task scaffold repository root (agent-profile/ and templates/PRD.md)");
+    }
+}
+
+public sealed class ScaffoldPaths
+{
+    public string RepositoryRoot { get; init; } = string.Empty;
+
+    public string AgentProfilePath { get; init; } = string.Empty;
+
+    public string PrdTemplatePath { get; init; } = string.Empty;
+}
+
+public sealed class PrdOperation
+{
+    public string Action { get; init; } = string.Empty;
+
+    public string? SourcePath { get; init; }
+
+    public string Destination { get; init; } = string.Empty;
+
+    public string? Reason { get; init; }
+
+    public string? TemplatePath { get; init; }
+}
+
+public sealed class ProfilePathDrift
+{
+    public string Name { get; init; } = string.Empty;
+
+    public string? ExistingPath { get; init; }
+
+    public string RequestedPath { get; init; } = string.Empty;
+}
+
+public sealed class TaskProfileState
+{
+    public bool IdentityMatches { get; init; }
+
+    public List<ProfilePathDrift> PathDrift { get; init; } = new();
+
+    public bool RequiresMigration { get; init; }
+}
+
+public sealed class CtxFilePlan
+{
+    public string Path { get; init; } = string.Empty;
+
+    public string Action { get; init; } = string.Empty;
+
+    public string Content { get; init; } = string.Empty;
+}
+
+public sealed class CustomFileOperation
+{
+    public string Path { get; init; } = string.Empty;
+
+    public string Destination { get; init; } = string.Empty;
+
+    public string Action { get; init; } = string.Empty;
+
+    public string? Reason { get; init; }
+
+    public string ContentHash { get; init; } = string.Empty;
+}
+
+public sealed class TaskStatePlanned
+{
+    public bool TaskExists { get; init; }
+
+    public string TasksRoot { get; init; } = string.Empty;
+
+    public string TaskPath { get; init; } = string.Empty;
+
+    public string ManifestPath { get; init; } = string.Empty;
+
+    public string CtxPath { get; init; } = string.Empty;
+
+    public string CtxContent { get; init; } = string.Empty;
+
+    public List<CanonicalProfile> EffectiveProfiles { get; init; } = new();
+
+    public PrdOperation PrdOperation { get; init; } = new();
+
+    public TaskProfileState ProfileState { get; init; } = new();
+
+    public CtxFilePlan CtxFilePlan { get; init; } = new();
+
+    public List<CustomFileOperation> CustomFileOperations { get; init; } = new();
+}
+
 public static class TaskPlanner
 {
     private static readonly Regex RemoteQualifiedPattern = new(@"^[^/]+/.+", RegexOptions.CultureInvariant);
@@ -144,7 +321,10 @@ public static class TaskPlanner
             planned.Add(PlanRepository(request.TaskKey, fullTasksRoot, repository));
         }
 
-        var identity = ComputeIdentity(BuildCanonicalInput(request, fullTasksRoot, orderedRepositories, planned));
+        var scaffoldPaths = TaskScaffoldPaths.Resolve();
+        var effectiveProfiles = BuildEffectiveProfiles(request, scaffoldPaths.AgentProfilePath);
+        var state = TaskStatePlanner.Compute(request, fullTasksRoot, effectiveProfiles, scaffoldPaths.PrdTemplatePath);
+        var identity = ComputeIdentity(BuildCanonicalInput(request, fullTasksRoot, orderedRepositories, planned, state));
 
         return new TaskPlanResult
         {
@@ -152,11 +332,31 @@ public static class TaskPlanner
             Plan = new TaskPlan
             {
                 TaskKey = request.TaskKey,
-                TaskOperation = "create",
+                TaskOperation = state.TaskExists ? "reuse" : "create",
                 WorktreeOperations = planned.Select(p => p.Operation).ToList(),
                 RequiresConfirmation = true,
             },
+            State = state,
         };
+    }
+
+    private static List<CanonicalProfile> BuildEffectiveProfiles(NormalizedRequest request, string agentProfilePath)
+    {
+        var effectiveProfiles = request.Profiles
+            .Select(p => new CanonicalProfile { Name = p.Name, Path = p.Path })
+            .ToList();
+        foreach (var profile in effectiveProfiles)
+        {
+            if (TaskFileSafety.PathComparer.Equals(
+                    TaskFileSafety.NormalizeTaskProfilePath(profile.Path),
+                    TaskFileSafety.NormalizeTaskProfilePath(agentProfilePath)))
+            {
+                throw new InputException($"duplicate profile path '{agentProfilePath}'");
+            }
+        }
+
+        effectiveProfiles.Add(new CanonicalProfile { Name = "task-scaffold", Path = agentProfilePath });
+        return effectiveProfiles;
     }
 
     private static PlannedOperation PlanRepository(string taskKey, string tasksRoot, NormalizedRepository repository)
@@ -298,7 +498,7 @@ public static class TaskPlanner
         };
     }
 
-    private static CanonicalPlanInput BuildCanonicalInput(NormalizedRequest request, string tasksRoot, List<NormalizedRepository> repositories, List<PlannedOperation> planned)
+    private static CanonicalPlanInput BuildCanonicalInput(NormalizedRequest request, string tasksRoot, List<NormalizedRepository> repositories, List<PlannedOperation> planned, TaskStatePlanned state)
     {
         return new CanonicalPlanInput
         {
@@ -334,6 +534,12 @@ public static class TaskPlanner
                 SourceCommit = p.SourceCommit,
                 DestinationIdentity = p.DestinationIdentity,
             }).ToList(),
+            TaskExists = state.TaskExists,
+            ManagedFiles = TaskStatePlanner.ManagedFiles(state).ToList(),
+            ArtifactsDirectoryExists = TaskStatePlanner.ArtifactsDirectoryExists(state),
+            PrdSource = TaskStatePlanner.PrdSourceIdentity(request),
+            ProfileIdentities = state.EffectiveProfiles.Select(TaskStatePlanner.ProfileIdentity).ToList(),
+            CustomFiles = TaskStatePlanner.CanonicalCustomFiles(request, state.TaskPath).ToList(),
         };
     }
 
