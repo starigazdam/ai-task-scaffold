@@ -26,6 +26,16 @@ function Get-TaskPathComparer {
     return [System.StringComparer]::Ordinal
 }
 
+function Test-TaskPathPrefix {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Prefix
+    )
+
+    if ($Path.Length -lt $Prefix.Length) { return $false }
+    return (Get-TaskPathComparer).Equals($Path.Substring(0, $Prefix.Length), $Prefix)
+}
+
 function ConvertTo-TaskRelativeFilePath {
     param([string]$Path)
 
@@ -35,7 +45,8 @@ function ConvertTo-TaskRelativeFilePath {
     }
     $segments = @($Path.Replace('\', '/').Split('/'))
     foreach ($segment in $segments) {
-        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -ceq '.' -or $segment -ceq '..' -or $segment.Contains([char]0)) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -ceq '.' -or $segment -ceq '..' -or
+            $segment.Contains([char]0) -or $segment.Contains(':')) {
             throw "invalid task file path '$Path'"
         }
     }
@@ -48,19 +59,28 @@ function Get-TaskCustomFileDestination {
         [Parameter(Mandatory)][string]$RelativePath
     )
 
+    $taskRoot = [IO.Path]::GetFullPath($TaskPath)
     $platformPath = $RelativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)
-    return [IO.Path]::GetFullPath((Join-Path $TaskPath $platformPath))
+    $destination = [IO.Path]::GetFullPath((Join-Path $taskRoot $platformPath))
+    $separator = [IO.Path]::DirectorySeparatorChar
+    if (-not (Test-TaskPathPrefix -Path $destination -Prefix "$taskRoot$separator")) {
+        throw "task file path escapes the task root: '$RelativePath'"
+    }
+    return $destination
 }
 
 function Test-TaskCustomPathSafety {
     param(
         [Parameter(Mandatory)][string]$TaskPath,
-        [Parameter(Mandatory)][string]$RelativePath
+        [Parameter(Mandatory)][string]$RelativePath,
+        [switch]$ExcludeDestination
     )
 
+    $segments = @($RelativePath.Split('/'))
     $current = [IO.Path]::GetFullPath($TaskPath)
-    foreach ($segment in $RelativePath.Split('/')) {
-        $current = [IO.Path]::GetFullPath((Join-Path $current $segment))
+    for ($index = 0; $index -lt $segments.Count; $index++) {
+        if ($ExcludeDestination -and $index -eq ($segments.Count - 1)) { break }
+        $current = [IO.Path]::GetFullPath((Join-Path $current $segments[$index]))
         $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
         if ($null -ne $item -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
             return $false
@@ -109,15 +129,61 @@ function Get-TaskFileContentHash {
 }
 
 function Test-TaskManagedTaskFilePath {
-    param([string]$RelativePath)
+    param(
+        [string]$TaskPath,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
 
-    $comparer = Get-TaskPathComparer
     $managedEntries = @('task.json', 'PRD.md', 'PLAN.md', 'STATUS.md', '.ctx', 'artifacts', 'worktrees')
-    $firstSegment = @($RelativePath.Split('/'))[0]
+    $comparer = Get-TaskPathComparer
+
+    if ([string]::IsNullOrWhiteSpace($TaskPath)) {
+        $firstSegment = @($RelativePath.Split('/'))[0]
+        foreach ($entry in $managedEntries) {
+            if ($comparer.Equals($firstSegment, $entry)) { return $true }
+        }
+        return $false
+    }
+
+    $taskRoot = [IO.Path]::GetFullPath($TaskPath)
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $destination = Get-TaskCustomFileDestination -TaskPath $taskRoot -RelativePath $RelativePath
     foreach ($entry in $managedEntries) {
-        if ($comparer.Equals($firstSegment, $entry)) { return $true }
+        $managedPath = [IO.Path]::GetFullPath((Join-Path $taskRoot $entry))
+        if ($comparer.Equals($destination, $managedPath) -or
+            (Test-TaskPathPrefix -Path $destination -Prefix "$managedPath$separator") -or
+            (Test-TaskPathPrefix -Path $managedPath -Prefix "$destination$separator")) {
+            return $true
+        }
     }
     return $false
+}
+
+function Assert-TaskFileDestinations {
+    param(
+        [Parameter(Mandatory)][string]$TaskPath,
+        [AllowEmptyCollection()][string[]]$RelativePaths
+    )
+
+    $comparer = Get-TaskPathComparer
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $resolved = @()
+    foreach ($relativePath in @($RelativePaths)) {
+        $destination = Get-TaskCustomFileDestination -TaskPath $TaskPath -RelativePath $relativePath
+        if (Test-TaskManagedTaskFilePath -TaskPath $TaskPath -RelativePath $relativePath) {
+            throw "task file path '$relativePath' collides with a scaffold-managed path"
+        }
+        foreach ($existing in $resolved) {
+            if ($comparer.Equals($existing.Destination, $destination)) {
+                throw "duplicate task file path '$relativePath'"
+            }
+            if ((Test-TaskPathPrefix -Path $destination -Prefix "$($existing.Destination)$separator") -or
+                (Test-TaskPathPrefix -Path $existing.Destination -Prefix "$destination$separator")) {
+                throw "task file path '$relativePath' conflicts with '$($existing.RelativePath)'"
+            }
+        }
+        $resolved += [pscustomobject]@{ RelativePath = $relativePath; Destination = $destination }
+    }
 }
 
 function Test-TaskFilePathIsAncestor {
@@ -299,4 +365,4 @@ function ConvertTo-TaskRequest {
     }
 }
 
-Export-ModuleMember -Function ConvertTo-TaskRequest, Test-GitBranchName, Test-TaskRepositoryName, ConvertTo-TaskTaskFiles, ConvertTo-TaskRelativeFilePath, Get-TaskPathComparer, Get-TaskCustomFileDestination, Get-TaskCustomFileState, Test-TaskCustomPathSafety, Test-TaskManagedTaskFilePath, Get-TaskFileContentBytes, Get-TaskFileContentHash
+Export-ModuleMember -Function ConvertTo-TaskRequest, Test-GitBranchName, Test-TaskRepositoryName, ConvertTo-TaskTaskFiles, ConvertTo-TaskRelativeFilePath, Get-TaskPathComparer, Get-TaskCustomFileDestination, Get-TaskCustomFileState, Test-TaskCustomPathSafety, Test-TaskManagedTaskFilePath, Test-TaskPathPrefix, Assert-TaskFileDestinations, Get-TaskFileContentBytes, Get-TaskFileContentHash

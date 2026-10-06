@@ -114,17 +114,29 @@ function Get-TaskScaffoldIdentityMaterial {
     }
     $requestTaskFiles = if ($Request.PSObject.Properties['TaskFiles']) { @($Request.TaskFiles) } else { @() }
     $customTaskFiles = @($requestTaskFiles | ForEach-Object {
-        $destinationState = Get-TaskCustomFileState -TaskPath $taskPath -RelativePath $_.Path
-        [ordered]@{
-            Path = $_.Path
-            ContentSha256 = Get-TaskFileContentHash -Content $_.Content
-            Destination = [ordered]@{
+        if (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $_.Path) {
+            $destinationState = Get-TaskCustomFileState -TaskPath $taskPath -RelativePath $_.Path
+            $destinationMaterial = [ordered]@{
                 Path = $destinationState.Path
                 Exists = $destinationState.Exists
                 IsFile = $destinationState.IsFile
                 IsReparsePoint = $destinationState.IsReparsePoint
                 Sha256 = $destinationState.Sha256
             }
+        }
+        else {
+            $destinationMaterial = [ordered]@{
+                Path = Get-TaskCustomFileDestination -TaskPath $taskPath -RelativePath $_.Path
+                Exists = $true
+                IsFile = $false
+                IsReparsePoint = $true
+                Sha256 = $null
+            }
+        }
+        [ordered]@{
+            Path = $_.Path
+            ContentSha256 = Get-TaskFileContentHash -Content $_.Content
+            Destination = $destinationMaterial
         }
     })
     $engineFiles = @(

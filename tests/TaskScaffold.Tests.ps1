@@ -912,6 +912,204 @@ Describe 'Invoke-TaskScaffold task files' {
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*unsafe-task-file-path*'
         Test-Path -LiteralPath (Join-Path $externalPath 'AGENTS.md') | Should -BeFalse
     }
+
+    It 'rechecks caller files under the mutation lock before mutating state' {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-under-lock'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $requestPath = Join-Path $TestDrive 'task-files-under-lock.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123' })
+            taskFiles = @([ordered]@{ path = 'AGENTS.md'; content = 'reviewed' })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+        $tasksRoot = Join-Path $TestDrive 'task-files-under-lock-tasks'
+        $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+        function Enter-TaskMutationLock {
+            param([string]$TasksRoot)
+            $lock = & (Get-Module GitWorktree) { param($root) Enter-TaskMutationLock -TasksRoot $root } $TasksRoot
+            New-Item -ItemType Directory -Path $taskPath -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $taskPath 'AGENTS.md') -Value 'changed under lock' -NoNewline
+            return $lock
+        }
+        try {
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*plan identity changed before apply*'
+        }
+        finally {
+            Remove-Item -Path function:Enter-TaskMutationLock -Force -ErrorAction SilentlyContinue
+        }
+
+        Test-Path -LiteralPath (Join-Path $tasksRoot '.ai-task-scaffold.lock') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $taskPath 'worktrees/api') | Should -BeFalse
+    }
+
+    It 'reports a symlinked existing destination as a reparse-point conflict' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-reparse-dest'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $TestDrive 'task-files-reparse-dest-tasks'
+        $taskPath = New-ExistingTaskFixture -RepositoryPath $repositoryPath -TasksRoot $tasksRoot -TaskKey 'FEATURE-123'
+        $externalPath = Join-Path $TestDrive 'external-reparse-dest'
+        New-Item -ItemType Directory -Path $externalPath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $externalPath 'secret.txt') -Value 'outside' -NoNewline
+        New-Item -ItemType SymbolicLink -Path (Join-Path $taskPath 'AGENTS.md') -Target (Join-Path $externalPath 'secret.txt') | Out-Null
+        $requestPath = Join-Path $TestDrive 'task-files-reparse-dest.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            taskFiles = @([ordered]@{ path = 'AGENTS.md'; content = 'x' })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $plan.CustomFileOperations[0].Action | Should -Be 'conflict'
+        $plan.CustomFileOperations[0].Reason | Should -Be 'reparse-point'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*reparse-point*'
+        (Get-Content -LiteralPath (Join-Path $externalPath 'secret.txt') -Raw) | Should -Be 'outside'
+    }
+
+    It 'refuses a deeper nested caller link without following it' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-deep-link'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $TestDrive 'task-files-deep-link-tasks'
+        $taskPath = New-ExistingTaskFixture -RepositoryPath $repositoryPath -TasksRoot $tasksRoot -TaskKey 'FEATURE-123'
+        New-Item -ItemType Directory -Path (Join-Path $taskPath 'a') -Force | Out-Null
+        $externalPath = Join-Path $TestDrive 'external-deep-link'
+        New-Item -ItemType Directory -Path $externalPath -Force | Out-Null
+        New-Item -ItemType SymbolicLink -Path (Join-Path $taskPath 'a/link') -Target $externalPath | Out-Null
+        $requestPath = Join-Path $TestDrive 'task-files-deep-link.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            taskFiles = @([ordered]@{ path = 'a/link/AGENTS.md'; content = 'escape' })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $plan.CustomFileOperations[0].Action | Should -Be 'conflict'
+        $plan.CustomFileOperations[0].Reason | Should -Be 'unsafe-task-file-path'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*unsafe-task-file-path*'
+        Test-Path -LiteralPath (Join-Path $externalPath 'AGENTS.md') | Should -BeFalse
+    }
+
+    It 'blocks a caller file whose ancestor is an existing regular file' {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-ancestor-file'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $TestDrive 'task-files-ancestor-file-tasks'
+        $taskPath = New-ExistingTaskFixture -RepositoryPath $repositoryPath -TasksRoot $tasksRoot -TaskKey 'FEATURE-123'
+        Set-Content -LiteralPath (Join-Path $taskPath 'notes') -Value 'not a directory' -NoNewline
+        $requestPath = Join-Path $TestDrive 'task-files-ancestor-file.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            taskFiles = @([ordered]@{ path = 'notes/AGENTS.md'; content = 'x' })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $plan.CustomFileOperations[0].Action | Should -Be 'conflict'
+        $plan.CustomFileOperations[0].Reason | Should -Be 'ancestor-is-file'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*ancestor-is-file*'
+        (Get-Content -LiteralPath (Join-Path $taskPath 'notes') -Raw) | Should -Be 'not a directory'
+        Test-Path -LiteralPath (Join-Path $taskPath 'worktrees/api') | Should -BeFalse
+    }
+
+    It 'leaves workspace and task state untouched when a caller file conflicts' {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-workspace'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $TestDrive 'task-files-workspace-tasks'
+        $taskPath = New-ExistingTaskFixture -RepositoryPath $repositoryPath -TasksRoot $tasksRoot -TaskKey 'FEATURE-123'
+        Set-Content -LiteralPath (Join-Path $taskPath 'AGENTS.md') -Value 'existing' -NoNewline
+        $workspaceFile = Join-Path $TestDrive 'team.code-workspace'
+        '{ "folders": [] }' | Set-Content -LiteralPath $workspaceFile -NoNewline
+        $manifestBefore = Get-Content -LiteralPath (Join-Path $taskPath 'task.json') -Raw
+        $requestPath = Join-Path $TestDrive 'task-files-workspace.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+            workspace = [ordered]@{ file = $workspaceFile }
+            taskFiles = @([ordered]@{ path = 'AGENTS.md'; content = 'requested' })
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $plan.CustomFileOperations[0].Action | Should -Be 'conflict'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*destination-differs*'
+
+        (Get-Content -LiteralPath $workspaceFile -Raw) | Should -Be '{ "folders": [] }'
+        (Get-Content -LiteralPath (Join-Path $taskPath 'task.json') -Raw) | Should -Be $manifestBefore
+        (Get-Content -LiteralPath (Join-Path $taskPath 'PRD.md') -Raw) | Should -Be '# Add endpoint'
+        Test-Path -LiteralPath (Join-Path $taskPath 'PLAN.md') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $taskPath 'STATUS.md') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $taskPath 'worktrees/api') | Should -BeFalse
+    }
+
+    It 'rejects a rooted or traversing caller path before creating any task state' {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-e2e'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $externalPath = Join-Path $TestDrive 'e2e-external'
+        New-Item -ItemType Directory -Path $externalPath -Force | Out-Null
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $cases = @(
+            [pscustomobject]@{ Path = (Join-Path $externalPath 'escape.md') },
+            [pscustomobject]@{ Path = 'escape/../escape.md' }
+        )
+
+        foreach ($case in $cases) {
+            $requestPath = Join-Path $TestDrive ('e2e-request-' + [guid]::NewGuid().ToString() + '.json')
+            [ordered]@{
+                schemaVersion = 2
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+                repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123' })
+                taskFiles = @([ordered]@{ path = $case.Path; content = 'x' })
+            } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+            $tasksRoot = Join-Path $TestDrive ('e2e-tasks-' + [guid]::NewGuid().ToString())
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot } | Should -Throw '*task file path*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+        @(Get-ChildItem -LiteralPath $externalPath -Force).Count | Should -Be 0
+    }
+
+    It 'rejects Windows path aliases of managed outputs' -Skip:(-not $IsWindows) {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-win-alias'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $TestDrive 'task-files-win-alias-tasks'
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        foreach ($alias in @('worktrees./api/AGENTS.md', 'PRD.md.', 'task.json ')) {
+            $requestPath = Join-Path $TestDrive ('win-alias-' + [guid]::NewGuid().ToString() + '.json')
+            [ordered]@{
+                schemaVersion = 2
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+                repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123' })
+                taskFiles = @([ordered]@{ path = $alias; content = 'x' })
+            } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot } | Should -Throw '*collides with a scaffold-managed path*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+    }
+
+    It 'rejects Windows normalization-equivalent duplicate destinations' -Skip:(-not $IsWindows) {
+        $repositoryPath = Join-Path $TestDrive 'api-task-files-win-dup'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $requestPath = Join-Path $TestDrive 'task-files-win-dup.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123' })
+            taskFiles = @(
+                [ordered]@{ path = 'a.md'; content = 'one' },
+                [ordered]@{ path = 'a.md.'; content = 'two' }
+            )
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        { & $script -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'task-files-win-dup-tasks') } | Should -Throw '*duplicate task file path*'
+    }
 }
 
 Describe 'ConvertTo-TaskRequest task files' {
@@ -967,6 +1165,11 @@ Describe 'ConvertTo-TaskRequest task files' {
             $path = New-TaskFilesContractRequest -TaskFiles @([ordered]@{ path = $invalidPath; content = 'x' })
             { ConvertTo-TaskRequest -Path $path } | Should -Throw '*task file path*'
         }
+    }
+
+    It 'rejects a colon inside any task file path segment' {
+        $path = New-TaskFilesContractRequest -TaskFiles @([ordered]@{ path = 'task.json:x'; content = 'x' })
+        { ConvertTo-TaskRequest -Path $path } | Should -Throw '*task file path*'
     }
 
     It 'rejects duplicate and ancestor-conflicting task file destinations' {

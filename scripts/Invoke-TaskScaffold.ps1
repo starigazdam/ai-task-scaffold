@@ -99,13 +99,15 @@ function Test-TaskCustomAncestorConflict {
 function Get-TaskCustomFileOperations {
     param([object[]]$TaskFiles, [string]$TaskPath)
 
+    Assert-TaskFileDestinations -TaskPath $TaskPath -RelativePaths @($TaskFiles | ForEach-Object { $_.Path })
+
     $operations = @()
     foreach ($file in $TaskFiles) {
         $destination = Get-TaskCustomFileDestination -TaskPath $TaskPath -RelativePath $file.Path
         $contentHash = Get-TaskFileContentHash -Content $file.Content
         $action = 'create'
         $reason = $null
-        if (-not (Test-TaskCustomPathSafety -TaskPath $TaskPath -RelativePath $file.Path)) {
+        if (-not (Test-TaskCustomPathSafety -TaskPath $TaskPath -RelativePath $file.Path -ExcludeDestination)) {
             $action = 'conflict'
             $reason = 'unsafe-task-file-path'
         }
@@ -423,26 +425,6 @@ phases:
 "@ | Set-Content -LiteralPath $statusPath -NoNewline
     }
 
-    foreach ($operation in $customFileOperations) {
-        if ($operation.Action -eq 'noop') { continue }
-        if (-not (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $operation.Path)) {
-            throw "cannot write task file '$($operation.Path)': unsafe-task-file-path"
-        }
-        $taskFile = $request.TaskFiles | Where-Object { $_.Path -ceq $operation.Path } | Select-Object -First 1
-        New-Item -ItemType Directory -Path (Split-Path -Parent $operation.Destination) -Force | Out-Null
-        if (-not (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $operation.Path)) {
-            throw "cannot write task file '$($operation.Path)': unsafe-task-file-path"
-        }
-        $bytes = Get-TaskFileContentBytes -Content $taskFile.Content
-        $stream = [IO.File]::Open($operation.Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try {
-            $stream.Write($bytes, 0, $bytes.Length)
-        }
-        finally {
-            $stream.Dispose()
-        }
-    }
-
     $recordedTaskFiles = @(Get-RecordedTaskFiles -ManifestPath $manifestPath)
     $requestedTaskFilePaths = @($request.TaskFiles | ForEach-Object { $_.Path })
     $mergedTaskFiles = @(Merge-TaskFilePaths -Existing $recordedTaskFiles -Requested $requestedTaskFilePaths)
@@ -500,6 +482,26 @@ phases:
             $existingManifest | Add-Member -NotePropertyName taskFiles -NotePropertyValue $mergedTaskFiles
         }
         $existingManifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $manifestPath -NoNewline
+    }
+
+    foreach ($operation in $customFileOperations) {
+        if ($operation.Action -eq 'noop') { continue }
+        if (-not (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $operation.Path)) {
+            throw "cannot write task file '$($operation.Path)': unsafe-task-file-path"
+        }
+        $taskFile = $request.TaskFiles | Where-Object { $_.Path -ceq $operation.Path } | Select-Object -First 1
+        New-Item -ItemType Directory -Path (Split-Path -Parent $operation.Destination) -Force | Out-Null
+        if (-not (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $operation.Path)) {
+            throw "cannot write task file '$($operation.Path)': unsafe-task-file-path"
+        }
+        $bytes = Get-TaskFileContentBytes -Content $taskFile.Content
+        $stream = [IO.File]::Open($operation.Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+        }
+        finally {
+            $stream.Dispose()
+        }
     }
     Assert-TaskPathSafety
     $currentCtx = Get-Item -LiteralPath $ctxPath -Force -ErrorAction SilentlyContinue

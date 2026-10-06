@@ -321,4 +321,34 @@ exit "$status"
         { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unsafe-task-file*'
         Test-Path -LiteralPath (Join-Path $externalPath 'AGENTS.md') | Should -BeFalse
     }
+
+    It 'rejects a differently-cased unrecorded root directory on Linux' -Skip:(-not $IsLinux) {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('AGENTS.md', 'guidance/AGENTS.md')
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'AGENTS.md') -Value 'x' -NoNewline
+        New-Item -ItemType Directory -Path (Join-Path $script:taskPath 'guidance') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'guidance/AGENTS.md') -Value 'y' -NoNewline
+        New-Item -ItemType Directory -Path (Join-Path $script:taskPath 'Guidance') -Force | Out-Null
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'unexpected-task-entry:Guidance'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unexpected-task-entry*'
+        Test-Path -LiteralPath (Join-Path $script:taskPath 'Guidance') | Should -BeTrue
+    }
+
+    It 'rejects a differently-cased unrecorded sibling file on Linux' -Skip:(-not $IsLinux) {
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        Add-ManifestTaskFiles -ManifestPath $manifestPath -Paths @('AGENTS.md')
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'AGENTS.md') -Value 'x' -NoNewline
+        Set-Content -LiteralPath (Join-Path $script:taskPath 'agents.md') -Value 'unrecorded' -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'unexpected-task-entry:agents.md'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unexpected-task-entry*'
+        Test-Path -LiteralPath (Join-Path $script:taskPath 'agents.md') | Should -BeTrue
+    }
 }

@@ -13,7 +13,7 @@ Import-Module (Join-Path $PSScriptRoot 'Private/GitWorktree.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'Private/TaskContract.psm1') -Force
 
 function Get-TaskRecordedTaskFiles {
-    param([string]$ManifestPath)
+    param([string]$ManifestPath, [string]$TaskPath)
 
     $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json -Depth 10
     $property = $manifest.PSObject.Properties['taskFiles']
@@ -26,12 +26,10 @@ function Get-TaskRecordedTaskFiles {
     foreach ($entry in $property.Value) {
         if ($null -eq $entry -or $entry -isnot [string]) { throw "invalid recorded task file entry in '$ManifestPath'" }
         $normalized = ConvertTo-TaskRelativeFilePath -Path $entry
-        if (Test-TaskManagedTaskFilePath -RelativePath $normalized) {
-            throw "recorded task file '$normalized' collides with a scaffold-managed path"
-        }
         if (-not $seen.Add($normalized)) { throw "duplicate recorded task file '$normalized'" }
         $recorded += $normalized
     }
+    Assert-TaskFileDestinations -TaskPath $TaskPath -RelativePaths $recorded
     return $recorded
 }
 
@@ -42,11 +40,13 @@ function Get-TaskRecordedFileLayoutProblem {
     if ($recorded.Count -eq 0) { return $null }
     $comparer = Get-TaskPathComparer
 
-    $groups = [ordered]@{}
+    $groups = [System.Collections.Generic.Dictionary[string, object]]::new($comparer)
     foreach ($relative in $recorded) {
         $top = @($relative.Split('/'))[0]
-        if (-not $groups.Contains($top)) { $groups[$top] = @() }
-        $groups[$top] = @($groups[$top]) + @($relative)
+        if (-not $groups.ContainsKey($top)) {
+            $groups[$top] = [System.Collections.Generic.List[string]]::new()
+        }
+        $groups[$top].Add($relative)
     }
 
     foreach ($top in @($groups.Keys)) {
@@ -117,7 +117,7 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
     $recordedProblem = $null
     if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
         try {
-            $recordedTaskFiles = @(Get-TaskRecordedTaskFiles -ManifestPath $manifestPath)
+            $recordedTaskFiles = @(Get-TaskRecordedTaskFiles -ManifestPath $manifestPath -TaskPath $taskPath)
         }
         catch {
             $recordedProblem = 'invalid-recorded-task-file'
@@ -127,13 +127,14 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
         $taskReason = $recordedProblem
     }
     else {
-        $expectedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', '.ctx', 'artifacts', 'worktrees')
+        $pathComparer = Get-TaskPathComparer
+        $expectedEntries = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
+        foreach ($entry in @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', '.ctx', 'artifacts', 'worktrees')) { [void]$expectedEntries.Add($entry) }
         foreach ($recorded in $recordedTaskFiles) {
-            $top = @($recorded.Split('/'))[0]
-            if ($top -notin $expectedEntries) { $expectedEntries += $top }
+            [void]$expectedEntries.Add(@($recorded.Split('/'))[0])
         }
         $unexpectedEntry = Get-ChildItem -LiteralPath $taskPath -Force |
-            Where-Object Name -notin $expectedEntries |
+            Where-Object { -not $expectedEntries.Contains($_.Name) } |
             Select-Object -First 1
         if ($unexpectedEntry) {
             $taskReason = "unexpected-task-entry:$($unexpectedEntry.Name)"
@@ -291,21 +292,23 @@ if ($Apply) {
     $lockedManifestPath = Join-Path $taskPath 'task.json'
     $finalRecordedTaskFiles = @()
     if (Test-Path -LiteralPath $lockedManifestPath -PathType Leaf) {
-        $finalRecordedTaskFiles = @(Get-TaskRecordedTaskFiles -ManifestPath $lockedManifestPath)
+        $finalRecordedTaskFiles = @(Get-TaskRecordedTaskFiles -ManifestPath $lockedManifestPath -TaskPath $taskPath)
     }
     $finalLayoutProblem = Get-TaskRecordedFileLayoutProblem -TaskPath $taskPath -RecordedTaskFiles $finalRecordedTaskFiles
     if ($finalLayoutProblem) {
         throw "cannot teardown task '$TaskKey': $finalLayoutProblem"
     }
-    $allowedEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', '.ctx', 'artifacts', 'worktrees')
+    $pathComparer = Get-TaskPathComparer
+    $allowedEntries = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
+    foreach ($entry in @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', '.ctx', 'artifacts', 'worktrees')) { [void]$allowedEntries.Add($entry) }
     foreach ($recorded in $finalRecordedTaskFiles) {
-        $top = @($recorded.Split('/'))[0]
-        if ($top -notin $allowedEntries) { $allowedEntries += $top }
+        [void]$allowedEntries.Add(@($recorded.Split('/'))[0])
     }
-    $requiredEntries = @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', 'artifacts', 'worktrees')
+    $requiredEntries = [System.Collections.Generic.HashSet[string]]::new($pathComparer)
+    foreach ($entry in @('PRD.md', 'PLAN.md', 'STATUS.md', 'task.json', 'artifacts', 'worktrees')) { [void]$requiredEntries.Add($entry) }
     $finalEntries = @(Get-ChildItem -LiteralPath $taskPath -Force)
-    if (@($finalEntries | Where-Object Name -notin $allowedEntries).Count -gt 0 -or
-        @($finalEntries | Where-Object Name -in $requiredEntries).Count -ne $requiredEntries.Count -or
+    if (@($finalEntries | Where-Object { -not $allowedEntries.Contains($_.Name) }).Count -gt 0 -or
+        @($finalEntries | Where-Object { $requiredEntries.Contains($_.Name) }).Count -ne $requiredEntries.Count -or
         @(Get-ChildItem -LiteralPath (Join-Path $taskPath 'worktrees') -Force).Count -ne 0) {
         throw "cannot teardown task '$TaskKey': task changed during removal"
     }
