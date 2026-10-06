@@ -49,6 +49,13 @@ public sealed class NormalizedRepository
     public string Branch { get; init; } = string.Empty;
 }
 
+public sealed class NormalizedTaskFile
+{
+    public string Path { get; init; } = string.Empty;
+
+    public string Content { get; init; } = string.Empty;
+}
+
 public sealed class NormalizedRequest
 {
     public int SchemaVersion { get; init; }
@@ -62,6 +69,8 @@ public sealed class NormalizedRequest
     public List<NormalizedRepository> Repositories { get; init; } = new();
 
     public List<ProfileEntry> Profiles { get; init; } = new();
+
+    public List<NormalizedTaskFile> TaskFiles { get; init; } = new();
 
     public string? WorkspaceFile { get; init; }
 }
@@ -97,7 +106,7 @@ public static class RequestValidator
 {
     private static readonly Regex NamePattern = new(@"\A[A-Za-z0-9][A-Za-z0-9._-]*\z", RegexOptions.CultureInvariant);
 
-    public static ValidationResult Validate(string requestPath)
+    public static ValidationResult Validate(string requestPath, bool allowTaskFiles = false)
     {
         string fullRequestPath;
         try
@@ -150,7 +159,9 @@ public static class RequestValidator
 
             CheckForDuplicateProperties(root);
 
-            var rootFields = ReadObject(root, "request", "schemaVersion", "task", "repositories", "profiles", "workspace");
+            var rootFields = ReadObject(root, "request", allowTaskFiles
+                ? new[] { "schemaVersion", "task", "repositories", "profiles", "workspace", "taskFiles" }
+                : new[] { "schemaVersion", "task", "repositories", "profiles", "workspace" });
 
             var version = Require(rootFields, "schemaVersion", "request");
             if (version.ValueKind != JsonValueKind.Number || !version.TryGetInt32(out var schemaVersion) || schemaVersion != 3)
@@ -309,6 +320,12 @@ public static class RequestValidator
                 workspaceFile = ResolvePath(rawFile, requestDirectory);
             }
 
+            var taskFiles = new List<NormalizedTaskFile>();
+            if (rootFields.TryGetValue("taskFiles", out var taskFilesElement))
+            {
+                taskFiles = ParseTaskFiles(taskFilesElement);
+            }
+
             return new ValidationResult
             {
                 Valid = true,
@@ -326,6 +343,7 @@ public static class RequestValidator
                     PrdPath = prdPath,
                     Repositories = normalizedRepositories,
                     Profiles = profiles,
+                    TaskFiles = taskFiles,
                     WorkspaceFile = workspaceFile,
                 },
             };
@@ -358,6 +376,73 @@ public static class RequestValidator
                 throw new InputException($"invalid profile '{profileName}': each entry in .agents/skills must be a skill directory containing SKILL.md");
             }
         }
+    }
+
+    private static List<NormalizedTaskFile> ParseTaskFiles(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Array)
+        {
+            throw new InputException("taskFiles must be an array");
+        }
+
+        var files = new List<NormalizedTaskFile>();
+        var seen = new HashSet<string>(TaskFileSafety.PathComparer);
+        foreach (var descriptor in element.EnumerateArray())
+        {
+            if (descriptor.ValueKind != JsonValueKind.Object)
+            {
+                throw new InputException("invalid task file descriptor: expected path and content");
+            }
+
+            var fields = ReadObject(descriptor, "taskFiles[]", "path", "content");
+            if (!fields.TryGetValue("path", out var pathElement) || !fields.TryGetValue("content", out var contentElement))
+            {
+                throw new InputException("invalid task file descriptor: expected path and content");
+            }
+
+            var rawPath = ReadString(pathElement, "taskFile.path");
+            if (string.IsNullOrEmpty(rawPath))
+            {
+                throw new InputException("task file path is required");
+            }
+
+            var normalized = TaskFileSafety.NormalizeRelativeTaskFilePath(rawPath);
+            if (TaskFileSafety.TestManagedTaskFilePath(null, normalized))
+            {
+                throw new InputException($"task file path '{normalized}' collides with a scaffold-managed path");
+            }
+
+            if (contentElement.ValueKind != JsonValueKind.String)
+            {
+                throw new InputException($"task file '{normalized}' content must be a string");
+            }
+
+            var content = contentElement.GetString() ?? string.Empty;
+            if (!seen.Add(normalized))
+            {
+                throw new InputException($"duplicate task file path '{normalized}'");
+            }
+
+            files.Add(new NormalizedTaskFile { Path = normalized, Content = content });
+        }
+
+        for (var outer = 0; outer < files.Count; outer++)
+        {
+            for (var inner = 0; inner < files.Count; inner++)
+            {
+                if (outer == inner)
+                {
+                    continue;
+                }
+
+                if (TaskFileSafety.TestTaskFilePathIsAncestor(files[outer].Path, files[inner].Path))
+                {
+                    throw new InputException($"task file path '{files[outer].Path}' conflicts with '{files[inner].Path}'");
+                }
+            }
+        }
+
+        return files;
     }
 
     private static bool IsValidGitBranch(string value)
