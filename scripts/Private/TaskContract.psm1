@@ -21,6 +21,229 @@ function Test-AIProfileName {
     return -not [string]::IsNullOrWhiteSpace($Name) -and $Name -match '^[A-Za-z0-9][A-Za-z0-9._-]*$'
 }
 
+function Get-TaskPathComparer {
+    if ([OperatingSystem]::IsWindows()) { return [System.StringComparer]::OrdinalIgnoreCase }
+    return [System.StringComparer]::Ordinal
+}
+
+function Test-TaskPathPrefix {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Prefix
+    )
+
+    if ($Path.Length -lt $Prefix.Length) { return $false }
+    return (Get-TaskPathComparer).Equals($Path.Substring(0, $Prefix.Length), $Prefix)
+}
+
+function ConvertTo-TaskRelativeFilePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw 'task file path is required' }
+    if ([IO.Path]::IsPathRooted($Path) -or $Path -match '^[A-Za-z]:') {
+        throw "task file path must be relative: '$Path'"
+    }
+    $segments = @($Path.Replace('\', '/').Split('/'))
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -ceq '.' -or $segment -ceq '..' -or
+            $segment.Contains([char]0) -or $segment.Contains(':')) {
+            throw "invalid task file path '$Path'"
+        }
+        if ([OperatingSystem]::IsWindows() -and $segment -match '~\d') {
+            throw "task file path must not use a Windows 8.3 short name: '$Path'"
+        }
+    }
+    return ($segments -join '/')
+}
+
+function Get-TaskCustomFileDestination {
+    param(
+        [Parameter(Mandatory)][string]$TaskPath,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
+
+    $taskRoot = [IO.Path]::GetFullPath($TaskPath)
+    $platformPath = $RelativePath.Replace('/', [IO.Path]::DirectorySeparatorChar)
+    $destination = [IO.Path]::GetFullPath((Join-Path $taskRoot $platformPath))
+    $separator = [IO.Path]::DirectorySeparatorChar
+    if (-not (Test-TaskPathPrefix -Path $destination -Prefix "$taskRoot$separator")) {
+        throw "task file path escapes the task root: '$RelativePath'"
+    }
+    return $destination
+}
+
+function Test-TaskCustomPathSafety {
+    param(
+        [Parameter(Mandatory)][string]$TaskPath,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [switch]$ExcludeDestination
+    )
+
+    $segments = @($RelativePath.Split('/'))
+    $current = [IO.Path]::GetFullPath($TaskPath)
+    for ($index = 0; $index -lt $segments.Count; $index++) {
+        if ($ExcludeDestination -and $index -eq ($segments.Count - 1)) { break }
+        $current = [IO.Path]::GetFullPath((Join-Path $current $segments[$index]))
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-TaskCustomFileState {
+    param(
+        [Parameter(Mandatory)][string]$TaskPath,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
+
+    $destination = Get-TaskCustomFileDestination -TaskPath $TaskPath -RelativePath $RelativePath
+    $state = [ordered]@{
+        Path = $destination
+        Exists = $false
+        IsFile = $false
+        IsReparsePoint = $false
+        Sha256 = $null
+    }
+    $item = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item) {
+        $state.Exists = $true
+        $state.IsReparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if (-not $item.PSIsContainer -and -not $state.IsReparsePoint) {
+            $state.IsFile = $true
+            $state.Sha256 = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    return [pscustomobject]$state
+}
+
+function Get-TaskFileContentBytes {
+    param([string]$Content)
+
+    return [Text.UTF8Encoding]::new($false).GetBytes($Content)
+}
+
+function Get-TaskFileContentHash {
+    param([string]$Content)
+
+    $bytes = Get-TaskFileContentBytes -Content $Content
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+function Test-TaskManagedTaskFilePath {
+    param(
+        [string]$TaskPath,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
+
+    $managedEntries = @('task.json', 'PRD.md', 'PLAN.md', 'STATUS.md', '.ctx', 'artifacts', 'worktrees')
+    $comparer = Get-TaskPathComparer
+
+    if ([string]::IsNullOrWhiteSpace($TaskPath)) {
+        $firstSegmentComparer = [System.StringComparer]::OrdinalIgnoreCase
+        $firstSegment = @($RelativePath.Split('/'))[0]
+        foreach ($entry in $managedEntries) {
+            if ($firstSegmentComparer.Equals($firstSegment, $entry)) { return $true }
+        }
+        return $false
+    }
+
+    $taskRoot = [IO.Path]::GetFullPath($TaskPath)
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $destination = Get-TaskCustomFileDestination -TaskPath $taskRoot -RelativePath $RelativePath
+    foreach ($entry in $managedEntries) {
+        $managedPath = [IO.Path]::GetFullPath((Join-Path $taskRoot $entry))
+        if ($comparer.Equals($destination, $managedPath) -or
+            (Test-TaskPathPrefix -Path $destination -Prefix "$managedPath$separator") -or
+            (Test-TaskPathPrefix -Path $managedPath -Prefix "$destination$separator")) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Assert-TaskFileDestinations {
+    param(
+        [Parameter(Mandatory)][string]$TaskPath,
+        [AllowEmptyCollection()][string[]]$RelativePaths
+    )
+
+    $comparer = Get-TaskPathComparer
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $resolved = @()
+    foreach ($relativePath in @($RelativePaths)) {
+        $destination = Get-TaskCustomFileDestination -TaskPath $TaskPath -RelativePath $relativePath
+        if (Test-TaskManagedTaskFilePath -TaskPath $TaskPath -RelativePath $relativePath) {
+            throw "task file path '$relativePath' collides with a scaffold-managed path"
+        }
+        foreach ($existing in $resolved) {
+            if ($comparer.Equals($existing.Destination, $destination)) {
+                throw "duplicate task file path '$relativePath'"
+            }
+            if ((Test-TaskPathPrefix -Path $destination -Prefix "$($existing.Destination)$separator") -or
+                (Test-TaskPathPrefix -Path $existing.Destination -Prefix "$destination$separator")) {
+                throw "task file path '$relativePath' conflicts with '$($existing.RelativePath)'"
+            }
+        }
+        $resolved += [pscustomobject]@{ RelativePath = $relativePath; Destination = $destination }
+    }
+}
+
+function Test-TaskFilePathIsAncestor {
+    param(
+        [Parameter(Mandatory)][string]$Ancestor,
+        [Parameter(Mandatory)][string]$Descendant
+    )
+
+    $ancestorSegments = @($Ancestor.Split('/'))
+    $descendantSegments = @($Descendant.Split('/'))
+    if ($ancestorSegments.Count -ge $descendantSegments.Count) { return $false }
+    $comparer = Get-TaskPathComparer
+    for ($index = 0; $index -lt $ancestorSegments.Count; $index++) {
+        if (-not $comparer.Equals($ancestorSegments[$index], $descendantSegments[$index])) { return $false }
+    }
+    return $true
+}
+
+function ConvertTo-TaskTaskFiles {
+    param([object]$Request)
+
+    $property = $Request.PSObject.Properties['taskFiles']
+    if (-not $property -or $null -eq $property.Value) { return @() }
+    if ($property.Value -isnot [array]) { throw 'taskFiles must be an array' }
+
+    $comparer = Get-TaskPathComparer
+    $seen = [System.Collections.Generic.HashSet[string]]::new($comparer)
+    $files = @()
+    foreach ($descriptor in $property.Value) {
+        if ($null -eq $descriptor) { throw 'invalid task file descriptor: expected path and content' }
+        $pathProperty = $descriptor.PSObject.Properties['path']
+        $contentProperty = $descriptor.PSObject.Properties['content']
+        if (-not $pathProperty -or -not $contentProperty) { throw 'invalid task file descriptor: expected path and content' }
+        if ($null -eq $pathProperty.Value) { throw 'task file path is required' }
+        $normalized = ConvertTo-TaskRelativeFilePath -Path ([string]$pathProperty.Value)
+        if (Test-TaskManagedTaskFilePath -RelativePath $normalized) {
+            throw "task file path '$normalized' collides with a scaffold-managed path"
+        }
+        if ($null -eq $contentProperty.Value -or $contentProperty.Value -isnot [string]) {
+            throw "task file '$normalized' content must be a string"
+        }
+        if (-not $seen.Add($normalized)) { throw "duplicate task file path '$normalized'" }
+        $files += [pscustomobject]@{ Path = $normalized; Content = [string]$contentProperty.Value }
+    }
+
+    for ($outer = 0; $outer -lt $files.Count; $outer++) {
+        for ($inner = 0; $inner -lt $files.Count; $inner++) {
+            if ($outer -eq $inner) { continue }
+            if (Test-TaskFilePathIsAncestor -Ancestor $files[$outer].Path -Descendant $files[$inner].Path) {
+                throw "task file path '$($files[$outer].Path)' conflicts with '$($files[$inner].Path)'"
+            }
+        }
+    }
+    return $files
+}
+
 function ConvertTo-TaskProfiles {
     param([object]$Request)
 
@@ -83,6 +306,7 @@ function ConvertTo-TaskRequest {
         throw "unsupported schemaVersion '$($request.schemaVersion)'"
     }
     $profiles = @(ConvertTo-TaskProfiles -Request $request)
+    $taskFiles = @(ConvertTo-TaskTaskFiles -Request $request)
     $key = [string]$request.task.key
     if ($key -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
         throw "invalid task key '$key'"
@@ -135,6 +359,7 @@ function ConvertTo-TaskRequest {
             }
         })
         Profiles = $profiles
+        TaskFiles = @($taskFiles)
         Workspace = if ($request.PSObject.Properties['workspace'] -and -not [string]::IsNullOrWhiteSpace([string]$request.workspace.file)) {
             [pscustomobject]@{ File = [string]$request.workspace.file }
         }
@@ -144,4 +369,4 @@ function ConvertTo-TaskRequest {
     }
 }
 
-Export-ModuleMember -Function ConvertTo-TaskRequest, Test-GitBranchName, Test-TaskRepositoryName
+Export-ModuleMember -Function ConvertTo-TaskRequest, Test-GitBranchName, Test-TaskRepositoryName, ConvertTo-TaskTaskFiles, ConvertTo-TaskRelativeFilePath, Get-TaskPathComparer, Get-TaskCustomFileDestination, Get-TaskCustomFileState, Test-TaskCustomPathSafety, Test-TaskManagedTaskFilePath, Test-TaskPathPrefix, Assert-TaskFileDestinations, Get-TaskFileContentBytes, Get-TaskFileContentHash

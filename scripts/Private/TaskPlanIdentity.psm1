@@ -112,6 +112,33 @@ function Get-TaskScaffoldIdentityMaterial {
     $taskFiles = @('task.json', 'PRD.md', 'PLAN.md', 'STATUS.md', '.ctx') | ForEach-Object {
         Get-TaskFileIdentity -Path (Join-Path $taskPath $_)
     }
+    $requestTaskFiles = if ($Request.PSObject.Properties['TaskFiles']) { @($Request.TaskFiles) } else { @() }
+    $customTaskFiles = @($requestTaskFiles | ForEach-Object {
+        if (Test-TaskCustomPathSafety -TaskPath $taskPath -RelativePath $_.Path) {
+            $destinationState = Get-TaskCustomFileState -TaskPath $taskPath -RelativePath $_.Path
+            $destinationMaterial = [ordered]@{
+                Path = $destinationState.Path
+                Exists = $destinationState.Exists
+                IsFile = $destinationState.IsFile
+                IsReparsePoint = $destinationState.IsReparsePoint
+                Sha256 = $destinationState.Sha256
+            }
+        }
+        else {
+            $destinationMaterial = [ordered]@{
+                Path = Get-TaskCustomFileDestination -TaskPath $taskPath -RelativePath $_.Path
+                Exists = $true
+                IsFile = $false
+                IsReparsePoint = $true
+                Sha256 = $null
+            }
+        }
+        [ordered]@{
+            Path = $_.Path
+            ContentSha256 = Get-TaskFileContentHash -Content $_.Content
+            Destination = $destinationMaterial
+        }
+    })
     $engineFiles = @(
         (Join-Path $ScaffoldRoot 'scripts/Invoke-TaskScaffold.ps1'),
         (Join-Path $ScaffoldRoot 'scripts/Private/TaskPlanIdentity.psm1'),
@@ -134,6 +161,9 @@ function Get-TaskScaffoldIdentityMaterial {
         Profiles = @($Request.Profiles | ForEach-Object {
             [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path) }
         })
+        TaskFiles = @($requestTaskFiles | ForEach-Object {
+            [ordered]@{ Path = $_.Path; ContentSha256 = Get-TaskFileContentHash -Content $_.Content }
+        })
         Workspace = if ($Request.Workspace) { [ordered]@{ File = [IO.Path]::GetFullPath($Request.Workspace.File) } } else { $null }
     }
     $prdSource = if (-not [string]::IsNullOrWhiteSpace($Request.Task.PrdPath)) {
@@ -147,6 +177,7 @@ function Get-TaskScaffoldIdentityMaterial {
         TasksRoot = [IO.Path]::GetFullPath($TasksRoot)
         TaskExists = Test-Path -LiteralPath $taskPath -PathType Container
         TaskFiles = $taskFiles
+        CustomTaskFiles = $customTaskFiles
         ArtifactsDirectoryExists = Test-Path -LiteralPath (Join-Path $taskPath 'artifacts') -PathType Container
         PrdSource = $prdSource
         Plan = $Plan
