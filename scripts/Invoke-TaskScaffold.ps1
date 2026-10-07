@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory)][string]$RequestPath,
     [Parameter(Mandatory)][string]$TasksRoot,
     [switch]$Apply,
-    [string]$ExpectedPlanIdentity
+    [string]$ExpectedPlanIdentity,
+    [string]$CtxConfigRoot,
+    [string]$CtxExternalProfilesRoot
 )
 
 Set-StrictMode -Version Latest
@@ -17,6 +19,13 @@ Import-Module (Join-Path $PSScriptRoot 'Private/TaskPlanIdentity.psm1') -Force
 $TasksRoot = [IO.Path]::GetFullPath($TasksRoot)
 $scaffoldRoot = Split-Path -Parent $PSScriptRoot
 
+$ctxConfigRootSupplied = $PSBoundParameters.ContainsKey('CtxConfigRoot')
+$ctxExternalProfilesRootSupplied = $PSBoundParameters.ContainsKey('CtxExternalProfilesRoot')
+$normalizedCtxConfigRoot = if ($ctxConfigRootSupplied) { ConvertTo-CtxRoot -Value $CtxConfigRoot -Label 'ctx config root' -RequireProfilesDirectory } else { $null }
+$normalizedCtxExternalProfilesRoot = if ($ctxExternalProfilesRootSupplied) { ConvertTo-CtxRoot -Value $CtxExternalProfilesRoot -Label 'ctx external profiles root' } else { $null }
+$identityCtxArgs = @{}
+if ($ctxConfigRootSupplied) { $identityCtxArgs['CtxConfigRoot'] = $normalizedCtxConfigRoot }
+if ($ctxExternalProfilesRootSupplied) { $identityCtxArgs['CtxExternalProfilesRoot'] = $normalizedCtxExternalProfilesRoot }
 $request = ConvertTo-TaskRequest -Path $RequestPath
 $taskScaffoldProfilePath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../agent-profile') -ErrorAction Stop).Path
 $taskScaffoldProfile = [pscustomobject]@{ Name = 'task-scaffold'; Path = $taskScaffoldProfilePath }
@@ -47,7 +56,7 @@ $expectedProfiles = @($effectiveProfiles | ForEach-Object {
     [ordered]@{ name = $_.Name; path = $_.Path }
 })
 $ctxPath = Join-Path $taskPath '.ctx'
-$ctxContent = (@($effectiveProfiles | ForEach-Object { "$($_.Name):$($_.Path)" }) -join "`n") + "`n"
+$ctxContent = Get-TaskCtxContent -TaskPath $taskPath -EffectiveProfiles $effectiveProfiles -CtxConfigRoot $normalizedCtxConfigRoot -CtxExternalProfilesRoot $normalizedCtxExternalProfilesRoot
 
 function Get-TaskWorkspaceFolderPlan {
     param(
@@ -295,7 +304,7 @@ $workspaceFolderPlan = Get-TaskWorkspaceFolderPlan -Request $request -EffectiveP
 $ctxFilePlan = Get-TaskCtxFilePlan -Path $ctxPath -Content $ctxContent
 $customFileOperations = @(Get-TaskCustomFileOperations -TaskFiles $request.TaskFiles -TaskPath $taskPath)
 $plan = New-TaskScaffoldPlan -TaskExists $taskExists -PrdOperation $prdOperation -ProfileState $profileState -WorktreeOperations $worktreeOperations -WorkspaceFolderPlan $workspaceFolderPlan -CtxFilePlan $ctxFilePlan -CustomFileOperations $customFileOperations
-$planIdentity = Get-TaskPlanIdentity -Request $request -TasksRoot $TasksRoot -ScaffoldRoot $scaffoldRoot -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -Plan $plan
+$planIdentity = Get-TaskPlanIdentity -Request $request -TasksRoot $TasksRoot -ScaffoldRoot $scaffoldRoot -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -Plan $plan @identityCtxArgs
 
 if ($Apply) {
     if ([string]::IsNullOrWhiteSpace($ExpectedPlanIdentity)) {
@@ -332,7 +341,7 @@ if ($Apply) {
     $ctxFilePlan = Get-TaskCtxFilePlan -Path $ctxPath -Content $ctxContent
     $customFileOperations = @(Get-TaskCustomFileOperations -TaskFiles $request.TaskFiles -TaskPath $taskPath)
     $plan = New-TaskScaffoldPlan -TaskExists $taskExists -PrdOperation $prdOperation -ProfileState $profileState -WorktreeOperations $worktreeOperations -WorkspaceFolderPlan $workspaceFolderPlan -CtxFilePlan $ctxFilePlan -CustomFileOperations $customFileOperations
-    $currentPlanIdentity = Get-TaskPlanIdentity -Request $request -TasksRoot $TasksRoot -ScaffoldRoot $scaffoldRoot -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -Plan $plan
+    $currentPlanIdentity = Get-TaskPlanIdentity -Request $request -TasksRoot $TasksRoot -ScaffoldRoot $scaffoldRoot -EffectiveProfiles $effectiveProfiles -WorktreeOperations $worktreeOperations -Plan $plan @identityCtxArgs
     if ($ExpectedPlanIdentity -cne $currentPlanIdentity) {
         throw 'task-scaffold plan identity changed before apply; no task state was changed; replan and approve again'
     }

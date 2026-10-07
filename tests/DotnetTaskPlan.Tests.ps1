@@ -482,4 +482,61 @@ Describe 'dotnet task plan ctx roots' {
         Assert-TaskPlanFailure -Run $duplicate -Case 'duplicated option' -MessagePattern 'usage:'
         Test-Path -LiteralPath $tasksRoot | Should -BeFalse
     }
+
+    $rawRootCases = foreach ($command in @('plan', 'apply')) {
+        foreach ($option in @('--ctx-config-root', '--ctx-external-profiles-root')) {
+            foreach ($breakCase in @([pscustomobject]@{ Name = 'CR'; Value = "`r" }, [pscustomobject]@{ Name = 'LF'; Value = "`n" })) {
+                @{
+                    Label   = "$command $option $($breakCase.Name)"
+                    Token   = "$command-$(($option -replace '^--', ''))-$($breakCase.Name.ToLowerInvariant())"
+                    Command = $command
+                    Option  = $option
+                    Break   = $breakCase.Value
+                }
+            }
+        }
+    }
+
+    It 'rejects raw line breaks before dot-segment normalization for <Label>' -ForEach $rawRootCases -Skip:(-not $IsLinux) {
+        $repositoryPath = New-TestRepository -Name "api-raw-$($_.Token)"
+        $tasksRoot = Join-Path $TestDrive "raw-$($_.Token)-tasks"
+        $fixture = New-CtxRootFixture -Name "raw-$($_.Token)-fixture"
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive "raw-$($_.Token).json") -Request $request
+
+        $noisyDirectory = Join-Path (Split-Path -Parent $fixture.ConfigRoot) "noisy$($_.Break)segment"
+        New-Item -ItemType Directory -Path $noisyDirectory -Force | Out-Null
+        $rawRoot = "$noisyDirectory/../ai-config"
+
+        $normalized = [IO.Path]::GetFullPath($rawRoot)
+        $normalized | Should -Be $fixture.ConfigRoot -Because 'the raw spelling must lexically cancel the newline component'
+        $normalized.IndexOfAny([char[]]@("`n", "`r")) | Should -Be -1 -Because 'the normalized root must not retain a line break'
+
+        $headBefore = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $branchBefore = (& git -C $repositoryPath branch --show-current).Trim()
+        $branchesBefore = @(& git -C $repositoryPath branch --format '%(refname:short)' | Sort-Object)
+        $worktreesBefore = @(& git -C $repositoryPath worktree list --porcelain)
+        $statusBefore = @(& git -C $repositoryPath status --porcelain)
+
+        if ($_.Command -eq 'apply') {
+            $clean = Invoke-TaskPlanRaw -Arguments @('task', 'plan', '--request', $requestPath, '--tasks-root', $tasksRoot, $_.Option, $fixture.ConfigRoot)
+            $clean.ExitCode | Should -Be 0 -Because "the clean-root plan must succeed (stderr: $($clean.StdErr.Trim()))"
+            $identity = ($clean.StdOut.Trim() | ConvertFrom-Json).planIdentity
+            $run = Invoke-TaskPlanRaw -Arguments @('task', 'apply', '--request', $requestPath, '--tasks-root', $tasksRoot, '--expected-plan-identity', $identity, $_.Option, $rawRoot)
+        }
+        else {
+            $run = Invoke-TaskPlanRaw -Arguments @('task', 'plan', '--request', $requestPath, '--tasks-root', $tasksRoot, $_.Option, $rawRoot)
+        }
+
+        Assert-TaskPlanFailure -Run $run -Case "raw line break root for $($_.Label)" -MessagePattern 'must not contain line breaks'
+        Test-Path -LiteralPath $tasksRoot | Should -BeFalse -Because 'no task state may be created for a rejected raw root'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123') | Should -BeFalse -Because 'no task directory may be created for a rejected raw root'
+        Test-Path -LiteralPath (Join-Path $tasksRoot '.ai-task-scaffold.lock') | Should -BeFalse -Because 'no mutation lock may be created for a rejected raw root'
+        (& git -C $repositoryPath rev-parse HEAD).Trim() | Should -Be $headBefore
+        (& git -C $repositoryPath branch --show-current).Trim() | Should -Be $branchBefore
+        @(& git -C $repositoryPath branch --format '%(refname:short)' | Sort-Object) | Should -Be $branchesBefore
+        @(& git -C $repositoryPath worktree list --porcelain) | Should -Be $worktreesBefore
+        @(& git -C $repositoryPath status --porcelain) | Should -Be $statusBefore
+    }
 }
