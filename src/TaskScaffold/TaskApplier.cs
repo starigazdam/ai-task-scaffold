@@ -18,7 +18,7 @@ public static class TaskApplier
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
-    public static TaskPlanResult Apply(NormalizedRequest request, string tasksRoot, string? expectedPlanIdentity)
+    public static TaskPlanResult Apply(NormalizedRequest request, string tasksRoot, string? expectedPlanIdentity, CtxRootOptions ctxRoots)
     {
         string fullTasksRoot;
         try
@@ -30,13 +30,13 @@ public static class TaskApplier
             throw new InputException($"invalid tasks root '{tasksRoot}'");
         }
 
-        var reviewPlan = TaskPlanner.Plan(request, fullTasksRoot);
+        var reviewPlan = TaskPlanner.Plan(request, fullTasksRoot, ctxRoots);
         PrecheckPlanIdentity(reviewPlan, request, expectedPlanIdentity);
 
         var mutationLock = EnterMutationLock(fullTasksRoot);
         try
         {
-            var plan = TaskPlanner.Plan(request, fullTasksRoot);
+            var plan = TaskPlanner.Plan(request, fullTasksRoot, ctxRoots);
             var state = plan.State!;
             if (!string.Equals(expectedPlanIdentity, plan.PlanIdentity, StringComparison.Ordinal))
             {

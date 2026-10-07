@@ -1,11 +1,11 @@
 BeforeAll {
     $script:RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     $script:ProjectPath = Join-Path $script:RepositoryRoot 'src/TaskScaffold/TaskScaffold.csproj'
+    $script:AgentProfilePath = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath((Join-Path $script:RepositoryRoot 'agent-profile')))
 
-    function Invoke-TaskPlanCli {
+    function Invoke-TaskPlanRaw {
         param(
-            [Parameter(Mandatory)][string]$RequestPath,
-            [Parameter(Mandatory)][string]$TasksRoot,
+            [Parameter(Mandatory)][AllowEmptyString()][string[]]$Arguments,
             [string]$WorkingDirectory,
             [string]$CliHome
         )
@@ -28,7 +28,7 @@ BeforeAll {
         $startInfo.Environment['DOTNET_CLI_TELEMETRY_OPTOUT'] = '1'
         $startInfo.Environment['DOTNET_SKIP_FIRST_TIME_EXPERIENCE'] = '1'
 
-        foreach ($argument in @('run', '--project', $script:ProjectPath, '--', 'task', 'plan', '--request', $RequestPath, '--tasks-root', $TasksRoot)) {
+        foreach ($argument in (@('run', '--project', $script:ProjectPath, '--') + $Arguments)) {
             [void]$startInfo.ArgumentList.Add($argument)
         }
 
@@ -41,6 +41,45 @@ BeforeAll {
             ExitCode = $process.ExitCode
             StdOut   = $stdoutTask.GetAwaiter().GetResult()
             StdErr   = $stderrTask.GetAwaiter().GetResult()
+        }
+    }
+
+    function Invoke-TaskPlanCli {
+        param(
+            [Parameter(Mandatory)][string]$RequestPath,
+            [Parameter(Mandatory)][string]$TasksRoot,
+            [string]$WorkingDirectory,
+            [string]$CliHome,
+            [string]$CtxConfigRoot,
+            [string]$CtxExternalProfilesRoot
+        )
+
+        $arguments = @('task', 'plan', '--request', $RequestPath, '--tasks-root', $TasksRoot)
+        if ($PSBoundParameters.ContainsKey('CtxConfigRoot')) {
+            $arguments += @('--ctx-config-root', $CtxConfigRoot)
+        }
+        if ($PSBoundParameters.ContainsKey('CtxExternalProfilesRoot')) {
+            $arguments += @('--ctx-external-profiles-root', $CtxExternalProfilesRoot)
+        }
+
+        return Invoke-TaskPlanRaw -Arguments $arguments -WorkingDirectory $WorkingDirectory -CliHome $CliHome
+    }
+
+    function New-CtxRootFixture {
+        param(
+            [Parameter(Mandatory)][string]$Name
+        )
+
+        $base = Join-Path $TestDrive $Name
+        $configRoot = Join-Path $base 'ai-config'
+        $teamProfile = Join-Path $configRoot 'profiles/team'
+        New-Item -ItemType Directory -Path $teamProfile -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $teamProfile 'AGENTS.md') -Value '# team' -NoNewline
+
+        return [pscustomobject]@{
+            ConfigRoot   = $configRoot
+            TeamProfile  = $teamProfile
+            ExternalRoot = $script:RepositoryRoot
         }
     }
 
@@ -114,6 +153,22 @@ BeforeAll {
 
         @($Object.PSObject.Properties.Name | Sort-Object) | Should -Be @($Expected | Sort-Object) -Because "$Case should expose exactly the contract properties"
     }
+
+    function Assert-TaskPlanFailure {
+        param(
+            [Parameter(Mandatory)]$Run,
+            [Parameter(Mandatory)][string]$Case,
+            [string]$MessagePattern
+        )
+
+        $Run.ExitCode | Should -Be 2 -Because "$Case should be rejected (stderr: $($Run.StdErr.Trim()))"
+        $Run.StdOut.Trim() | Should -Be '' -Because "$Case should not write stdout"
+        $Run.StdErr | Should -Not -Match '(?m)^\s+at\s' -Because "$Case should not emit a stack trace"
+        $Run.StdErr | Should -Not -Match 'Unhandled exception' -Because "$Case should not emit an unhandled exception"
+        if ($MessagePattern) {
+            $Run.StdErr | Should -Match $MessagePattern -Because "$Case should explain the failure"
+        }
+    }
 }
 
 Describe 'dotnet task plan' {
@@ -128,7 +183,7 @@ Describe 'dotnet task plan' {
 
             Assert-PropertySet -Object $result -Expected @('planIdentity', 'plan') -Case 'the plan payload'
             $result.planIdentity | Should -Match '^[0-9a-f]{64}$'
-            Assert-PropertySet -Object $result.plan -Expected @('taskKey', 'taskOperation', 'worktreeOperations', 'requiresConfirmation') -Case 'the plan'
+            Assert-PropertySet -Object $result.plan -Expected @('taskKey', 'taskOperation', 'worktreeOperations', 'requiresConfirmation', 'ctxFile') -Case 'the plan'
             $result.plan.taskKey | Should -Be 'FEATURE-123'
             $result.plan.taskOperation | Should -Be 'create'
             $result.plan.requiresConfirmation | Should -BeTrue
@@ -281,5 +336,150 @@ Describe 'dotnet task plan' {
             $observedActions | Should -Be @('blocked', 'blocked', 'blocked')
             $observedReasons | Should -Be @('unsafe-worktree-path', 'unsafe-worktree-path', 'unsafe-worktree-path')
         }
+    }
+}
+
+Describe 'dotnet task plan ctx roots' {
+    It 'plans root-mode .ctx with relative directives and does not touch the tasks root or environment' {
+        $repositoryPath = New-TestRepository -Name 'api-ctx-roots-plan'
+        $tasksRoot = Join-Path $TestDrive 'ctx-roots-plan-tasks'
+        $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+        $fixture = New-CtxRootFixture -Name 'ctx-roots-plan-fixture'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'ctx-roots-plan.json') -Request $request
+
+        $configEnvBefore = $env:AI_CTX_PROFILES_CONFIG_ROOT
+        $externalEnvBefore = $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot) -Case 'root-mode plan'
+
+        $expected = @(
+            "config-root:$([IO.Path]::GetRelativePath($taskPath, $fixture.ConfigRoot))"
+            "external-profiles-root:$([IO.Path]::GetRelativePath($taskPath, $fixture.ExternalRoot))"
+            "team:$([IO.Path]::GetRelativePath($taskPath, $fixture.TeamProfile))"
+            "task-scaffold:$([IO.Path]::GetRelativePath($taskPath, $script:AgentProfilePath))"
+        ) -join "`n"
+        $expected += "`n"
+
+        $result.plan.ctxFile.action | Should -Be 'create'
+        ($result.plan.ctxFile.content -ceq $expected) | Should -BeTrue -Because 'root-mode content must match exactly'
+        $result.plan.ctxFile.path | Should -Be (Join-Path $tasksRoot 'FEATURE-123' '.ctx')
+        Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        $env:AI_CTX_PROFILES_CONFIG_ROOT | Should -Be $configEnvBefore
+        $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT | Should -Be $externalEnvBefore
+    }
+
+    It 'produces a deterministic identity and content for identical root-mode plans' {
+        $repositoryPath = New-TestRepository -Name 'api-ctx-roots-deterministic'
+        $tasksRoot = Join-Path $TestDrive 'ctx-roots-deterministic-tasks'
+        $fixture = New-CtxRootFixture -Name 'ctx-roots-deterministic-fixture'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'ctx-roots-deterministic.json') -Request $request
+
+        $first = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot) -Case 'first root-mode plan'
+        $second = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot) -Case 'second root-mode plan'
+
+        $second.planIdentity | Should -Be $first.planIdentity
+        ($second.plan.ctxFile.content -ceq $first.plan.ctxFile.content) | Should -BeTrue
+    }
+
+    It 'emits only an external-profiles-root directive when only the external root is supplied' {
+        $repositoryPath = New-TestRepository -Name 'api-ctx-roots-external'
+        $tasksRoot = Join-Path $TestDrive 'ctx-roots-external-tasks'
+        $fixture = New-CtxRootFixture -Name 'ctx-roots-external-fixture'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'ctx-roots-external.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot -CtxExternalProfilesRoot $fixture.ExternalRoot) -Case 'external-only plan'
+
+        $result.plan.ctxFile.content | Should -Match '^external-profiles-root:'
+        $result.plan.ctxFile.content | Should -Not -Match '(?m)^config-root:'
+        @($result.plan.ctxFile.content.TrimEnd("`n") -split "`n").Count | Should -Be 3
+    }
+
+    It 'keeps the legacy absolute .ctx content when no roots are supplied' {
+        $repositoryPath = New-TestRepository -Name 'api-ctx-roots-legacy'
+        $tasksRoot = Join-Path $TestDrive 'ctx-roots-legacy-tasks'
+        $fixture = New-CtxRootFixture -Name 'ctx-roots-legacy-fixture'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'ctx-roots-legacy.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'legacy plan'
+
+        $expected = "team:$($fixture.TeamProfile)`ntask-scaffold:$($script:AgentProfilePath)`n"
+        ($result.plan.ctxFile.content -ceq $expected) | Should -BeTrue -Because 'legacy content must be unchanged'
+    }
+
+    It 'binds the supplied roots into the plan identity' {
+        $repositoryPath = New-TestRepository -Name 'api-ctx-roots-identity'
+        $tasksRoot = Join-Path $TestDrive 'ctx-roots-identity-tasks'
+        $fixtureA = New-CtxRootFixture -Name 'ctx-roots-identity-a'
+        $fixtureB = New-CtxRootFixture -Name 'ctx-roots-identity-b'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixtureA.TeamProfile })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'ctx-roots-identity.json') -Request $request
+
+        $withoutRoots = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'no-root plan'
+        $withA = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixtureA.ConfigRoot) -Case 'roots-A plan'
+        $withB = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixtureB.ConfigRoot) -Case 'roots-B plan'
+
+        $withA.planIdentity | Should -Not -Be $withoutRoots.planIdentity
+        $withB.planIdentity | Should -Not -Be $withA.planIdentity
+    }
+
+    It 'rejects invalid ctx roots before any planning' {
+        $fixture = New-CtxRootFixture -Name 'ctx-roots-invalid-fixture'
+        $fileRoot = Join-Path $TestDrive 'ctx-roots-invalid-file'
+        Set-Content -LiteralPath $fileRoot -Value 'not a directory' -NoNewline
+        $missingRoot = Join-Path $TestDrive 'ctx-roots-invalid-missing'
+        $noProfilesRoot = Join-Path $TestDrive 'ctx-roots-invalid-no-profiles'
+        New-Item -ItemType Directory -Path $noProfilesRoot -Force | Out-Null
+
+        $cases = @(
+            [pscustomobject]@{ Label = 'nonexistent'; Value = $missingRoot; Pattern = 'ctx config root must be an absolute existing directory' },
+            [pscustomobject]@{ Label = 'relative'; Value = 'ai-config'; Pattern = 'ctx config root must be an absolute existing directory' },
+            [pscustomobject]@{ Label = 'file'; Value = $fileRoot; Pattern = 'ctx config root must be an absolute existing directory' },
+            [pscustomobject]@{ Label = 'no-profiles'; Value = $noProfilesRoot; Pattern = "ctx config root must contain a 'profiles' directory" },
+            [pscustomobject]@{ Label = 'empty'; Value = ''; Pattern = 'ctx config root must be an absolute existing directory' }
+        )
+
+        if ($IsLinux) {
+            $lineBreakRoot = Join-Path $TestDrive "ctx-roots-invalid-linebreak`nmore"
+            New-Item -ItemType Directory -Path (Join-Path $lineBreakRoot 'profiles') -Force | Out-Null
+            $cases += [pscustomobject]@{ Label = 'line-break'; Value = $lineBreakRoot; Pattern = 'must not contain line breaks' }
+        }
+
+        foreach ($case in $cases) {
+            $repositoryPath = New-TestRepository -Name "api-ctx-invalid-$($case.Label)"
+            $tasksRoot = Join-Path $TestDrive "ctx-roots-invalid-$($case.Label)-tasks"
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive "ctx-roots-invalid-$($case.Label).json") -Request $request
+
+            $run = Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $case.Value
+            Assert-TaskPlanFailure -Run $run -Case "ctx config root $($case.Label)" -MessagePattern $case.Pattern
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse -Because "no task state may be created for the $($case.Label) root"
+        }
+    }
+
+    It 'rejects unknown and duplicated options' {
+        $repositoryPath = New-TestRepository -Name 'api-ctx-options'
+        $tasksRoot = Join-Path $TestDrive 'ctx-roots-options-tasks'
+        $fixture = New-CtxRootFixture -Name 'ctx-roots-options-fixture'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request['profiles'] = @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'ctx-roots-options.json') -Request $request
+
+        $unknown = Invoke-TaskPlanRaw -Arguments @('task', 'plan', '--request', $requestPath, '--tasks-root', $tasksRoot, '--ctx-root', 'x')
+        Assert-TaskPlanFailure -Run $unknown -Case 'unknown option' -MessagePattern 'usage:'
+        Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+        $duplicate = Invoke-TaskPlanRaw -Arguments @('task', 'plan', '--request', $requestPath, '--tasks-root', $tasksRoot, '--ctx-config-root', $fixture.ConfigRoot, '--ctx-config-root', $fixture.ConfigRoot)
+        Assert-TaskPlanFailure -Run $duplicate -Case 'duplicated option' -MessagePattern 'usage:'
+        Test-Path -LiteralPath $tasksRoot | Should -BeFalse
     }
 }

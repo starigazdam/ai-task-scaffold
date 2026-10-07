@@ -106,6 +106,13 @@ public static class RequestValidator
 {
     private static readonly Regex NamePattern = new(@"\A[A-Za-z0-9][A-Za-z0-9._-]*\z", RegexOptions.CultureInvariant);
 
+    private static readonly HashSet<string> ReservedProfileNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "task-scaffold",
+        "config-root",
+        "external-profiles-root",
+    };
+
     public static ValidationResult Validate(string requestPath, bool allowTaskFiles = false)
     {
         string fullRequestPath;
@@ -271,7 +278,7 @@ public static class RequestValidator
                         throw new InputException($"invalid profile name '{name}'");
                     }
 
-                    if (string.Equals(name, "task-scaffold", StringComparison.OrdinalIgnoreCase))
+                    if (ReservedProfileNames.Contains(name))
                     {
                         throw new InputException($"profile name '{name}' is reserved");
                     }

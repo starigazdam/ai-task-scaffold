@@ -387,6 +387,8 @@ Describe 'dotnet request validate' {
                 'duplicate profile name'            = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $valid }, [ordered]@{ name = 'team'; path = $other }))
                 'duplicate profile name ignoring case' = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $valid }, [ordered]@{ name = 'TEAM'; path = $other }))
                 'reserved profile name'             = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'task-scaffold'; path = $valid }))
+                'reserved profile name config-root'             = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'config-root'; path = $valid }))
+                'reserved profile name external-profiles-root'  = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'external-profiles-root'; path = $valid }))
                 'loose file under .agents/skills'   = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $looseSkill }))
                 'skill directory without SKILL.md'  = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $incompleteSkill }))
                 'trailing newline profile name'     = (New-BaseRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = "team`n"; path = $valid }))
