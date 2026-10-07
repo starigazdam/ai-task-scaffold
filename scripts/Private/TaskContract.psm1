@@ -376,14 +376,15 @@ function ConvertTo-CtxRoot {
         [switch]$RequireProfilesDirectory
     )
 
+    if ($Value -match '[\r\n]') {
+        throw "$Label must not contain line breaks: '$Value'"
+    }
+
     if ([string]::IsNullOrWhiteSpace($Value) -or -not [IO.Path]::IsPathFullyQualified($Value) -or -not (Test-Path -LiteralPath $Value -PathType Container)) {
         throw "$Label must be an absolute existing directory: '$Value'"
     }
 
     $normalized = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Value))
-    if ($normalized -match '[\r\n]') {
-        throw "$Label must not contain line breaks: '$normalized'"
-    }
 
     if ($RequireProfilesDirectory -and -not (Test-Path -LiteralPath (Join-Path $normalized 'profiles') -PathType Container)) {
         throw "$Label must contain a 'profiles' directory: '$normalized'"

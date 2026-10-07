@@ -752,6 +752,46 @@ Describe 'Invoke-TaskScaffold' {
             Test-Path -LiteralPath $tasksRoot | Should -BeFalse
         }
 
+        It 'rejects a raw line break in the supplied root even when nothing is cancelled' {
+            if (-not $IsLinux) { Set-ItResult -Skipped -Because 'embedding a raw newline in a directory name is Linux-only'; return }
+
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-linebreak'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixture = New-CtxRootFixture -Name 'ctx-roots-linebreak-fixture'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-linebreak.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixture.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+            $lineBreakRoot = Join-Path $TestDrive "ctx-roots-invalid-linebreak`nmore"
+            New-Item -ItemType Directory -Path (Join-Path $lineBreakRoot 'profiles') -Force | Out-Null
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-linebreak-tasks'
+
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $lineBreakRoot } | Should -Throw '*must not contain line breaks*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+
+        It 'rejects a line break even when a trailing .. would otherwise cancel it out during normalization' {
+            if (-not $IsLinux) { Set-ItResult -Skipped -Because 'embedding a raw newline in a directory name is Linux-only'; return }
+
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-linebreak-bypass'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixture = New-CtxRootFixture -Name 'ctx-roots-linebreak-bypass-fixture'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-linebreak-bypass.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixture.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+            $bypassBase = Join-Path $TestDrive 'ctx-roots-linebreak-bypass-base'
+            $noisyDir = Join-Path $bypassBase "noisy`nsegment"
+            $realConfigRoot = Join-Path $bypassBase 'real-config'
+            New-Item -ItemType Directory -Path (Join-Path $realConfigRoot 'profiles') -Force | Out-Null
+            New-Item -ItemType Directory -Path $noisyDir -Force | Out-Null
+            $bypassValue = Join-Path $noisyDir '../real-config'
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-linebreak-bypass-tasks'
+
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $bypassValue } | Should -Throw '*must not contain line breaks*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+
         It 'applies root-mode .ctx and re-applies as a no-op without touching the environment' {
             $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-apply'
             New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
