@@ -387,6 +387,11 @@ public static class TaskPlanner
             return null;
         }
 
+        if (raw.IndexOfAny(new[] { '\n', '\r' }) >= 0)
+        {
+            throw new InputException($"{label} must not contain line breaks: '{raw}'");
+        }
+
         if (string.IsNullOrWhiteSpace(raw) || !Path.IsPathFullyQualified(raw) || !Directory.Exists(raw))
         {
             throw new InputException($"{label} must be an absolute existing directory: '{raw}'");
