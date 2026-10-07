@@ -105,7 +105,9 @@ function Get-TaskScaffoldIdentityMaterial {
         [Parameter(Mandatory)][string]$ScaffoldRoot,
         [Parameter(Mandatory)][object[]]$EffectiveProfiles,
         [Parameter(Mandatory)][object[]]$WorktreeOperations,
-        [Parameter(Mandatory)][object]$Plan
+        [Parameter(Mandatory)][object]$Plan,
+        [string]$CtxConfigRoot,
+        [string]$CtxExternalProfilesRoot
     )
 
     $taskPath = Join-Path $TasksRoot $Request.Task.Key
@@ -175,6 +177,8 @@ function Get-TaskScaffoldIdentityMaterial {
         IdentityVersion = 1
         Request = $normalizedRequest
         TasksRoot = [IO.Path]::GetFullPath($TasksRoot)
+        CtxConfigRoot = if ($PSBoundParameters.ContainsKey('CtxConfigRoot')) { $CtxConfigRoot } else { $null }
+        CtxExternalProfilesRoot = if ($PSBoundParameters.ContainsKey('CtxExternalProfilesRoot')) { $CtxExternalProfilesRoot } else { $null }
         TaskExists = Test-Path -LiteralPath $taskPath -PathType Container
         TaskFiles = $taskFiles
         CustomTaskFiles = $customTaskFiles
@@ -195,7 +199,9 @@ function Get-TaskPlanIdentity {
         [Parameter(Mandatory)][string]$ScaffoldRoot,
         [Parameter(Mandatory)][object[]]$EffectiveProfiles,
         [Parameter(Mandatory)][object[]]$WorktreeOperations,
-        [Parameter(Mandatory)][object]$Plan
+        [Parameter(Mandatory)][object]$Plan,
+        [string]$CtxConfigRoot,
+        [string]$CtxExternalProfilesRoot
     )
 
     $material = Get-TaskScaffoldIdentityMaterial @PSBoundParameters

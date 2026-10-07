@@ -369,4 +369,50 @@ function ConvertTo-TaskRequest {
     }
 }
 
-Export-ModuleMember -Function ConvertTo-TaskRequest, Test-GitBranchName, Test-TaskRepositoryName, ConvertTo-TaskTaskFiles, ConvertTo-TaskRelativeFilePath, Get-TaskPathComparer, Get-TaskCustomFileDestination, Get-TaskCustomFileState, Test-TaskCustomPathSafety, Test-TaskManagedTaskFilePath, Test-TaskPathPrefix, Assert-TaskFileDestinations, Get-TaskFileContentBytes, Get-TaskFileContentHash
+function ConvertTo-CtxRoot {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string]$Label,
+        [switch]$RequireProfilesDirectory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value) -or -not [IO.Path]::IsPathFullyQualified($Value) -or -not (Test-Path -LiteralPath $Value -PathType Container)) {
+        throw "$Label must be an absolute existing directory: '$Value'"
+    }
+
+    $normalized = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Value))
+    if ($normalized -match '[\r\n]') {
+        throw "$Label must not contain line breaks: '$normalized'"
+    }
+
+    if ($RequireProfilesDirectory -and -not (Test-Path -LiteralPath (Join-Path $normalized 'profiles') -PathType Container)) {
+        throw "$Label must contain a 'profiles' directory: '$normalized'"
+    }
+
+    return $normalized
+}
+
+function Get-TaskCtxContent {
+    param(
+        [Parameter(Mandatory)][string]$TaskPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$EffectiveProfiles,
+        [string]$CtxConfigRoot,
+        [string]$CtxExternalProfilesRoot
+    )
+
+    if (-not $CtxConfigRoot -and -not $CtxExternalProfilesRoot) {
+        return (@($EffectiveProfiles | ForEach-Object { "$($_.Name):$($_.Path)" }) -join "`n") + "`n"
+    }
+
+    $lines = @()
+    if ($CtxConfigRoot) {
+        $lines += "config-root:$([IO.Path]::GetRelativePath($TaskPath, $CtxConfigRoot))"
+    }
+    if ($CtxExternalProfilesRoot) {
+        $lines += "external-profiles-root:$([IO.Path]::GetRelativePath($TaskPath, $CtxExternalProfilesRoot))"
+    }
+    $lines += @($EffectiveProfiles | ForEach-Object { "$($_.Name):$([IO.Path]::GetRelativePath($TaskPath, $_.Path))" })
+    return ($lines -join "`n") + "`n"
+}
+
+Export-ModuleMember -Function ConvertTo-TaskRequest, Test-GitBranchName, Test-TaskRepositoryName, ConvertTo-TaskTaskFiles, ConvertTo-TaskRelativeFilePath, Get-TaskPathComparer, Get-TaskCustomFileDestination, Get-TaskCustomFileState, Test-TaskCustomPathSafety, Test-TaskManagedTaskFilePath, Test-TaskPathPrefix, Assert-TaskFileDestinations, Get-TaskFileContentBytes, Get-TaskFileContentHash, ConvertTo-CtxRoot, Get-TaskCtxContent

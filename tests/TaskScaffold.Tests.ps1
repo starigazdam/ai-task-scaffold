@@ -615,6 +615,214 @@ Describe 'Invoke-TaskScaffold' {
         $manifest.profiles.Name | Should -Be 'task-scaffold'
         $manifest.repositories.Name | Should -Be 'api'
     }
+
+    Context 'ctx root directives' {
+        BeforeAll {
+            function New-CtxRootFixture {
+                param([Parameter(Mandatory)][string]$Name)
+
+                $base = Join-Path $TestDrive $Name
+                $configRoot = Join-Path $base 'ai-config'
+                $teamProfile = Join-Path $configRoot 'profiles/team'
+                New-Item -ItemType Directory -Path $teamProfile -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path $teamProfile 'AGENTS.md') -Value '# team' -NoNewline
+                $externalRoot = Join-Path $base 'external'
+                New-Item -ItemType Directory -Path $externalRoot -Force | Out-Null
+
+                [pscustomobject]@{
+                    ConfigRoot   = $configRoot
+                    TeamProfile  = $teamProfile
+                    ExternalRoot = $externalRoot
+                }
+            }
+
+            function New-CtxRootRequest {
+                param(
+                    [Parameter(Mandatory)][string]$RepositoryPath,
+                    [Parameter(Mandatory)][string]$TeamProfilePath,
+                    [string]$Key = 'FEATURE-123'
+                )
+
+                [ordered]@{
+                    schemaVersion = 2
+                    task          = [ordered]@{ key = $Key; title = 'Add endpoint' }
+                    repositories  = @([ordered]@{ name = 'api'; path = $RepositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+                    profiles      = @([ordered]@{ name = 'team'; path = $TeamProfilePath })
+                }
+            }
+        }
+
+        It 'plans root-mode .ctx with relative directives and touches neither the tasks root nor the environment' {
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-plan'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixture = New-CtxRootFixture -Name 'ctx-roots-plan-fixture'
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-plan-tasks'
+            $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-plan.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixture.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+            $agentProfilePath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../agent-profile')).Path
+
+            $configEnvBefore = $env:AI_CTX_PROFILES_CONFIG_ROOT
+            $externalEnvBefore = $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT
+
+            $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot | ConvertFrom-Json
+
+            $expected = @(
+                "config-root:$([IO.Path]::GetRelativePath($taskPath, $fixture.ConfigRoot))"
+                "external-profiles-root:$([IO.Path]::GetRelativePath($taskPath, $fixture.ExternalRoot))"
+                "team:$([IO.Path]::GetRelativePath($taskPath, $fixture.TeamProfile))"
+                "task-scaffold:$([IO.Path]::GetRelativePath($taskPath, $agentProfilePath))"
+            ) -join "`n"
+            $expected += "`n"
+
+            $plan.CtxFilePlan.Action | Should -Be 'create'
+            ($plan.CtxFilePlan.Content -ceq $expected) | Should -BeTrue -Because 'root-mode content must match exactly'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+            $env:AI_CTX_PROFILES_CONFIG_ROOT | Should -Be $configEnvBefore
+            $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT | Should -Be $externalEnvBefore
+        }
+
+        It 'keeps legacy absolute .ctx content byte-identical when no roots are supplied' {
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-legacy'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixture = New-CtxRootFixture -Name 'ctx-roots-legacy-fixture'
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-legacy-tasks'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-legacy.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixture.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+            $agentProfilePath = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../agent-profile')).Path
+
+            $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+            $expected = "team:$($fixture.TeamProfile)`ntask-scaffold:$agentProfilePath`n"
+            ($plan.CtxFilePlan.Content -ceq $expected) | Should -BeTrue -Because 'legacy content must be unchanged'
+        }
+
+        It 'emits only the supplied directive and binds roots into the plan identity' {
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-identity'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixtureA = New-CtxRootFixture -Name 'ctx-roots-identity-a'
+            $fixtureB = New-CtxRootFixture -Name 'ctx-roots-identity-b'
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-identity-tasks'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-identity.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixtureA.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+            $withoutRoots = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+            $externalOnly = & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxExternalProfilesRoot $fixtureA.ExternalRoot | ConvertFrom-Json
+            $withA = & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixtureA.ConfigRoot | ConvertFrom-Json
+            $withB = & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixtureB.ConfigRoot | ConvertFrom-Json
+
+            $externalOnly.CtxFilePlan.Content | Should -Match '^external-profiles-root:'
+            $externalOnly.CtxFilePlan.Content | Should -Not -Match '(?m)^config-root:'
+
+            $withA.PlanIdentity | Should -Not -Be $withoutRoots.PlanIdentity
+            $withB.PlanIdentity | Should -Not -Be $withA.PlanIdentity
+        }
+
+        It 'rejects invalid ctx roots before any task state is created' {
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-invalid'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixture = New-CtxRootFixture -Name 'ctx-roots-invalid-fixture'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-invalid.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixture.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+            $fileRoot = Join-Path $TestDrive 'ctx-roots-invalid-file'
+            Set-Content -LiteralPath $fileRoot -Value 'not a directory' -NoNewline
+            $missingRoot = Join-Path $TestDrive 'ctx-roots-invalid-missing'
+            $noProfilesRoot = Join-Path $TestDrive 'ctx-roots-invalid-no-profiles'
+            New-Item -ItemType Directory -Path $noProfilesRoot -Force | Out-Null
+
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-invalid-tasks'
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $missingRoot } | Should -Throw '*must be an absolute existing directory*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot 'relative/path' } | Should -Throw '*must be an absolute existing directory*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fileRoot } | Should -Throw '*must be an absolute existing directory*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $noProfilesRoot } | Should -Throw "*must contain a 'profiles' directory*"
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxExternalProfilesRoot $missingRoot } | Should -Throw '*must be an absolute existing directory*'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+
+        It 'applies root-mode .ctx and re-applies as a no-op without touching the environment' {
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-apply'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixture = New-CtxRootFixture -Name 'ctx-roots-apply-fixture'
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-apply-tasks'
+            $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-apply.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixture.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+            $configEnvBefore = $env:AI_CTX_PROFILES_CONFIG_ROOT
+            $externalEnvBefore = $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT
+
+            $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot | ConvertFrom-Json
+            & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot | Out-Null
+
+            $ctxPath = Join-Path $taskPath '.ctx'
+            $bytes = [IO.File]::ReadAllBytes($ctxPath)
+            @($bytes[0], $bytes[1], $bytes[2]) -join ',' | Should -Not -Be '239,187,191' -Because '.ctx must be written without a BOM'
+            ([IO.File]::ReadAllText($ctxPath) -ceq $plan.CtxFilePlan.Content) | Should -BeTrue -Because 'the applied .ctx must equal the planned content'
+
+            $replan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot | ConvertFrom-Json
+            $replan.CtxFilePlan.Action | Should -Be 'noop'
+            & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $replan.PlanIdentity -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot | Out-Null
+            [IO.File]::ReadAllText($ctxPath) | Should -Be $plan.CtxFilePlan.Content
+
+            $env:AI_CTX_PROFILES_CONFIG_ROOT | Should -Be $configEnvBefore
+            $env:AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT | Should -Be $externalEnvBefore
+        }
+
+        It 'rejects a reviewed identity when ctx roots change, are added, or are removed before apply' {
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-stale'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixtureA = New-CtxRootFixture -Name 'ctx-roots-stale-a'
+            $fixtureB = New-CtxRootFixture -Name 'ctx-roots-stale-b'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-stale.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixtureA.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+            $tasksRootA = Join-Path $TestDrive 'ctx-roots-stale-changed-tasks'
+            $planA = & $script -RequestPath $requestPath -TasksRoot $tasksRootA -CtxConfigRoot $fixtureA.ConfigRoot | ConvertFrom-Json
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRootA -Apply -ExpectedPlanIdentity $planA.PlanIdentity -CtxConfigRoot $fixtureB.ConfigRoot } | Should -Throw '*plan identity changed*'
+            Test-Path -LiteralPath (Join-Path $tasksRootA 'FEATURE-123') | Should -BeFalse
+
+            $tasksRootB = Join-Path $TestDrive 'ctx-roots-stale-removed-tasks'
+            $planB = & $script -RequestPath $requestPath -TasksRoot $tasksRootB -CtxConfigRoot $fixtureA.ConfigRoot -CtxExternalProfilesRoot $fixtureA.ExternalRoot | ConvertFrom-Json
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRootB -Apply -ExpectedPlanIdentity $planB.PlanIdentity } | Should -Throw '*plan identity changed*'
+            Test-Path -LiteralPath (Join-Path $tasksRootB 'FEATURE-123') | Should -BeFalse
+
+            $tasksRootC = Join-Path $TestDrive 'ctx-roots-stale-added-tasks'
+            $planC = & $script -RequestPath $requestPath -TasksRoot $tasksRootC | ConvertFrom-Json
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRootC -Apply -ExpectedPlanIdentity $planC.PlanIdentity -CtxConfigRoot $fixtureA.ConfigRoot } | Should -Throw '*plan identity changed*'
+            Test-Path -LiteralPath (Join-Path $tasksRootC 'FEATURE-123') | Should -BeFalse
+        }
+
+        It 'rejects apply when a supplied config root disappears after review' {
+            $repositoryPath = Join-Path $TestDrive 'api-ctx-roots-removed'
+            New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+            $fixture = New-CtxRootFixture -Name 'ctx-roots-removed-fixture'
+            $tasksRoot = Join-Path $TestDrive 'ctx-roots-removed-tasks'
+            $requestPath = Join-Path $TestDrive 'ctx-roots-removed.json'
+            (New-CtxRootRequest -RepositoryPath $repositoryPath -TeamProfilePath $fixture.TeamProfile) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+            $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot | ConvertFrom-Json
+            Remove-Item -LiteralPath $fixture.ConfigRoot -Recurse -Force
+
+            { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity -CtxConfigRoot $fixture.ConfigRoot } | Should -Throw '*must be an absolute existing directory*'
+            Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123') | Should -BeFalse
+        }
+    }
 }
 
 Describe 'Invoke-TaskScaffold task files' {
