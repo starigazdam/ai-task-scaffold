@@ -42,6 +42,20 @@ public sealed class TaskPlan
 
     [JsonPropertyName("requiresConfirmation")]
     public bool RequiresConfirmation { get; init; } = true;
+
+    [JsonPropertyName("ctxFile")]
+    public CtxFilePlan CtxFile { get; init; } = new();
+}
+
+public sealed class CtxRootOptions
+{
+    public string? ConfigRoot { get; init; }
+
+    public string? ExternalProfilesRoot { get; init; }
+
+    public bool Any => ConfigRoot is not null || ExternalProfilesRoot is not null;
+
+    public static readonly CtxRootOptions None = new();
 }
 
 public sealed class TaskPlanResult
@@ -87,6 +101,12 @@ public sealed class CanonicalPlanInput
     public List<CanonicalProfileIdentity> ProfileIdentities { get; init; } = new();
 
     public List<CanonicalCustomFile> CustomFiles { get; init; } = new();
+
+    public string? CtxConfigRoot { get; init; }
+
+    public string? CtxExternalProfilesRoot { get; init; }
+
+    public string CtxContent { get; init; } = string.Empty;
 }
 
 public sealed class CanonicalRepository
@@ -249,10 +269,13 @@ public sealed class TaskProfileState
 
 public sealed class CtxFilePlan
 {
+    [JsonPropertyName("path")]
     public string Path { get; init; } = string.Empty;
 
+    [JsonPropertyName("action")]
     public string Action { get; init; } = string.Empty;
 
+    [JsonPropertyName("content")]
     public string Content { get; init; } = string.Empty;
 }
 
@@ -298,7 +321,7 @@ public static class TaskPlanner
 {
     private static readonly Regex RemoteQualifiedPattern = new(@"^[^/]+/.+", RegexOptions.CultureInvariant);
 
-    public static TaskPlanResult Plan(NormalizedRequest request, string tasksRoot)
+    public static TaskPlanResult Plan(NormalizedRequest request, string tasksRoot, CtxRootOptions ctxRoots)
     {
         string fullTasksRoot;
         try
@@ -309,6 +332,8 @@ public static class TaskPlanner
         {
             throw new InputException($"invalid tasks root '{tasksRoot}'");
         }
+
+        var normalizedCtxRoots = NormalizeCtxRoots(ctxRoots);
 
         var orderedRepositories = request.Repositories
             .OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
@@ -323,8 +348,8 @@ public static class TaskPlanner
 
         var scaffoldPaths = TaskScaffoldPaths.Resolve();
         var effectiveProfiles = BuildEffectiveProfiles(request, scaffoldPaths.AgentProfilePath);
-        var state = TaskStatePlanner.Compute(request, fullTasksRoot, effectiveProfiles, scaffoldPaths.PrdTemplatePath);
-        var identity = ComputeIdentity(BuildCanonicalInput(request, fullTasksRoot, orderedRepositories, planned, state));
+        var state = TaskStatePlanner.Compute(request, fullTasksRoot, effectiveProfiles, scaffoldPaths.PrdTemplatePath, normalizedCtxRoots);
+        var identity = ComputeIdentity(BuildCanonicalInput(request, fullTasksRoot, orderedRepositories, planned, state, normalizedCtxRoots));
 
         return new TaskPlanResult
         {
@@ -335,9 +360,50 @@ public static class TaskPlanner
                 TaskOperation = state.TaskExists ? "reuse" : "create",
                 WorktreeOperations = planned.Select(p => p.Operation).ToList(),
                 RequiresConfirmation = true,
+                CtxFile = state.CtxFilePlan,
             },
             State = state,
         };
+    }
+
+    private static CtxRootOptions NormalizeCtxRoots(CtxRootOptions ctxRoots)
+    {
+        if (ctxRoots is null || !ctxRoots.Any)
+        {
+            return CtxRootOptions.None;
+        }
+
+        return new CtxRootOptions
+        {
+            ConfigRoot = NormalizeCtxRoot(ctxRoots.ConfigRoot, "ctx config root", requireProfilesDirectory: true),
+            ExternalProfilesRoot = NormalizeCtxRoot(ctxRoots.ExternalProfilesRoot, "ctx external profiles root", requireProfilesDirectory: false),
+        };
+    }
+
+    private static string? NormalizeCtxRoot(string? raw, string label, bool requireProfilesDirectory)
+    {
+        if (raw is null)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(raw) || !Path.IsPathFullyQualified(raw) || !Directory.Exists(raw))
+        {
+            throw new InputException($"{label} must be an absolute existing directory: '{raw}'");
+        }
+
+        var normalized = TaskFileSafety.NormalizeTaskProfilePath(raw);
+        if (normalized.IndexOfAny(new[] { '\n', '\r' }) >= 0)
+        {
+            throw new InputException($"{label} must not contain line breaks: '{normalized}'");
+        }
+
+        if (requireProfilesDirectory && !Directory.Exists(Path.Combine(normalized, "profiles")))
+        {
+            throw new InputException($"{label} must contain a 'profiles' directory: '{normalized}'");
+        }
+
+        return normalized;
     }
 
     private static List<CanonicalProfile> BuildEffectiveProfiles(NormalizedRequest request, string agentProfilePath)
@@ -498,7 +564,7 @@ public static class TaskPlanner
         };
     }
 
-    private static CanonicalPlanInput BuildCanonicalInput(NormalizedRequest request, string tasksRoot, List<NormalizedRepository> repositories, List<PlannedOperation> planned, TaskStatePlanned state)
+    private static CanonicalPlanInput BuildCanonicalInput(NormalizedRequest request, string tasksRoot, List<NormalizedRepository> repositories, List<PlannedOperation> planned, TaskStatePlanned state, CtxRootOptions ctxRoots)
     {
         return new CanonicalPlanInput
         {
@@ -540,6 +606,9 @@ public static class TaskPlanner
             PrdSource = TaskStatePlanner.PrdSourceIdentity(request),
             ProfileIdentities = state.EffectiveProfiles.Select(TaskStatePlanner.ProfileIdentity).ToList(),
             CustomFiles = TaskStatePlanner.CanonicalCustomFiles(request, state.TaskPath).ToList(),
+            CtxConfigRoot = ctxRoots.ConfigRoot,
+            CtxExternalProfilesRoot = ctxRoots.ExternalProfilesRoot,
+            CtxContent = state.CtxContent,
         };
     }
 

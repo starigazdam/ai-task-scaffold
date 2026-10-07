@@ -5,7 +5,7 @@ BeforeAll {
 
     function Invoke-Cli {
         param(
-            [Parameter(Mandatory)][string[]]$Arguments,
+            [Parameter(Mandatory)][AllowEmptyString()][string[]]$Arguments,
             [string]$WorkingDirectory,
             [string]$CliHome
         )
@@ -47,10 +47,20 @@ BeforeAll {
     function Get-Plan {
         param(
             [Parameter(Mandatory)][string]$RequestPath,
-            [Parameter(Mandatory)][string]$TasksRoot
+            [Parameter(Mandatory)][string]$TasksRoot,
+            [string]$CtxConfigRoot,
+            [string]$CtxExternalProfilesRoot
         )
 
-        $run = Invoke-Cli -Arguments @('task', 'plan', '--request', $RequestPath, '--tasks-root', $TasksRoot)
+        $arguments = @('task', 'plan', '--request', $RequestPath, '--tasks-root', $TasksRoot)
+        if ($PSBoundParameters.ContainsKey('CtxConfigRoot')) {
+            $arguments += @('--ctx-config-root', $CtxConfigRoot)
+        }
+        if ($PSBoundParameters.ContainsKey('CtxExternalProfilesRoot')) {
+            $arguments += @('--ctx-external-profiles-root', $CtxExternalProfilesRoot)
+        }
+
+        $run = Invoke-Cli -Arguments $arguments
         $run.ExitCode | Should -Be 0 -Because "task plan should succeed (stderr: $($run.StdErr.Trim()))"
         return ($run.StdOut.Trim() | ConvertFrom-Json)
     }
@@ -59,12 +69,20 @@ BeforeAll {
         param(
             [Parameter(Mandatory)][string]$RequestPath,
             [Parameter(Mandatory)][string]$TasksRoot,
-            [string]$ExpectedPlanIdentity
+            [string]$ExpectedPlanIdentity,
+            [string]$CtxConfigRoot,
+            [string]$CtxExternalProfilesRoot
         )
 
         $arguments = @('task', 'apply', '--request', $RequestPath, '--tasks-root', $TasksRoot)
         if ($PSBoundParameters.ContainsKey('ExpectedPlanIdentity') -and $null -ne $ExpectedPlanIdentity) {
             $arguments += @('--expected-plan-identity', $ExpectedPlanIdentity)
+        }
+        if ($PSBoundParameters.ContainsKey('CtxConfigRoot')) {
+            $arguments += @('--ctx-config-root', $CtxConfigRoot)
+        }
+        if ($PSBoundParameters.ContainsKey('CtxExternalProfilesRoot')) {
+            $arguments += @('--ctx-external-profiles-root', $CtxExternalProfilesRoot)
         }
 
         return Invoke-Cli -Arguments $arguments
@@ -73,12 +91,36 @@ BeforeAll {
     function Invoke-CurrentPlanApply {
         param(
             [Parameter(Mandatory)][string]$RequestPath,
-            [Parameter(Mandatory)][string]$TasksRoot
+            [Parameter(Mandatory)][string]$TasksRoot,
+            [string]$CtxConfigRoot,
+            [string]$CtxExternalProfilesRoot
         )
 
-        $plan = Get-Plan -RequestPath $RequestPath -TasksRoot $TasksRoot
-        $run = Invoke-Apply -RequestPath $RequestPath -TasksRoot $TasksRoot -ExpectedPlanIdentity $plan.planIdentity
+        $rootArguments = @{}
+        if ($PSBoundParameters.ContainsKey('CtxConfigRoot')) { $rootArguments['CtxConfigRoot'] = $CtxConfigRoot }
+        if ($PSBoundParameters.ContainsKey('CtxExternalProfilesRoot')) { $rootArguments['CtxExternalProfilesRoot'] = $CtxExternalProfilesRoot }
+
+        $plan = Get-Plan -RequestPath $RequestPath -TasksRoot $TasksRoot @rootArguments
+        $run = Invoke-Apply -RequestPath $RequestPath -TasksRoot $TasksRoot -ExpectedPlanIdentity $plan.planIdentity @rootArguments
         return [pscustomobject]@{ Plan = $plan; Run = $run }
+    }
+
+    function New-CtxRootFixture {
+        param(
+            [Parameter(Mandatory)][string]$Name
+        )
+
+        $base = Join-Path $TestDrive $Name
+        $configRoot = Join-Path $base 'ai-config'
+        $teamProfile = Join-Path $configRoot 'profiles/team'
+        New-Item -ItemType Directory -Path $teamProfile -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $teamProfile 'AGENTS.md') -Value '# team' -NoNewline
+
+        return [pscustomobject]@{
+            ConfigRoot   = $configRoot
+            TeamProfile  = $teamProfile
+            ExternalRoot = $script:RepositoryRoot
+        }
     }
 
     function New-TestRepository {
@@ -541,6 +583,116 @@ Describe 'dotnet task apply' {
             $run = Invoke-CurrentPlanApply -RequestPath $requestPath -TasksRoot $tasksRoot
             Assert-ApplyFailure -Run $run.Run -Case 'symlinked custom-file parent' -MessagePattern "cannot apply task file 'nested/AGENTS.md': unsafe-task-file-path"
             Test-Path -LiteralPath (Join-Path $external 'AGENTS.md') | Should -BeFalse
+        }
+    }
+
+    Context 'ctx root directives' {
+        It 'applies root-mode .ctx as UTF-8 without BOM and re-applies as a no-op' {
+            $repositoryPath = New-TestRepository -Name 'api-ctx-fresh'
+            $tasksRoot = Join-Path $TestDrive 'ctx-fresh-tasks'
+            $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+            $fixture = New-CtxRootFixture -Name 'ctx-fresh-fixture'
+            $request = New-ApplyRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+            $requestPath = Write-JsonRequest -Path (Join-Path $TestDrive 'ctx-fresh.json') -Request $request
+
+            $outcome = Invoke-CurrentPlanApply -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot
+            Assert-ApplySuccess -Run $outcome.Run -Case 'root-mode fresh apply'
+
+            $ctxPath = Join-Path $taskPath '.ctx'
+            $bytes = [IO.File]::ReadAllBytes($ctxPath)
+            @($bytes[0], $bytes[1], $bytes[2]) -join ',' | Should -Not -Be '239,187,191' -Because '.ctx must be written without a BOM'
+            ([IO.File]::ReadAllText($ctxPath) -ceq $outcome.Plan.plan.ctxFile.content) | Should -BeTrue -Because 'the applied .ctx must equal the planned content'
+
+            $replan = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot
+            $replan.plan.ctxFile.action | Should -Be 'noop'
+
+            $before = Get-TreeSnapshot -Root $taskPath
+            $reapply = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRoot -ExpectedPlanIdentity $replan.planIdentity -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot
+            Assert-ApplySuccess -Run $reapply -Case 'root-mode re-apply'
+            (Get-TreeSnapshot -Root $taskPath) | Should -Be $before -Because 'a repeated root-mode apply must not change content'
+        }
+
+        It 'adds and removes ctx root directives through the reviewed flow' {
+            $repositoryPath = New-TestRepository -Name 'api-ctx-update'
+            $tasksRoot = Join-Path $TestDrive 'ctx-update-tasks'
+            $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+            $fixture = New-CtxRootFixture -Name 'ctx-update-fixture'
+            $request = New-ApplyRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+            $requestPath = Write-JsonRequest -Path (Join-Path $TestDrive 'ctx-update.json') -Request $request
+
+            Assert-ApplySuccess -Run (Invoke-CurrentPlanApply -RequestPath $requestPath -TasksRoot $tasksRoot).Run -Case 'legacy initial apply'
+            $legacyBytes = [IO.File]::ReadAllBytes((Join-Path $taskPath '.ctx'))
+
+            $rootPlan = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot
+            $rootPlan.plan.ctxFile.action | Should -Be 'update'
+            $rootApply = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRoot -ExpectedPlanIdentity $rootPlan.planIdentity -CtxConfigRoot $fixture.ConfigRoot -CtxExternalProfilesRoot $fixture.ExternalRoot
+            Assert-ApplySuccess -Run $rootApply -Case 'add directives apply'
+            ([IO.File]::ReadAllText((Join-Path $taskPath '.ctx')) -ceq $rootPlan.plan.ctxFile.content) | Should -BeTrue -Because 'the applied .ctx must equal the planned content'
+            (Get-Content -LiteralPath (Join-Path $taskPath '.ctx') -Raw) | Should -Match '(?m)^config-root:'
+
+            $legacyPlan = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRoot
+            $legacyPlan.plan.ctxFile.action | Should -Be 'update'
+            $legacyApply = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRoot -ExpectedPlanIdentity $legacyPlan.planIdentity
+            Assert-ApplySuccess -Run $legacyApply -Case 'remove directives apply'
+            [Convert]::ToHexString([IO.File]::ReadAllBytes((Join-Path $taskPath '.ctx'))) | Should -Be ([Convert]::ToHexString($legacyBytes))
+        }
+
+        It 'rejects a reviewed identity when the ctx roots change before apply' {
+            $repositoryPath = New-TestRepository -Name 'api-ctx-stale'
+            $fixtureA = New-CtxRootFixture -Name 'ctx-stale-a'
+            $fixtureB = New-CtxRootFixture -Name 'ctx-stale-b'
+            $request = New-ApplyRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $fixtureA.TeamProfile })
+            $requestPath = Write-JsonRequest -Path (Join-Path $TestDrive 'ctx-stale.json') -Request $request
+
+            $tasksRootA = Join-Path $TestDrive 'ctx-stale-different-roots-tasks'
+            $planA = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRootA -CtxConfigRoot $fixtureA.ConfigRoot
+            $changedRoot = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRootA -ExpectedPlanIdentity $planA.planIdentity -CtxConfigRoot $fixtureB.ConfigRoot
+            Assert-ApplyFailure -Run $changedRoot -Case 'different valid config root' -MessagePattern 'plan identity changed'
+            Test-Path -LiteralPath (Join-Path $tasksRootA 'FEATURE-123') | Should -BeFalse
+
+            $tasksRootB = Join-Path $TestDrive 'ctx-stale-removed-roots-tasks'
+            $planB = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRootB -CtxConfigRoot $fixtureA.ConfigRoot -CtxExternalProfilesRoot $fixtureA.ExternalRoot
+            $removedRoots = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRootB -ExpectedPlanIdentity $planB.planIdentity
+            Assert-ApplyFailure -Run $removedRoots -Case 'apply without roots' -MessagePattern 'plan identity changed'
+            Test-Path -LiteralPath (Join-Path $tasksRootB 'FEATURE-123') | Should -BeFalse
+
+            $tasksRootC = Join-Path $TestDrive 'ctx-stale-added-roots-tasks'
+            $planC = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRootC
+            $addedRoots = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRootC -ExpectedPlanIdentity $planC.planIdentity -CtxConfigRoot $fixtureA.ConfigRoot
+            Assert-ApplyFailure -Run $addedRoots -Case 'apply with roots' -MessagePattern 'plan identity changed'
+            Test-Path -LiteralPath (Join-Path $tasksRootC 'FEATURE-123') | Should -BeFalse
+        }
+
+        It 'rejects apply when a supplied config root disappears after review' {
+            $repositoryPath = New-TestRepository -Name 'api-ctx-removed'
+            $tasksRoot = Join-Path $TestDrive 'ctx-removed-tasks'
+            $fixture = New-CtxRootFixture -Name 'ctx-removed-fixture'
+            $requestPath = Write-JsonRequest -Path (Join-Path $TestDrive 'ctx-removed.json') -Request (New-ApplyRequest -RepositoryPath $repositoryPath)
+
+            $plan = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot
+            Remove-Item -LiteralPath $fixture.ConfigRoot -Recurse -Force
+
+            $run = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRoot -ExpectedPlanIdentity $plan.planIdentity -CtxConfigRoot $fixture.ConfigRoot
+            Assert-ApplyFailure -Run $run -Case 'config root removed after review' -MessagePattern 'ctx config root must be an absolute existing directory'
+            Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123') | Should -BeFalse
+        }
+
+        It 'keeps task.json byte-identical when adding root directives to an existing task' {
+            $repositoryPath = New-TestRepository -Name 'api-ctx-manifest'
+            $tasksRoot = Join-Path $TestDrive 'ctx-manifest-tasks'
+            $taskPath = Join-Path $tasksRoot 'FEATURE-123'
+            $fixture = New-CtxRootFixture -Name 'ctx-manifest-fixture'
+            $request = New-ApplyRequest -RepositoryPath $repositoryPath -Profiles @([ordered]@{ name = 'team'; path = $fixture.TeamProfile })
+            $requestPath = Write-JsonRequest -Path (Join-Path $TestDrive 'ctx-manifest.json') -Request $request
+
+            Assert-ApplySuccess -Run (Invoke-CurrentPlanApply -RequestPath $requestPath -TasksRoot $tasksRoot).Run -Case 'legacy initial apply'
+            $manifestBytes = [IO.File]::ReadAllBytes((Join-Path $taskPath 'task.json'))
+
+            $rootPlan = Get-Plan -RequestPath $requestPath -TasksRoot $tasksRoot -CtxConfigRoot $fixture.ConfigRoot
+            $rootApply = Invoke-Apply -RequestPath $requestPath -TasksRoot $tasksRoot -ExpectedPlanIdentity $rootPlan.planIdentity -CtxConfigRoot $fixture.ConfigRoot
+            Assert-ApplySuccess -Run $rootApply -Case 'root-mode update apply'
+
+            [Convert]::ToHexString([IO.File]::ReadAllBytes((Join-Path $taskPath 'task.json'))) | Should -Be ([Convert]::ToHexString($manifestBytes)) -Because 'only .ctx may change when adding root directives'
         }
     }
 }

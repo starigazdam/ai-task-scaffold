@@ -8,12 +8,12 @@ public static class TaskStatePlanner
 {
     private static readonly string[] ManagedFileNames = { "task.json", "PRD.md", "PLAN.md", "STATUS.md", ".ctx" };
 
-    public static TaskStatePlanned Compute(NormalizedRequest request, string tasksRoot, List<CanonicalProfile> effectiveProfiles, string prdTemplatePath)
+    public static TaskStatePlanned Compute(NormalizedRequest request, string tasksRoot, List<CanonicalProfile> effectiveProfiles, string prdTemplatePath, CtxRootOptions ctxRoots)
     {
         var taskPath = Path.Combine(tasksRoot, request.TaskKey);
         var manifestPath = Path.Combine(taskPath, "task.json");
         var ctxPath = Path.Combine(taskPath, ".ctx");
-        var ctxContent = string.Join("\n", effectiveProfiles.Select(p => $"{p.Name}:{p.Path}")) + "\n";
+        var ctxContent = BuildCtxContent(taskPath, effectiveProfiles, ctxRoots);
         var taskExists = Path.Exists(taskPath);
 
         return new TaskStatePlanned
@@ -30,6 +30,33 @@ public static class TaskStatePlanner
             CtxFilePlan = ComputeCtxFilePlan(ctxPath, ctxContent),
             CustomFileOperations = ComputeCustomFileOperations(request, taskPath),
         };
+    }
+
+    private static string BuildCtxContent(string taskPath, List<CanonicalProfile> effectiveProfiles, CtxRootOptions ctxRoots)
+    {
+        if (!ctxRoots.Any)
+        {
+            return string.Join("\n", effectiveProfiles.Select(p => $"{p.Name}:{p.Path}")) + "\n";
+        }
+
+        string Rel(string target)
+        {
+            return Path.GetRelativePath(taskPath, target);
+        }
+
+        var lines = new List<string>();
+        if (ctxRoots.ConfigRoot is not null)
+        {
+            lines.Add($"config-root:{Rel(ctxRoots.ConfigRoot)}");
+        }
+
+        if (ctxRoots.ExternalProfilesRoot is not null)
+        {
+            lines.Add($"external-profiles-root:{Rel(ctxRoots.ExternalProfilesRoot)}");
+        }
+
+        lines.AddRange(effectiveProfiles.Select(p => $"{p.Name}:{Rel(p.Path)}"));
+        return string.Join("\n", lines) + "\n";
     }
 
     private static PrdOperation ComputePrdOperation(NormalizedRequest request, bool taskExists, string prdTemplatePath)
