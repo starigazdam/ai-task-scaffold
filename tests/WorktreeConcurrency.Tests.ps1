@@ -249,7 +249,9 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         foreach ($name in $names) { New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case "repos/$name") }
         $items = @(for ($index = 0; $index -lt $names.Count; $index++) { New-WorkItem -CaseRoot $case -Name $names[$index] -Index $index })
 
-        # charlie (index 2) fails at 0.1 s; alpha (index 0) fails at 0.6 s; bravo succeeds.
+        # charlie (index 2) fails at once because its base branch is gone; alpha
+        # (index 0) fails after 0.6 s through the shim; bravo succeeds at 0.2 s.
+        & git -C (Join-Path $case 'repos/charlie') branch -m main main-renamed
         $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'order.log')
         $savedPath = $env:PATH
         $env:PATH = "$($shim.Directory):$savedPath"
@@ -265,14 +267,17 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
             Remove-Item Env:SHIM_SLEEP, Env:SHIM_SLEEP_MATCH, Env:SHIM_FAIL_MATCH, Env:SHIM_FAIL_SLEEP -ErrorAction SilentlyContinue
         }
 
+        @($results | Where-Object Status -eq 'failed').Count | Should -Be 2
+        $results.Index | Should -Be @(0, 1, 2)
         $intervals = Get-ShimIntervals -LogPath $shim.LogPath
         $intervals.Count | Should -Be 3
         # charlie's start ended before alpha's, so completion order is not plan order.
         $intervals[0].End | Should -BeLessThan $intervals[2].End
-        $results.Index | Should -Be @(0, 1, 2)
         $firstFailure = $results | Where-Object Status -eq 'failed' | Select-Object -First 1
         $firstFailure.Index | Should -Be 0
         $firstFailure.Repository | Should -Be 'alpha'
+        $firstFailure.Message | Should -Match 'shim: forced failure'
+        ($results | Where-Object Status -eq 'failed' | Select-Object -Last 1).Repository | Should -Be 'charlie'
     }
 
     It 'keeps the serial behavior and message when the limit is one' {
