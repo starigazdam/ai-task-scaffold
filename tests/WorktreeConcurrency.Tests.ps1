@@ -48,6 +48,7 @@ BeforeAll {
             'case " $* " in'
             '  *" worktree add "*)'
             '    START=$(date +%s%N)'
+            '    case " $* " in *"${SHIM_FAIL_MATCH:-@@none@@}"*) sleep "$SHIM_SLEEP"; echo "shim: forced failure" >&2; exit 1 ;; esac'
             '    case " $* " in *"$SHIM_SLEEP_MATCH"*) sleep "$SHIM_SLEEP" ;; esac'
             '    "$REAL_GIT" "$@"; CODE=$?'
             '    END=$(date +%s%N)'
@@ -204,28 +205,30 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         $names = @('alpha', 'bravo', 'charlie', 'delta', 'echo')
         foreach ($name in $names) { New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case "repos/$name") }
         $items = @(for ($index = 0; $index -lt $names.Count; $index++) { New-WorkItem -CaseRoot $case -Name $names[$index] -Index $index })
-        # The first planned destination appears after planning, so its item fails first.
-        New-Item -ItemType Directory -Path (Join-Path $case 'tasks/CONCURRENCY-1/worktrees/alpha') -Force | Out-Null
 
+        # alpha fails 0.1 s into its git start; bravo succeeds 0.8 s into its own start.
+        # Both starts are admitted first, so bravo runs while alpha is running. The
+        # remaining three are planned after the failure is published and stay skipped.
         $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'failure.log')
         $savedPath = $env:PATH
         $env:PATH = "$($shim.Directory):$savedPath"
-        $env:SHIM_SLEEP = '0.5'
-        $env:SHIM_SLEEP_MATCH = '/worktrees/'
+        $env:SHIM_SLEEP_MATCH = '/worktrees/bravo'
+        $env:SHIM_FAIL_MATCH = '/worktrees/alpha'
+        $env:SHIM_SLEEP = '0.8'
         try {
             $results = Invoke-TaskWorktreePlanBatch -WorkItems $items -Limit 2 -ModulePath $modulePath
         }
         finally {
             $env:PATH = $savedPath
-            Remove-Item Env:SHIM_SLEEP, Env:SHIM_SLEEP_MATCH -ErrorAction SilentlyContinue
+            Remove-Item Env:SHIM_SLEEP, Env:SHIM_SLEEP_MATCH, Env:SHIM_FAIL_MATCH -ErrorAction SilentlyContinue
         }
 
         $results.Status[0] | Should -Be 'failed'
         $results.Status[1] | Should -Be 'created'
         $results.Status[2..4] | Should -Be @('skipped', 'skipped', 'skipped')
         $firstFailure = $results | Where-Object Status -eq 'failed' | Select-Object -First 1
-        $firstFailure.Message | Should -Match 'refusing to overwrite existing destination'
-        (Get-ShimIntervals -LogPath $shim.LogPath).Count | Should -Be 1
+        $firstFailure.Message | Should -Match "git worktree add failed for 'alpha'"
+        $firstFailure.Message | Should -Match 'shim: forced failure'
         Test-Path -LiteralPath (Join-Path $case 'tasks/CONCURRENCY-1/worktrees/charlie') | Should -BeFalse
     }
 
@@ -246,32 +249,41 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
     }
 }
 
-Describe 'Worktree admission gate' {
-    It 'admits work while no failure is published and refuses it after one' {
+Describe 'Worktree start gate' {
+    It 'starts no git process once a failure is published' {
+        $case = New-ConcurrencyCaseRoot
+        New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case 'repos/alpha')
+        $item = New-WorkItem -CaseRoot $case -Name 'alpha' -Index 0
         $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1 })
         $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
+        Set-TaskWorktreeFailure -State $state -Gate $gate -Index 3
 
-        Test-TaskWorktreeAdmission -State $state -Gate $gate | Should -BeTrue
-        Set-TaskWorktreeFailure -State $state -Gate $gate -Index 4
-        Test-TaskWorktreeAdmission -State $state -Gate $gate | Should -BeFalse
-        $state.FirstFailedIndex | Should -Be 4
+        $started = Invoke-TaskWorktreePlan -Repository $item.Repository -Plan $item.Plan -State $state -Gate $gate
+
+        $started | Should -BeFalse
+        Test-Path -LiteralPath $item.Plan.Destination | Should -BeFalse
     }
 
-    It 'makes admission wait for a failure published while the gate is held' {
-        # The barrier: the main thread owns the gate, the caller blocks in
-        # admission, the failure is published first, then the gate is released.
+    It 'holds the gate across the git start, so a paused start is refused after publication' {
+        # The barrier: the main thread owns the gate, a caller blocks on it just
+        # before starting git, the failure is published first, then the gate is
+        # released. A start that is not gated would create the worktree.
+        $case = New-ConcurrencyCaseRoot
+        New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case 'repos/alpha')
+        $item = New-WorkItem -CaseRoot $case -Name 'alpha' -Index 0
         $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1; Reached = $false })
         $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
         $gate.Wait()
-        $job = Start-ThreadJob -ArgumentList $modulePath, $state, $gate -ScriptBlock {
-            param($modulePath, $state, $gate)
+        $job = Start-ThreadJob -ArgumentList $modulePath, $item, $state, $gate -ScriptBlock {
+            param($modulePath, $item, $state, $gate)
             Import-Module $modulePath -Force
             $state.Reached = $true
-            return (Test-TaskWorktreeAdmission -State $state -Gate $gate)
+            return (Invoke-TaskWorktreePlan -Repository $item.Repository -Plan $item.Plan -State $state -Gate $gate)
         }
         try {
             for ($wait = 0; $wait -lt 250 -and -not $state.Reached; $wait++) { Start-Sleep -Milliseconds 20 }
             $state.Reached | Should -BeTrue
+            Start-Sleep -Milliseconds 200
             # This thread owns the gate, so this write is the exclusive publication
             # step that Set-TaskWorktreeFailure performs in production.
             $state.Failed = $true
@@ -279,10 +291,11 @@ Describe 'Worktree admission gate' {
         finally {
             $gate.Release()
         }
-        $admitted = Receive-Job -Job $job -Wait
+        $started = Receive-Job -Job $job -Wait
         Remove-Job -Job $job
 
-        $admitted | Should -BeFalse
+        $started | Should -BeFalse
+        Test-Path -LiteralPath $item.Plan.Destination | Should -BeFalse
     }
 
     It 'makes failure publication wait for the gate as well' {
