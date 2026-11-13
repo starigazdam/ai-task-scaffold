@@ -213,6 +213,36 @@ function Invoke-TaskWorktreePlanItem {
     }
 }
 
+function Test-TaskWorktreeAdmission {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][System.Threading.SemaphoreSlim]$Gate
+    )
+
+    # Admission and failure publication share one gate, so a worktree can start
+    # only when no failure was published before the start.
+    $Gate.Wait()
+    try { return -not $State.Failed }
+    finally { [void]$Gate.Release() }
+}
+
+function Set-TaskWorktreeFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][System.Threading.SemaphoreSlim]$Gate,
+        [int]$Index
+    )
+
+    $Gate.Wait()
+    try {
+        $State.Failed = $true
+        $State.FirstFailedIndex = $Index
+    }
+    finally { [void]$Gate.Release() }
+}
+
 function Invoke-TaskWorktreePlanBatch {
     [CmdletBinding()]
     param(
@@ -244,18 +274,20 @@ function Invoke-TaskWorktreePlanBatch {
     }
     $chainList = @($chains.Values | ForEach-Object { ,$_.ToArray() })
 
-    $failures = [System.Collections.Concurrent.ConcurrentQueue[int]]::new()
+    $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1 })
+    $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
     $parallelResults = $chainList | ForEach-Object -Parallel {
         $modulePath = $using:ModulePath
-        $failures = $using:failures
+        $state = $using:state
+        $gate = $using:gate
         Import-Module -Name $modulePath -Force
         foreach ($item in $_) {
-            if ($failures.Count -gt 0) {
+            if (-not (Test-TaskWorktreeAdmission -State $state -Gate $gate)) {
                 [pscustomobject]@{ Index = $item.Index; Repository = $item.Repository.Name; Status = 'skipped'; Message = 'skipped after an earlier worktree failure' }
                 continue
             }
             $result = Invoke-TaskWorktreePlanItem -Item $item
-            if ($result.Status -eq 'failed') { $failures.Enqueue($result.Index) }
+            if ($result.Status -eq 'failed') { Set-TaskWorktreeFailure -State $state -Gate $gate -Index $result.Index }
             $result
         }
     } -ThrottleLimit $Limit
@@ -263,4 +295,4 @@ function Invoke-TaskWorktreePlanBatch {
     return ,@($parallelResults | Sort-Object Index)
 }
 
-Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch
+Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Test-TaskWorktreeAdmission, Set-TaskWorktreeFailure

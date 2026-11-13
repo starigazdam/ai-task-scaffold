@@ -241,7 +241,74 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         $results.Count | Should -Be 1
         $results[0].Status | Should -Be 'failed'
         $results[0].Repository | Should -Be 'alpha'
+        $results[0].Message | Should -Match 'refusing to overwrite existing destination'
         Test-Path -LiteralPath (Join-Path $case 'tasks/CONCURRENCY-1/worktrees/bravo') | Should -BeFalse
+    }
+}
+
+Describe 'Worktree admission gate' {
+    It 'admits work while no failure is published and refuses it after one' {
+        $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1 })
+        $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
+
+        Test-TaskWorktreeAdmission -State $state -Gate $gate | Should -BeTrue
+        Set-TaskWorktreeFailure -State $state -Gate $gate -Index 4
+        Test-TaskWorktreeAdmission -State $state -Gate $gate | Should -BeFalse
+        $state.FirstFailedIndex | Should -Be 4
+    }
+
+    It 'makes admission wait for a failure published while the gate is held' {
+        # The barrier: the main thread owns the gate, the caller blocks in
+        # admission, the failure is published first, then the gate is released.
+        $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1; Reached = $false })
+        $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
+        $gate.Wait()
+        $job = Start-ThreadJob -ArgumentList $modulePath, $state, $gate -ScriptBlock {
+            param($modulePath, $state, $gate)
+            Import-Module $modulePath -Force
+            $state.Reached = $true
+            return (Test-TaskWorktreeAdmission -State $state -Gate $gate)
+        }
+        try {
+            for ($wait = 0; $wait -lt 250 -and -not $state.Reached; $wait++) { Start-Sleep -Milliseconds 20 }
+            $state.Reached | Should -BeTrue
+            # This thread owns the gate, so this write is the exclusive publication
+            # step that Set-TaskWorktreeFailure performs in production.
+            $state.Failed = $true
+        }
+        finally {
+            $gate.Release()
+        }
+        $admitted = Receive-Job -Job $job -Wait
+        Remove-Job -Job $job
+
+        $admitted | Should -BeFalse
+    }
+
+    It 'makes failure publication wait for the gate as well' {
+        $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1; Done = $false })
+        $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
+        $gate.Wait()
+        $job = Start-ThreadJob -ArgumentList $modulePath, $state, $gate -ScriptBlock {
+            param($modulePath, $state, $gate)
+            Import-Module $modulePath -Force
+            Set-TaskWorktreeFailure -State $state -Gate $gate -Index 7
+            $state.Done = $true
+        }
+        try {
+            Start-Sleep -Milliseconds 300
+            $state.Done | Should -BeFalse
+            $state.Failed | Should -BeFalse
+        }
+        finally {
+            $gate.Release()
+        }
+        Receive-Job -Job $job -Wait | Out-Null
+        Remove-Job -Job $job
+
+        $state.Done | Should -BeTrue
+        $state.Failed | Should -BeTrue
+        $state.FirstFailedIndex | Should -Be 7
     }
 }
 
