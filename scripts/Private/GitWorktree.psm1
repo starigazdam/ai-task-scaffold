@@ -140,11 +140,43 @@ function New-TaskWorktreePlan {
     return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
 }
 
+function Start-TaskWorktreeGitProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RepositoryPath,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [hashtable]$State,
+        [System.Threading.SemaphoreSlim]$Gate
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new('git')
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.ArgumentList.Add('-C')
+    $startInfo.ArgumentList.Add($RepositoryPath)
+    foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add($argument) }
+
+    # The start itself is the gated step: a failure published after this point
+    # cannot be followed by a new git start, and work started earlier is running.
+    if ($Gate) {
+        $Gate.Wait()
+        try {
+            if ($State.Failed) { return $null }
+            return [System.Diagnostics.Process]::Start($startInfo)
+        }
+        finally { [void]$Gate.Release() }
+    }
+    return [System.Diagnostics.Process]::Start($startInfo)
+}
+
 function Invoke-TaskWorktreePlan {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][psobject]$Repository,
-        [Parameter(Mandatory)][psobject]$Plan
+        [Parameter(Mandatory)][psobject]$Plan,
+        [hashtable]$State,
+        [System.Threading.SemaphoreSlim]$Gate
     )
 
     if ($Plan.Action -eq 'blocked') {
@@ -165,23 +197,129 @@ function Invoke-TaskWorktreePlan {
         throw "refusing to overwrite existing destination '$($Plan.Destination)'"
     }
 
-    New-Item -ItemType Directory -Path (Split-Path -Parent $Plan.Destination) -Force | Out-Null
-    if ($Plan.Action -eq 'create-remote') {
-        & git -C $Repository.Path worktree add --track -b $Repository.Branch $Plan.Destination $Plan.Source
-    }
-    elseif ($Plan.BranchMode -eq 'existing') {
-        & git -C $Repository.Path worktree add $Plan.Destination $Plan.Source
-    }
-    elseif ($Plan.Action -eq 'create-local') {
-        & git -C $Repository.Path worktree add -b $Repository.Branch $Plan.Destination $Plan.Source
-    }
-    else {
-        throw "unsupported worktree action '$($Plan.Action)'"
-    }
+    $gitArguments = if ($Plan.Action -eq 'create-remote') { @('worktree', 'add', '--track', '-b', $Repository.Branch, $Plan.Destination, $Plan.Source) }
+        elseif ($Plan.BranchMode -eq 'existing') { @('worktree', 'add', $Plan.Destination, $Plan.Source) }
+        elseif ($Plan.Action -eq 'create-local') { @('worktree', 'add', '-b', $Repository.Branch, $Plan.Destination, $Plan.Source) }
+        else { throw "unsupported worktree action '$($Plan.Action)'" }
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "git worktree add failed for '$($Repository.Name)'"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $Plan.Destination) -Force | Out-Null
+    $process = Start-TaskWorktreeGitProcess -RepositoryPath $Repository.Path -Arguments $gitArguments -State $State -Gate $Gate
+    if ($null -eq $process) { return $false }
+    # Native stderr becomes a terminating error inside a parallel runspace, so
+    # capture it here and report it with the failure instead of writing it out.
+    try {
+        # Drain both streams before the wait so a full pipe buffer cannot block git.
+        $standardError = $process.StandardError.ReadToEndAsync()
+        $standardOutput = $process.StandardOutput.ReadToEndAsync()
+        $process.WaitForExit()
+        $gitText = $standardError.GetAwaiter().GetResult() + $standardOutput.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            # Bound the detail: git diagnostics are short, but a broken hook is not.
+            $detail = (@($gitText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -First 20) -join '; '
+            if ($detail) { throw "git worktree add failed for '$($Repository.Name)': $detail" }
+            throw "git worktree add failed for '$($Repository.Name)'"
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+    return $true
+}
+
+function Get-TaskWorktreeConcurrencyLimit {
+    param([string]$VariableName = 'AI_TASK_SCAFFOLD_WORKTREE_CONCURRENCY')
+
+    $raw = [Environment]::GetEnvironmentVariable($VariableName)
+    if ([string]::IsNullOrWhiteSpace($raw)) { return 3 }
+    $limit = 0
+    if (-not [int]::TryParse($raw.Trim(), [ref]$limit) -or $limit -lt 1 -or $limit -gt 8) {
+        throw "invalid $VariableName value '$raw': expected an integer from 1 to 8"
+    }
+    return $limit
+}
+
+function Invoke-TaskWorktreePlanItem {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][psobject]$Item,
+        [hashtable]$State,
+        [System.Threading.SemaphoreSlim]$Gate
+    )
+
+    try {
+        $started = Invoke-TaskWorktreePlan -Repository $Item.Repository -Plan $Item.Plan -State $State -Gate $Gate
+        if ($started -eq $false) {
+            return [pscustomobject]@{ Index = $Item.Index; Repository = $Item.Repository.Name; Status = 'skipped'; Message = 'skipped after an earlier worktree failure' }
+        }
+        return [pscustomobject]@{ Index = $Item.Index; Repository = $Item.Repository.Name; Status = 'created'; Message = $null }
+    }
+    catch {
+        return [pscustomobject]@{ Index = $Item.Index; Repository = $Item.Repository.Name; Status = 'failed'; Message = $_.Exception.Message }
     }
 }
 
-Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan
+function Set-TaskWorktreeFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][System.Threading.SemaphoreSlim]$Gate,
+        [int]$Index
+    )
+
+    $Gate.Wait()
+    try {
+        $State.Failed = $true
+        $State.FirstFailedIndex = $Index
+    }
+    finally { [void]$Gate.Release() }
+}
+
+function Invoke-TaskWorktreePlanBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$WorkItems,
+        [Parameter(Mandatory)][ValidateRange(1, 8)][int]$Limit,
+        [Parameter(Mandatory)][string]$ModulePath
+    )
+
+    if ($WorkItems.Count -eq 0) { return ,@() }
+
+    if ($Limit -le 1 -or $WorkItems.Count -eq 1) {
+        $serialResults = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $WorkItems) {
+            $serialResults.Add((Invoke-TaskWorktreePlanItem -Item $item))
+            if ($serialResults[$serialResults.Count - 1].Status -eq 'failed') { break }
+        }
+        return ,$serialResults.ToArray()
+    }
+
+    # Entries that share one Git common directory race on .git/worktrees and ref
+    # locks, so each common directory becomes one chain that runs serially.
+    $chains = [ordered]@{}
+    foreach ($item in $WorkItems) {
+        $key = Get-GitCommonDir -RepositoryPath $item.Repository.Path
+        if (-not $key) { $key = [IO.Path]::GetFullPath($item.Repository.Path) }
+        if (-not $chains.Contains($key)) { $chains[$key] = [System.Collections.Generic.List[object]]::new() }
+        $chains[$key].Add($item)
+        New-Item -ItemType Directory -Path (Split-Path -Parent $item.Plan.Destination) -Force | Out-Null
+    }
+    $chainList = @($chains.Values | ForEach-Object { ,$_.ToArray() })
+
+    $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1 })
+    $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
+    $parallelResults = $chainList | ForEach-Object -Parallel {
+        $modulePath = $using:ModulePath
+        $state = $using:state
+        $gate = $using:gate
+        Import-Module -Name $modulePath -Force
+        foreach ($item in $_) {
+            $result = Invoke-TaskWorktreePlanItem -Item $item -State $state -Gate $gate
+            if ($result.Status -eq 'failed') { Set-TaskWorktreeFailure -State $state -Gate $gate -Index $result.Index }
+            $result
+        }
+    } -ThrottleLimit $Limit
+
+    return ,@($parallelResults | Sort-Object Index)
+}
+
+Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Start-TaskWorktreeGitProcess, Set-TaskWorktreeFailure

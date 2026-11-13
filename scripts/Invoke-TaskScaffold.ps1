@@ -13,7 +13,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'Private/TaskContract.psm1') -Force
-Import-Module (Join-Path $PSScriptRoot 'Private/GitWorktree.psm1') -Force
+$gitWorktreeModulePath = Join-Path $PSScriptRoot 'Private/GitWorktree.psm1'
+Import-Module $gitWorktreeModulePath -Force
 Import-Module (Join-Path $PSScriptRoot 'Private/TaskPlanIdentity.psm1') -Force
 
 $TasksRoot = [IO.Path]::GetFullPath($TasksRoot)
@@ -327,6 +328,7 @@ if ($Apply) {
 }
 
 if ($Apply) {
+    $worktreeConcurrencyLimit = Get-TaskWorktreeConcurrencyLimit
     $mutationLock = Enter-TaskMutationLock -TasksRoot $TasksRoot
     try {
     $worktreeOperations = @($request.Repositories |
@@ -526,8 +528,18 @@ phases:
         [IO.File]::WriteAllText($ctxPath, $ctxContent, [Text.UTF8Encoding]::new($false))
     }
     New-Item -ItemType Directory -Path (Join-Path $taskPath 'artifacts') -Force | Out-Null
-    foreach ($operation in $worktreeOperations) {
-        Invoke-TaskWorktreePlan -Repository ($request.Repositories | Where-Object Name -eq $operation.Repository) -Plan $operation
+    $worktreeItems = @(for ($worktreeIndex = 0; $worktreeIndex -lt $worktreeOperations.Count; $worktreeIndex++) {
+        $worktreeOperation = $worktreeOperations[$worktreeIndex]
+        [pscustomobject]@{
+            Index = $worktreeIndex
+            Plan = $worktreeOperation
+            Repository = ($request.Repositories | Where-Object Name -eq $worktreeOperation.Repository | Select-Object -First 1)
+        }
+    })
+    $worktreeResults = Invoke-TaskWorktreePlanBatch -WorkItems $worktreeItems -Limit $worktreeConcurrencyLimit -ModulePath $gitWorktreeModulePath
+    $firstFailure = $worktreeResults | Where-Object Status -eq 'failed' | Select-Object -First 1
+    if ($firstFailure) {
+        throw $firstFailure.Message
     }
     }
     finally {
