@@ -111,6 +111,8 @@ $plan = ./scripts/Invoke-TaskScaffold.ps1 -RequestPath ./task-request.json -Task
 
 The identity covers the normalized request, the generated plan, task-owned state, profile instructions and skills, repository refs and planned worktree identity, workspace input, and scaffold scripts/templates. Apply checks the expected identity before locking and rechecks under the mutation lock immediately before task or worktree mutations. If any covered input differs, apply fails and requires a fresh plan and approval. `-Apply` without `-ExpectedPlanIdentity` is rejected; legacy schema-version-1 requests remain supported.
 
+`-Apply` runs `git worktree add` in parallel for repositories that have different Git common directories. Set the limit with `AI_TASK_SCAFFOLD_WORKTREE_CONCURRENCY`: an integer from 1 to 8, default 3. Repositories that share one Git common directory stay in serial order, and a limit of 1 keeps the former serial behavior. After the first failure, no new worktree starts, running worktrees finish, and apply reports the first failure by plan order. The limit is not part of `PlanIdentity`.
+
 Run the full terminal wizard from PowerShell. Enter the task key and title, then provide an optional PRD path; leave it blank to create a starter. Repository selection is the final input step. Use **Up/Down** to navigate, **Space** to check/uncheck, then **Enter** to continue. If the supplied source is missing, the wizard reports that it will create the starter instead. It shows the request and scaffold plan, then asks once more before copying or creating `PRD.md` and creating task/worktree state:
 
 ```powershell

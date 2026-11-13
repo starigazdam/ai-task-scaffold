@@ -166,22 +166,101 @@ function Invoke-TaskWorktreePlan {
     }
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $Plan.Destination) -Force | Out-Null
+    # Native stderr becomes a terminating error inside a parallel runspace, so
+    # capture it here and report it with the failure instead of writing it out.
     if ($Plan.Action -eq 'create-remote') {
-        & git -C $Repository.Path worktree add --track -b $Repository.Branch $Plan.Destination $Plan.Source
+        $gitOutput = & git -C $Repository.Path worktree add --track -b $Repository.Branch $Plan.Destination $Plan.Source 2>&1 | ForEach-Object { "$_" }
     }
     elseif ($Plan.BranchMode -eq 'existing') {
-        & git -C $Repository.Path worktree add $Plan.Destination $Plan.Source
+        $gitOutput = & git -C $Repository.Path worktree add $Plan.Destination $Plan.Source 2>&1 | ForEach-Object { "$_" }
     }
     elseif ($Plan.Action -eq 'create-local') {
-        & git -C $Repository.Path worktree add -b $Repository.Branch $Plan.Destination $Plan.Source
+        $gitOutput = & git -C $Repository.Path worktree add -b $Repository.Branch $Plan.Destination $Plan.Source 2>&1 | ForEach-Object { "$_" }
     }
     else {
         throw "unsupported worktree action '$($Plan.Action)'"
     }
 
     if ($LASTEXITCODE -ne 0) {
+        $detail = (@($gitOutput) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '; '
+        if ($detail) { throw "git worktree add failed for '$($Repository.Name)': $detail" }
         throw "git worktree add failed for '$($Repository.Name)'"
     }
 }
 
-Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan
+function Get-TaskWorktreeConcurrencyLimit {
+    param([string]$VariableName = 'AI_TASK_SCAFFOLD_WORKTREE_CONCURRENCY')
+
+    $raw = [Environment]::GetEnvironmentVariable($VariableName)
+    if ([string]::IsNullOrWhiteSpace($raw)) { return 3 }
+    $limit = 0
+    if (-not [int]::TryParse($raw.Trim(), [ref]$limit) -or $limit -lt 1 -or $limit -gt 8) {
+        throw "invalid $VariableName value '$raw': expected an integer from 1 to 8"
+    }
+    return $limit
+}
+
+function Invoke-TaskWorktreePlanItem {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][psobject]$Item)
+
+    try {
+        Invoke-TaskWorktreePlan -Repository $Item.Repository -Plan $Item.Plan | Out-Null
+        return [pscustomobject]@{ Index = $Item.Index; Repository = $Item.Repository.Name; Status = 'created'; Message = $null }
+    }
+    catch {
+        return [pscustomobject]@{ Index = $Item.Index; Repository = $Item.Repository.Name; Status = 'failed'; Message = $_.Exception.Message }
+    }
+}
+
+function Invoke-TaskWorktreePlanBatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$WorkItems,
+        [Parameter(Mandatory)][ValidateRange(1, 8)][int]$Limit,
+        [Parameter(Mandatory)][string]$ModulePath
+    )
+
+    if ($WorkItems.Count -eq 0) { return ,@() }
+
+    if ($Limit -le 1 -or $WorkItems.Count -eq 1) {
+        $serialResults = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $WorkItems) {
+            $serialResults.Add((Invoke-TaskWorktreePlanItem -Item $item))
+            if ($serialResults[$serialResults.Count - 1].Status -eq 'failed') { break }
+        }
+        return ,$serialResults.ToArray()
+    }
+
+    # Entries that share one Git common directory race on .git/worktrees and ref
+    # locks, so each common directory becomes one chain that runs serially.
+    $chains = [ordered]@{}
+    foreach ($item in $WorkItems) {
+        $key = Get-GitCommonDir -RepositoryPath $item.Repository.Path
+        if (-not $key) { $key = [IO.Path]::GetFullPath($item.Repository.Path) }
+        if (-not $chains.Contains($key)) { $chains[$key] = [System.Collections.Generic.List[object]]::new() }
+        $chains[$key].Add($item)
+        New-Item -ItemType Directory -Path (Split-Path -Parent $item.Plan.Destination) -Force | Out-Null
+    }
+    $chainList = @($chains.Values | ForEach-Object { ,$_.ToArray() })
+
+    $failures = [System.Collections.Concurrent.ConcurrentQueue[int]]::new()
+    $parallelResults = $chainList | ForEach-Object -Parallel {
+        $modulePath = $using:ModulePath
+        $failures = $using:failures
+        Import-Module -Name $modulePath -Force
+        foreach ($item in $_) {
+            if ($failures.Count -gt 0) {
+                [pscustomobject]@{ Index = $item.Index; Repository = $item.Repository.Name; Status = 'skipped'; Message = 'skipped after an earlier worktree failure' }
+                continue
+            }
+            $result = Invoke-TaskWorktreePlanItem -Item $item
+            if ($result.Status -eq 'failed') { $failures.Enqueue($result.Index) }
+            $result
+        }
+    } -ThrottleLimit $Limit
+
+    return ,@($parallelResults | Sort-Object Index)
+}
+
+Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch
