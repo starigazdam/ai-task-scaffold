@@ -48,7 +48,16 @@ BeforeAll {
             'case " $* " in'
             '  *" worktree add "*)'
             '    START=$(date +%s%N)'
-            '    case " $* " in *"${SHIM_FAIL_MATCH:-@@none@@}"*) sleep "$SHIM_SLEEP"; echo "shim: forced failure" >&2; exit 1 ;; esac'
+            '    case " $* " in'
+            '      *"${SHIM_FAIL_MATCH:-@@none@@}"*)'
+            '        sleep "$SHIM_FAIL_SLEEP"'
+            '        END=$(date +%s%N)'
+            '        printf "%s %s\n" "$START" "$END" >> "$LOG"'
+            '        echo "shim: forced stdout"'
+            '        echo "shim: forced failure" >&2'
+            '        exit 1'
+            '        ;;'
+            '    esac'
             '    case " $* " in *"$SHIM_SLEEP_MATCH"*) sleep "$SHIM_SLEEP" ;; esac'
             '    "$REAL_GIT" "$@"; CODE=$?'
             '    END=$(date +%s%N)'
@@ -207,20 +216,21 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         $items = @(for ($index = 0; $index -lt $names.Count; $index++) { New-WorkItem -CaseRoot $case -Name $names[$index] -Index $index })
 
         # alpha fails 0.1 s into its git start; bravo succeeds 0.8 s into its own start.
-        # Both starts are admitted first, so bravo runs while alpha is running. The
-        # remaining three are planned after the failure is published and stay skipped.
+        # Both starts are admitted first, so bravo is running when alpha publishes. The
+        # remaining three reach the gate after the publication and stay skipped.
         $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'failure.log')
         $savedPath = $env:PATH
         $env:PATH = "$($shim.Directory):$savedPath"
         $env:SHIM_SLEEP_MATCH = '/worktrees/bravo'
         $env:SHIM_FAIL_MATCH = '/worktrees/alpha'
         $env:SHIM_SLEEP = '0.8'
+        $env:SHIM_FAIL_SLEEP = '0.1'
         try {
             $results = Invoke-TaskWorktreePlanBatch -WorkItems $items -Limit 2 -ModulePath $modulePath
         }
         finally {
             $env:PATH = $savedPath
-            Remove-Item Env:SHIM_SLEEP, Env:SHIM_SLEEP_MATCH, Env:SHIM_FAIL_MATCH -ErrorAction SilentlyContinue
+            Remove-Item Env:SHIM_SLEEP, Env:SHIM_SLEEP_MATCH, Env:SHIM_FAIL_MATCH, Env:SHIM_FAIL_SLEEP -ErrorAction SilentlyContinue
         }
 
         $results.Status[0] | Should -Be 'failed'
@@ -229,7 +239,40 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         $firstFailure = $results | Where-Object Status -eq 'failed' | Select-Object -First 1
         $firstFailure.Message | Should -Match "git worktree add failed for 'alpha'"
         $firstFailure.Message | Should -Match 'shim: forced failure'
+        $firstFailure.Message | Should -Match 'shim: forced stdout'
         Test-Path -LiteralPath (Join-Path $case 'tasks/CONCURRENCY-1/worktrees/charlie') | Should -BeFalse
+    }
+
+    It 'reports the failure with the lowest plan index, not the first to finish' -Skip:(-not $IsLinux) {
+        $case = New-ConcurrencyCaseRoot
+        $names = @('alpha', 'bravo', 'charlie')
+        foreach ($name in $names) { New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case "repos/$name") }
+        $items = @(for ($index = 0; $index -lt $names.Count; $index++) { New-WorkItem -CaseRoot $case -Name $names[$index] -Index $index })
+
+        # charlie (index 2) fails at 0.1 s; alpha (index 0) fails at 0.6 s; bravo succeeds.
+        $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'order.log')
+        $savedPath = $env:PATH
+        $env:PATH = "$($shim.Directory):$savedPath"
+        $env:SHIM_SLEEP_MATCH = '/worktrees/bravo'
+        $env:SHIM_SLEEP = '0.2'
+        $env:SHIM_FAIL_MATCH = '/worktrees/alpha'
+        $env:SHIM_FAIL_SLEEP = '0.6'
+        try {
+            $results = Invoke-TaskWorktreePlanBatch -WorkItems $items -Limit 3 -ModulePath $modulePath
+        }
+        finally {
+            $env:PATH = $savedPath
+            Remove-Item Env:SHIM_SLEEP, Env:SHIM_SLEEP_MATCH, Env:SHIM_FAIL_MATCH, Env:SHIM_FAIL_SLEEP -ErrorAction SilentlyContinue
+        }
+
+        $intervals = Get-ShimIntervals -LogPath $shim.LogPath
+        $intervals.Count | Should -Be 3
+        # charlie's start ended before alpha's, so completion order is not plan order.
+        $intervals[0].End | Should -BeLessThan $intervals[2].End
+        $results.Index | Should -Be @(0, 1, 2)
+        $firstFailure = $results | Where-Object Status -eq 'failed' | Select-Object -First 1
+        $firstFailure.Index | Should -Be 0
+        $firstFailure.Repository | Should -Be 'alpha'
     }
 
     It 'keeps the serial behavior and message when the limit is one' {

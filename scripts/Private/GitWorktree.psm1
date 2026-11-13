@@ -207,14 +207,15 @@ function Invoke-TaskWorktreePlan {
     if ($null -eq $process) { return $false }
     # Native stderr becomes a terminating error inside a parallel runspace, so
     # capture it here and report it with the failure instead of writing it out.
-    $standardError = $null
     try {
+        # Drain both streams before the wait so a full pipe buffer cannot block git.
         $standardError = $process.StandardError.ReadToEndAsync()
-        $process.StandardOutput.ReadToEndAsync() | Out-Null
+        $standardOutput = $process.StandardOutput.ReadToEndAsync()
         $process.WaitForExit()
-        $gitOutput = @($standardError.GetAwaiter().GetResult() -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $gitText = $standardError.GetAwaiter().GetResult() + $standardOutput.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
-            $detail = $gitOutput -join '; '
+            # Bound the detail: git diagnostics are short, but a broken hook is not.
+            $detail = (@($gitText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -First 20) -join '; '
             if ($detail) { throw "git worktree add failed for '$($Repository.Name)': $detail" }
             throw "git worktree add failed for '$($Repository.Name)'"
         }
