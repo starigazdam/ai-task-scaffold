@@ -1149,6 +1149,48 @@ Describe 'Exact task ref resolution' {
         $plan.Reason | Should -Be 'start-commit-missing'
     }
 
+    It 'blocks a dangling symbolic task ref instead of creating a branch' {
+        $repositoryPath = Join-Path $TestDrive 'exact-ref-dangling'
+        $head = New-ExactRefRepository -Path $repositoryPath
+        # A symbolic ref whose target does not exist is present but unreadable:
+        # for-each-ref omits it, so absence must not be inferred from the listing.
+        & git -C $repositoryPath symbolic-ref refs/heads/feature/FEATURE-123 refs/heads/missing
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'exact-ref-dangling-tasks')
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'start-commit-missing' -Because 'a present symbolic ref with a missing target must never fall through to main'
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
+
+        $pinned = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $head }
+        $pinnedPlan = New-TaskWorktreePlan -Repository $pinned -TaskKey 'FEATURE-124' -TasksRoot (Join-Path $TestDrive 'exact-ref-dangling-pinned-tasks')
+
+        $pinnedPlan.Action | Should -Be 'blocked'
+        $pinnedPlan.Reason | Should -Be 'start-commit-mismatch'
+        Test-Path -LiteralPath $pinnedPlan.Destination | Should -BeFalse
+    }
+
+    It 'blocks a start commit that only a replacement ref can resolve' {
+        $repositoryPath = Join-Path $TestDrive 'exact-ref-replacement'
+        $head = New-ExactRefRepository -Path $repositoryPath
+        & git -C $repositoryPath replace -l *> $null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'git replace is unavailable'; return }
+
+        # The original object is absent; a replace ref maps it to a real commit,
+        # so a plain rev-parse would validate a commit that is not here.
+        $missing = '36478499d1d27f636b8ea3604772d3aa7cd5e8d3'
+        & git -C $repositoryPath update-ref "refs/replace/$missing" $head
+        (& git -C $repositoryPath rev-parse --verify --quiet "$missing^{commit}") | Should -Be $missing
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $missing }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'exact-ref-replacement-tasks')
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'start-commit-missing'
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
+    }
+
     It 'does not let a lookalike tag stand in for the remote task ref' {
         $repositoryPath = Join-Path $TestDrive 'exact-ref-tag-lookalike'
         $head = New-ExactRefRepository -Path $repositoryPath
@@ -1168,6 +1210,45 @@ Describe 'Exact task ref resolution' {
         $pinnedPlan.BranchMode | Should -Be 'new'
         $pinnedPlan.Source | Should -Be $head
         $pinnedPlan.SourceCommit | Should -Be $head
+    }
+}
+
+Describe 'Native repository path resolution' {
+    It 'resolves link/../repo with native chdir semantics on Linux' -Skip:(-not $IsLinux) {
+        # link -> other/dir, so native `git -C link/../repo` enters other/repo.
+        # A lexical GetFullPath would collapse the dot segment first and select
+        # the decoy repository at link/../repo's lexical position.
+        $base = Join-Path $TestDrive 'native-path'
+        foreach ($name in @('other/dir', 'other/repo', 'repo')) {
+            New-Item -ItemType Directory -Path (Join-Path $base $name) -Force | Out-Null
+        }
+        foreach ($name in @('other/repo', 'repo')) {
+            $path = Join-Path $base $name
+            & git -C $path init -b main | Out-Null
+            & git -C $path config user.name Test
+            & git -C $path config user.email test@example.invalid
+            Set-Content -LiteralPath (Join-Path $path 'README.md') -Value 'first'
+            & git -C $path add README.md
+            & git -C $path commit -m first | Out-Null
+        }
+        $nativeHead = (& git -C (Join-Path $base 'other/repo') rev-parse HEAD).Trim()
+        Set-Content -LiteralPath (Join-Path $base 'repo/README.md') -Value 'second'
+        & git -C (Join-Path $base 'repo') commit -am second | Out-Null
+        $decoyHead = (& git -C (Join-Path $base 'repo') rev-parse HEAD).Trim()
+        New-Item -ItemType SymbolicLink -Path (Join-Path $base 'link') -Target (Join-Path $base 'other/dir') | Out-Null
+
+        Push-Location $base
+        try {
+            $nativeTop = (& git -C 'link/../repo' rev-parse --show-toplevel).Trim()
+            $repository = [pscustomobject]@{ Name = 'api'; Path = 'link/../repo'; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+            $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'native-path-tasks')
+        }
+        finally { Pop-Location }
+
+        $nativeTop | Should -Be ([IO.Path]::TrimEndingDirectorySeparator((Join-Path $base 'other/repo')))
+        $plan.Action | Should -Be 'create-local'
+        $plan.SourceCommit | Should -Be $nativeHead
+        $plan.SourceCommit | Should -Not -Be $decoyHead -Because 'a lexically normalized path would select the decoy repository'
     }
 }
 
@@ -1253,7 +1334,12 @@ Describe 'No-lazy-fetch capability' {
         $plan.BranchMode | Should -Be 'new'
     }
 
-    It 'plans a real partial clone with a Git that supports --no-lazy-fetch' -Skip:(-not $IsLinux) {
+    It 'plans a real partial clone with a Git that supports --no-lazy-fetch' {
+        # Capability of the local Git, not the OS: a supported Git can plan a
+        # partial clone on any platform that can create one.
+        & git --no-lazy-fetch --version *> $null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'this Git does not support --no-lazy-fetch'; return }
+
         $fixture = New-PartialCloneFixture -SourcePath (Join-Path $TestDrive 'capability-source-modern') -ClonePath (Join-Path $TestDrive 'capability-partial-modern')
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
 

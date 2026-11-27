@@ -549,7 +549,11 @@ Describe 'dotnet task plan ref resolution and Git capability' {
         $result.plan.worktreeOperations[0].branchMode | Should -Be 'new'
     }
 
-    It 'plans a real partial clone with a Git that supports --no-lazy-fetch' -Skip:(-not $IsLinux) {
+    It 'plans a real partial clone with a Git that supports --no-lazy-fetch' {
+        # Capability of the local Git, not the OS.
+        & git --no-lazy-fetch --version *> $null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'this Git does not support --no-lazy-fetch'; return }
+
         $repositoryPath = New-PartialCloneRepository -SourcePath (Join-Path $TestDrive 'cli-partial-source-modern') -ClonePath (Join-Path $TestDrive 'cli-partial-modern')
         $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
         $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
@@ -606,6 +610,90 @@ Describe 'dotnet task plan ref resolution and Git capability' {
 
         $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
         $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'blocks a dangling symbolic branch ref instead of creating one' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-dangling'
+        # Present but unreadable: for-each-ref omits a symbolic ref whose target
+        # is missing, so absence must not be inferred from that listing.
+        & git -C $repositoryPath symbolic-ref refs/heads/feature/FEATURE-123 refs/heads/missing
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-dangling.json') -Request $request
+        $tasksRoot = Join-Path $TestDrive 'cli-tasks-ref-dangling'
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'dangling symbolic task ref'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
+    }
+
+    It 'blocks a start commit that only a replacement ref can resolve' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-replacement'
+        & git -C $repositoryPath replace -l *> $null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'git replace is unavailable'; return }
+
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $missing = '36478499d1d27f636b8ea3604772d3aa7cd5e8d3'
+        & git -C $repositoryPath update-ref "refs/replace/$missing" $head
+        (& git -C $repositoryPath rev-parse --verify --quiet "$missing^{commit}") | Should -Be $missing
+
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request.repositories[0]['startCommit'] = $missing
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-replacement.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-replacement')) -Case 'replacement-only start commit'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'rechecks a new promisor remote between the initial and locked plan' -Skip:(-not $IsLinux) {
+        # The shim behaves like Git without --no-lazy-fetch and turns the full
+        # clone into a partial one once apply holds the mutation lock, so only a
+        # config re-read can refuse the locked re-plan.
+        $repositoryPath = New-TestRepository -Name 'cli-promisor-later'
+        $tasksRoot = Join-Path $TestDrive 'cli-tasks-promisor-later'
+        $shimDir = Join-Path $TestDrive 'cli-shim-promisor-later'
+        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+        $shimPath = Join-Path $shimDir 'git'
+        @(
+            '#!/bin/sh'
+            "REAL_GIT='$realGit'"
+            "LOCK='$(Join-Path $tasksRoot '.ai-task-scaffold.lock')'"
+            "FLAG='$(Join-Path $TestDrive 'cli-promisor-later.flag')'"
+            "REPO='$repositoryPath'"
+            'if [ "$1" = "--no-lazy-fetch" ]; then'
+            '  echo "error: unknown option: --no-lazy-fetch" >&2'
+            '  exit 129'
+            'fi'
+            'case " $* " in'
+            '  *" config "*extensions.partialClone*)'
+            '    if [ -e "$LOCK" ] && [ ! -e "$FLAG" ]; then'
+            '      "$REAL_GIT" -C "$REPO" config remote.origin.promisor true'
+            '      : > "$FLAG"'
+            '    fi ;;'
+            'esac'
+            'exec "$REAL_GIT" "$@"'
+        ) | Set-Content -LiteralPath $shimPath
+        & chmod +x $shimPath
+
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-promisor-later.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $plan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'full clone before the promisor remote appears'
+            $run = Invoke-TaskPlanRaw -Arguments @('task', 'apply', '--request', $requestPath, '--tasks-root', $tasksRoot, '--expected-plan-identity', $plan.planIdentity)
+        }
+        finally { $env:PATH = $savedPath }
+
+        $run.ExitCode | Should -Be 1
+        $run.StdErr | Should -Match 'partial clone'
+        (& git -C $repositoryPath config --get remote.origin.promisor) | Should -Be 'true'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/task.json') | Should -BeFalse
     }
 
     It 'binds the validated pin without re-reading the mutable task ref' -Skip:(-not $IsLinux) {

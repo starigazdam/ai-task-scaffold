@@ -6,18 +6,22 @@ function Resolve-TaskRepositoryPath {
 
     # Native Git run from PowerShell resolves a relative -C path against the
     # PowerShell file-system location, while a child process inherits the
-    # process working directory. Resolve once here so both see one path, and
-    # leave the raw value untouched in durable manifests.
+    # process working directory. Combine both once so every probe, child, and
+    # identity read sees one path, and leave the raw value untouched in durable
+    # manifests. The combination is not normalized: `..` and symlinks must keep
+    # the meaning native chdir gives them (link/../repo is the repository
+    # inside link's target, not a sibling), so a lexical GetFullPath could
+    # select a different repository.
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
     if ([IO.Path]::IsPathFullyQualified($Path)) {
-        return [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Path))
+        return [IO.Path]::TrimEndingDirectorySeparator($Path)
     }
 
     $location = $null
     try { $location = (Get-Location -PSProvider FileSystem -ErrorAction Stop).ProviderPath }
     catch { $location = [Environment]::CurrentDirectory }
     if ([string]::IsNullOrWhiteSpace($location)) { $location = [Environment]::CurrentDirectory }
-    return [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::Combine($location, $Path)))
+    return [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::Combine($location, $Path))
 }
 
 function Get-GitCommitWithoutLazyFetch {
@@ -31,7 +35,9 @@ function Get-GitCommitWithoutLazyFetch {
 
     # A partial clone can lazily fetch a missing object during rev-parse. These
     # planning lookups are read-only, so they must only resolve local objects.
-    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--verify', '--quiet', "$Reference^{commit}") -NoLazyFetch
+    # Replacement refs must not stand in either: they can map a missing pinned
+    # commit to a local one and make an absent object look present.
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('--no-replace-objects', 'rev-parse', '--verify', '--quiet', "$Reference^{commit}") -NoLazyFetch
     if ($result.ExitCode -ne 0) { return $null }
     return ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
 }
@@ -39,31 +45,46 @@ function Get-GitCommitWithoutLazyFetch {
 function Get-TaskGitRefCommit {
     param([string]$RepositoryPath, [string]$Reference)
 
-    # for-each-ref lists the ref name and its raw object ID. Match the exact
-    # name, then verify that raw ID is a locally available commit. A ref whose
-    # tip cannot be read is present-but-unverified, never absent, so callers
-    # fail closed instead of falling through to another ref.
+    # Presence is decided by exact name checks that never run revision DWIM:
+    # `show-ref --verify` and `symbolic-ref -q` accept only the full name, so a
+    # lookalike tag cannot stand in. for-each-ref still lists the raw object ID.
+    # A name that is present but whose tip cannot be read -- a dangling symbolic
+    # ref, which for-each-ref omits and show-ref refuses -- stays present, so
+    # callers fail closed instead of falling through to another ref.
+    $presence = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('show-ref', '--verify', '--quiet', $Reference) -NoLazyFetch
+    $present = $presence.ExitCode -eq 0
+    if (-not $present -and $presence.ExitCode -eq 1) {
+        # show-ref reports a dangling symbolic ref as absent (it cannot resolve
+        # the target), so ask for the symbolic ref itself before giving up.
+        $symbolic = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('symbolic-ref', '-q', $Reference) -NoLazyFetch
+        $present = $symbolic.ExitCode -eq 0
+    }
+    elseif (-not $present) {
+        # Any other exit is an unreadable ref, never an absent one.
+        $present = $true
+    }
+
     $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('for-each-ref', '--format=%(refname) %(objectname)', $Reference) -NoLazyFetch
     if ($result.ExitCode -ne 0) {
         throw "cannot read ref '$Reference' in '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
     }
 
-    $found = $false
     $objectId = $null
     foreach ($line in @($result.Output -split "`r?`n")) {
-        $separator = $line.IndexOf(' ')
-        if ($separator -le 0) { continue }
-        if ($line.Substring(0, $separator) -cne $Reference) { continue }
-        $found = $true
-        $candidate = $line.Substring($separator + 1).Trim()
+        if (-not $line.StartsWith("$Reference ", [StringComparison]::Ordinal)) { continue }
+        # Fixed-width parse: the remainder is exactly one raw object ID, never a
+        # decorated or trimmed value.
+        $candidate = $line.Substring($Reference.Length + 1)
         if ($candidate -cmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') { $objectId = $candidate }
+        $present = $true
         break
     }
 
-    if (-not $found) { return [pscustomobject]@{ Exists = $false; Commit = $null } }
+    if (-not $present) { return [pscustomobject]@{ Exists = $false; Commit = $null } }
     if (-not $objectId) { return [pscustomobject]@{ Exists = $true; Commit = $null } }
 
-    $verify = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--verify', '--quiet', "$objectId^{commit}") -NoLazyFetch
+    # Replacement refs can make an absent object read as a commit.
+    $verify = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('--no-replace-objects', 'rev-parse', '--verify', '--quiet', "$objectId^{commit}") -NoLazyFetch
     if ($verify.ExitCode -ne 0) { return [pscustomobject]@{ Exists = $true; Commit = $null } }
     $commit = ([string](@($verify.Output -split "`r?`n") | Select-Object -First 1)).Trim()
     return [pscustomobject]@{
@@ -796,7 +817,7 @@ function Invoke-TaskWorktreePlanBatch {
     $chains = [ordered]@{}
     foreach ($item in $WorkItems) {
         $key = Get-GitCommonDir -RepositoryPath $item.Repository.Path
-        if (-not $key) { $key = [IO.Path]::GetFullPath($item.Repository.Path) }
+        if (-not $key) { $key = Resolve-TaskRepositoryPath -Path $item.Repository.Path }
         if (-not $chains.Contains($key)) { $chains[$key] = [System.Collections.Generic.List[object]]::new() }
         $chains[$key].Add($item)
         New-Item -ItemType Directory -Path (Split-Path -Parent $item.Plan.Destination) -Force | Out-Null

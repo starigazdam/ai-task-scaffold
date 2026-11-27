@@ -758,40 +758,56 @@ public static class TaskPlanner
 
     private static string? ResolveCommit(string repositoryPath, string reference)
     {
-        var result = RunGit(repositoryPath, "rev-parse", "--verify", "--quiet", $"{reference}^{{commit}}");
+        // No replacement objects: a replace ref can map a missing pinned commit
+        // to a local one, which would validate an object that is not here.
+        var result = RunGit(repositoryPath, "--no-replace-objects", "rev-parse", "--verify", "--quiet", $"{reference}^{{commit}}");
         return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
     }
 
     private static (bool Exists, string? Commit) ReadRefTip(string repositoryPath, string reference)
     {
-        // for-each-ref reports the raw ref name and object ID. Match the exact
-        // name, then verify that raw ID is a locally available commit. A ref
-        // whose tip cannot be verified is present, never absent, so callers do
-        // not fall through to another ref or a lookalike tag.
+        // Presence comes from exact name checks that never run revision DWIM:
+        // show-ref --verify and symbolic-ref -q accept only the full name, so a
+        // lookalike tag cannot stand in. for-each-ref supplies the raw object
+        // ID. A name that is present but whose tip cannot be read -- a dangling
+        // symbolic ref, which show-ref reports as absent and for-each-ref omits
+        // -- stays present so callers fail closed instead of falling through.
+        var presence = RunGit(repositoryPath, "show-ref", "--verify", "--quiet", reference);
+        var exists = presence.ExitCode == 0;
+        if (!exists && presence.ExitCode == 1)
+        {
+            var symbolic = RunGit(repositoryPath, "symbolic-ref", "-q", reference);
+            exists = symbolic.ExitCode == 0;
+        }
+        else if (!exists)
+        {
+            // Any other exit is an unreadable ref, never an absent one.
+            exists = true;
+        }
+
         var result = RunGit(repositoryPath, "for-each-ref", "--format=%(refname) %(objectname)", reference);
         if (result.ExitCode != 0)
         {
             throw new OperationalException($"cannot read ref '{reference}' in '{repositoryPath}'");
         }
 
-        var exists = false;
         string? objectId = null;
         foreach (var rawLine in result.StdOut.Split('\n'))
         {
             var line = rawLine.TrimEnd('\r');
-            var separator = line.IndexOf(' ');
-            if (separator <= 0 || !string.Equals(line[..separator], reference, StringComparison.Ordinal))
+            if (!line.StartsWith(reference + " ", StringComparison.Ordinal))
             {
                 continue;
             }
 
-            exists = true;
-            var candidate = line[(separator + 1)..].Trim();
+            // Fixed-width parse: the remainder is exactly one raw object ID.
+            var candidate = line[(reference.Length + 1)..];
             if (ObjectIdPattern.IsMatch(candidate))
             {
                 objectId = candidate;
             }
 
+            exists = true;
             break;
         }
 
@@ -805,7 +821,7 @@ public static class TaskPlanner
             return (true, null);
         }
 
-        var verify = RunGit(repositoryPath, "rev-parse", "--verify", "--quiet", $"{objectId}^{{commit}}");
+        var verify = RunGit(repositoryPath, "--no-replace-objects", "rev-parse", "--verify", "--quiet", $"{objectId}^{{commit}}");
         if (verify.ExitCode != 0)
         {
             return (true, null);
@@ -887,8 +903,6 @@ public static class TaskPlanner
 
     private static readonly Dictionary<string, bool> NoLazyFetchSupportByPath = new(StringComparer.Ordinal);
 
-    private static readonly Dictionary<string, bool> PartialCloneByRepository = new(StringComparer.Ordinal);
-
     private static readonly object GitCapabilityLock = new();
 
     private static (int ExitCode, string StdOut, string StdErr) RunGit(string repositoryPath, params string[] arguments)
@@ -940,16 +954,10 @@ public static class TaskPlanner
 
     private static bool IsPartialClone(string repositoryPath)
     {
-        lock (GitCapabilityLock)
-        {
-            if (PartialCloneByRepository.TryGetValue(repositoryPath, out var cached))
-            {
-                return cached;
-            }
-        }
-
-        // extensions.partialClone marks a filtered clone; remote.<name>.promisor=true
-        // marks a promisor remote. Either can make an object read fetch.
+        // Never cached: extensions.partialClone and remote.<name>.promisor are
+        // mutable repository config, and the initial plan and the locked
+        // re-plan must both see a promisor remote added in between. Old Git is
+        // only safe while the repository is a full clone.
         var partial = false;
         var extensions = RunGitProcess(repositoryPath, false, "config", "--get", "extensions.partialClone");
         if (extensions.ExitCode == 0 && !string.IsNullOrWhiteSpace(extensions.StdOut))
@@ -982,11 +990,6 @@ public static class TaskPlanner
                     }
                 }
             }
-        }
-
-        lock (GitCapabilityLock)
-        {
-            PartialCloneByRepository[repositoryPath] = partial;
         }
 
         return partial;
