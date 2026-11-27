@@ -351,4 +351,18 @@ exit "$status"
         { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unexpected-task-entry*'
         Test-Path -LiteralPath (Join-Path $script:taskPath 'agents.md') | Should -BeTrue
     }
+
+    It 'blocks teardown while an incomplete worktree creation marker exists' {
+        $markerPath = Join-Path $script:taskPath 'worktrees/.ai-task-scaffold-incomplete.api'
+        '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'incomplete-worktree-creation'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*incomplete-worktree-creation*'
+        Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
+        Test-Path -LiteralPath $markerPath | Should -BeTrue
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+    }
 }

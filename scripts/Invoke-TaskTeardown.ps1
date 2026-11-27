@@ -152,11 +152,19 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
             }
             else {
             $worktreesPath = Join-Path $taskPath 'worktrees'
+            $markerProblem = $false
             if (Test-Path -LiteralPath $worktreesPath -PathType Container) {
                 $entries = @(Get-ChildItem -LiteralPath $worktreesPath -Force)
                 $entryNames = @($entries | ForEach-Object { $_.Name })
                 $registeredNames = @($manifest.repositories | ForEach-Object { [string]$_.name })
-                foreach ($missingName in @($registeredNames | Where-Object { $_ -cnotin $entryNames })) {
+                # A marker already reports its repository as incomplete; a
+                # second missing-worktree reason would hide that diagnostic.
+                $markedNames = @($entries |
+                    Where-Object { -not $_.PSIsContainer } |
+                    ForEach-Object { Get-TaskWorktreeMarkerRepository -Name $_.Name } |
+                    Where-Object { $_ })
+                $markerProblem = $markedNames.Count -gt 0
+                foreach ($missingName in @($registeredNames | Where-Object { $_ -cnotin $entryNames -and $_ -cnotin $markedNames })) {
                     $operations += [ordered]@{
                         Repository = $missingName
                         RepositoryPath = $null
@@ -169,11 +177,16 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                     }
                 }
                 foreach ($entry in $entries) {
+                    # A creation marker means apply started but did not finish.
+                    # It is a task-level blocker, not a worktree operation: the
+                    # destination must be recovered before any removal.
+                    if (-not $entry.PSIsContainer -and (Get-TaskWorktreeMarkerRepository -Name $entry.Name)) { continue }
                     $action = 'blocked'
                     $reason = 'unexpected-worktree-entry'
                     $actualCommonDir = $null
                     $actualGitDir = $null
                     $actualBranch = $null
+                    $registration = @()
                     if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                         $reason = 'symlink-worktree-entry'
                     }
@@ -240,7 +253,10 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                     }
                 }
             }
-            if ($operations | Where-Object Action -eq 'blocked') {
+            if ($markerProblem) {
+                $taskReason = 'incomplete-worktree-creation'
+            }
+            elseif ($operations | Where-Object Action -eq 'blocked') {
                 $taskReason = 'blocked-worktree'
             }
             else {

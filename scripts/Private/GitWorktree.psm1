@@ -67,6 +67,103 @@ function Get-TaskWorktreeDestination {
     return [IO.Path]::GetFullPath((Join-Path $TasksRoot (Join-Path (Join-Path $TaskKey 'worktrees') $RepositoryName)))
 }
 
+# A creation marker records that worktree creation for one destination started
+# but has not completed. It lives next to the destination inside the scaffold
+# owned worktrees container, so no caller task file can ever collide with it.
+$script:TaskWorktreeMarkerPrefix = '.ai-task-scaffold-incomplete.'
+
+function Get-TaskWorktreeCreationMarkerPath {
+    param([string]$TasksRoot, [string]$TaskKey, [string]$RepositoryName)
+
+    $destination = Get-TaskWorktreeDestination -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $RepositoryName
+    return Join-Path (Split-Path -Parent $destination) "$($script:TaskWorktreeMarkerPrefix)$RepositoryName"
+}
+
+function New-TaskWorktreeCreationMarker {
+    param([string]$Path, [psobject]$Plan, [string]$Branch)
+
+    $sourceCommit = if ($Plan.PSObject.Properties['SourceCommit']) { $Plan.SourceCommit } else { $null }
+    $material = [ordered]@{
+        markerVersion = 1
+        repository = $Plan.Repository
+        branch = $Branch
+        action = $Plan.Action
+        source = $Plan.Source
+        sourceCommit = $sourceCommit
+        destination = $Plan.Destination
+        startedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($material | ConvertTo-Json -Compress))
+    # Exclusive create: an existing marker means another attempt owns this
+    # destination, so it must never be overwritten.
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+}
+
+function Get-TaskWorktreeMarkerRepository {
+    param([string]$Name)
+
+    if ($Name -notmatch '^\.ai-task-scaffold-incomplete\.(?<repository>[A-Za-z0-9][A-Za-z0-9._-]*)$') { return $null }
+    return $Matches['repository']
+}
+
+function Clear-TaskWorktreeCreationMarkerIfNoWorktree {
+    param([string]$Path, [string]$Destination)
+
+    # A failure before git started, or a git failure that left no worktree at
+    # the destination, is provably not an incomplete creation. Keeping the
+    # marker there would strand a perfectly normal retry.
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-TaskRemoteTrackingBranchName {
+    param([string]$Reference)
+
+    # refs/remotes/<remote>/<name> -> <name>. Any other start point (a local
+    # branch or a bare commit) never auto-tracks a new branch.
+    if ($Reference -notmatch '^refs/remotes/[^/]+/(?<name>.+)$') { return $null }
+    return $Matches['name']
+}
+
+function Get-TaskBranchAutoSetupMerge {
+    param([string]$RepositoryPath)
+
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--get', 'branch.autoSetupMerge')
+    if ($result.ExitCode -eq 1) { return 'true' }
+    if ($result.ExitCode -ne 0) {
+        throw "cannot read branch.autoSetupMerge for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
+    }
+    $value = ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return 'true' }
+    return $value.ToLowerInvariant()
+}
+
+function Get-TaskNewBranchUpstreamRef {
+    param([string]$RepositoryPath, [string]$Branch, [string]$StartRef)
+
+    # Native `git worktree add -b <branch> <dest> <start>` sets an upstream only
+    # when the start point is a remote-tracking branch. Applying that decision
+    # here keeps branch.autoSetupMerge semantics after the start is pinned to a
+    # commit.
+    $remoteBranch = Get-TaskRemoteTrackingBranchName -Reference $StartRef
+    if (-not $remoteBranch) { return $null }
+
+    $mode = Get-TaskBranchAutoSetupMerge -RepositoryPath $RepositoryPath
+    if ($mode -in @('true', '1', 'yes', 'on', 'always')) { return $StartRef }
+    if ($mode -in @('false', '0', 'no', 'off')) { return $null }
+    if ($mode -ceq 'simple') {
+        # `simple` tracks only when the new branch name matches the tracked
+        # remote branch name (origin/feature/x -> feature/x).
+        return $(if ($remoteBranch -ceq $Branch) { $StartRef } else { $null })
+    }
+
+    # git itself rejects an unknown value for every command, so planning must
+    # fail rather than silently pick a default.
+    throw "unsupported branch.autoSetupMerge value '$mode' for '$RepositoryPath'"
+}
+
 function Enter-TaskMutationLock {
     param([string]$TasksRoot)
 
@@ -122,6 +219,13 @@ function New-TaskWorktreePlan {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
     }
+    # A marker outlives an interrupted or failed creation. It must win over the
+    # destination check: a partially created worktree can look like a healthy
+    # one, and reusing it would silently accept a half-applied plan.
+    $markerPath = Get-TaskWorktreeCreationMarkerPath -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $Repository.Name
+    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
+        return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'incomplete-worktree-creation'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+    }
     if (Test-Path -LiteralPath $destination) {
         if (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $destination -Branch $Repository.Branch -ExpectedCommonDir $repositoryCommonDir) {
             $reuseCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference "refs/heads/$($Repository.Branch)"
@@ -175,9 +279,14 @@ function New-TaskWorktreePlan {
     }
 
     $remoteBase = if ($Repository.BaseBranch -match '^[^/]+/.+') { $Repository.BaseBranch } else { "origin/$($Repository.BaseBranch)" }
-    $remoteBaseCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference "refs/remotes/$remoteBase"
+    $remoteBaseRef = "refs/remotes/$remoteBase"
+    $remoteBaseCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $remoteBaseRef
     if ($remoteBaseCommit) {
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        # Starting a new branch from a remote-tracking base normally auto-tracks
+        # it. That upstream decision is resolved from branch.autoSetupMerge and
+        # bound into the identity, because apply starts from a bare commit.
+        $upstreamRef = Get-TaskNewBranchUpstreamRef -RepositoryPath $Repository.Path -Branch $Repository.Branch -StartRef $remoteBaseRef
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseCommit; UpstreamRef = $upstreamRef; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -294,8 +403,27 @@ function Invoke-TaskWorktreePlan {
         else { throw "unsupported worktree action '$($Plan.Action)'" }
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $Plan.Destination) -Force | Out-Null
-    $process = Start-TaskWorktreeGitProcess -RepositoryPath $Repository.Path -Arguments $gitArguments -State $State -Gate $Gate
-    if ($null -eq $process) { return $false }
+    $markerPath = Get-TaskWorktreeCreationMarkerPath -TasksRoot $Plan.TasksRoot -TaskKey $Plan.TaskKey -RepositoryName $Repository.Name
+    try {
+        # Durable and exclusive before any Git side effect: an interruption at
+        # any later point leaves a marker that blocks a blind retry.
+        New-TaskWorktreeCreationMarker -Path $markerPath -Plan $Plan -Branch $Repository.Branch
+    }
+    catch {
+        throw "worktree creation for '$($Repository.Name)' is incomplete at '$($Plan.Destination)'; inspect it and remove '$markerPath' only after recovery: $($_.Exception.Message)"
+    }
+
+    try {
+        $process = Start-TaskWorktreeGitProcess -RepositoryPath $Repository.Path -Arguments $gitArguments -State $State -Gate $Gate
+    }
+    catch {
+        Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
+        throw
+    }
+    if ($null -eq $process) {
+        Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
+        return $false
+    }
     # Native stderr becomes a terminating error inside a parallel runspace, so
     # capture it here and report it with the failure instead of writing it out.
     try {
@@ -305,6 +433,7 @@ function Invoke-TaskWorktreePlan {
         $process.WaitForExit()
         $gitText = $standardError.GetAwaiter().GetResult() + $standardOutput.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
             $detail = Get-TaskGitDiagnostic -Text $gitText
             if ($detail) { throw "git worktree add failed for '$($Repository.Name)': $detail" }
             throw "git worktree add failed for '$($Repository.Name)'"
@@ -317,6 +446,7 @@ function Invoke-TaskWorktreePlan {
     if ($sourceCommit) {
         $headResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('rev-parse', 'HEAD^{commit}') -NoLazyFetch
         if ($headResult.ExitCode -ne 0) {
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
             $detail = Get-TaskGitDiagnostic -Text $headResult.Text
             if ($detail) { throw "cannot verify the new worktree HEAD for '$($Repository.Name)': $detail" }
             throw "cannot verify the new worktree HEAD for '$($Repository.Name)'"
@@ -327,18 +457,25 @@ function Invoke-TaskWorktreePlan {
         }
     }
 
-    if ($Plan.Action -eq 'create-remote') {
-        # Keep the upstream on the full, unambiguous remote ref even though the
-        # branch itself starts at the bound commit.
-        $upstreamRef = "refs/remotes/origin/$($Repository.Branch)"
+    # A tracking plan always keeps its upstream on the full, unambiguous remote
+    # ref. A new branch from a remote-tracking base carries the decision git
+    # itself would have made from branch.autoSetupMerge, resolved at plan time
+    # and bound into the identity.
+    $upstreamRef =
+        if ($Plan.Action -eq 'create-remote') { "refs/remotes/origin/$($Repository.Branch)" }
+        elseif ($Plan.PSObject.Properties['UpstreamRef'] -and $Plan.UpstreamRef) { [string]$Plan.UpstreamRef }
+        else { $null }
+    if ($upstreamRef) {
         $upstreamResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('branch', "--set-upstream-to=$upstreamRef", $Repository.Branch)
         if ($upstreamResult.ExitCode -ne 0) {
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
             $detail = Get-TaskGitDiagnostic -Text $upstreamResult.Text
             if ($detail) { throw "git branch --set-upstream-to failed for '$($Repository.Name)': $detail" }
             throw "git branch --set-upstream-to failed for '$($Repository.Name)'"
         }
         $upstreamReadBack = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('for-each-ref', '--format=%(upstream)', "refs/heads/$($Repository.Branch)")
         if ($upstreamReadBack.ExitCode -ne 0) {
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
             $detail = Get-TaskGitDiagnostic -Text $upstreamReadBack.Text
             if ($detail) { throw "cannot verify the upstream for '$($Repository.Name)': $detail" }
             throw "cannot verify the upstream for '$($Repository.Name)'"
@@ -348,6 +485,9 @@ function Invoke-TaskWorktreePlan {
             throw "created branch for '$($Repository.Name)' tracks '$actualUpstream' instead of '$upstreamRef'"
         }
     }
+
+    # Every required check passed; the destination is complete.
+    Remove-Item -LiteralPath $markerPath -Force
     return $true
 }
 
@@ -447,4 +587,4 @@ function Invoke-TaskWorktreePlanBatch {
     return ,@($parallelResults | Sort-Object Index)
 }
 
-Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommitWithoutLazyFetch, Invoke-TaskWorktreeGitCommand, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Start-TaskWorktreeGitProcess, Set-TaskWorktreeFailure
+Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommitWithoutLazyFetch, Invoke-TaskWorktreeGitCommand, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Start-TaskWorktreeGitProcess, Set-TaskWorktreeFailure, Get-TaskWorktreeMarkerRepository

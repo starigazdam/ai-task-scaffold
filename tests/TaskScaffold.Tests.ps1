@@ -1613,3 +1613,129 @@ Describe 'ConvertTo-TaskRequest task files' {
         { ConvertTo-TaskRequest -Path $path } | Should -Throw '*duplicate task file path*'
     }
 }
+
+Describe 'Invoke-TaskScaffold worktree creation recovery' {
+    BeforeAll {
+        function New-ScaffoldCaseRoot {
+            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $root -Force | Out-Null
+            return $root
+        }
+
+        function New-ScaffoldRemoteBaseFixture {
+            param([string]$Root)
+
+            $repositoryPath = Join-Path $Root 'repo'
+            $remotePath = Join-Path $Root 'remote.git'
+            $seedPath = Join-Path $Root 'seed'
+            & git init --bare $remotePath | Out-Null
+            New-Item -ItemType Directory -Path $seedPath | Out-Null
+            & git -C $seedPath init -b main | Out-Null
+            & git -C $seedPath config user.name Test
+            & git -C $seedPath config user.email test@example.invalid
+            Set-Content -LiteralPath (Join-Path $seedPath 'README.md') -Value 'first'
+            & git -C $seedPath add README.md
+            & git -C $seedPath commit -m first | Out-Null
+            & git -C $seedPath remote add origin $remotePath
+            & git -C $seedPath push origin 'main:refs/heads/main' | Out-Null
+            & git -C $remotePath symbolic-ref HEAD refs/heads/main
+            & git clone -q $remotePath $repositoryPath | Out-Null
+            & git -C $repositoryPath config user.name Test
+            & git -C $repositoryPath config user.email test@example.invalid
+            $reviewed = (& git -C $seedPath rev-parse HEAD).Trim()
+            & git -C $repositoryPath checkout --detach | Out-Null
+            & git -C $repositoryPath branch -D main | Out-Null
+            & git -C $repositoryPath fetch origin | Out-Null
+
+            return [pscustomobject]@{ Path = $repositoryPath; Reviewed = $reviewed }
+        }
+
+        function Write-ScaffoldRecoveryRequest {
+            param([string]$Path, [string]$RepositoryPath)
+
+            [ordered]@{
+                schemaVersion = 1
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Recovery' }
+                repositories = @([ordered]@{
+                    name = 'api'
+                    path = $RepositoryPath
+                    baseBranch = 'main'
+                    branch = 'feature/FEATURE-123'
+                })
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -NoNewline
+        }
+    }
+
+    It 'refuses a fresh review and apply of an incomplete worktree creation' {
+        $root = New-ScaffoldCaseRoot
+        $repositoryPath = Join-Path $root 'api'
+        New-Item -ItemType Directory -Path $repositoryPath -Force | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+
+        $requestPath = Join-Path $root 'request.json'
+        Write-ScaffoldRecoveryRequest -Path $requestPath -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $root 'tasks'
+        $worktreesPath = Join-Path $tasksRoot 'FEATURE-123/worktrees'
+        New-Item -ItemType Directory -Path $worktreesPath -Force | Out-Null
+        $markerPath = Join-Path $worktreesPath '.ai-task-scaffold-incomplete.api'
+        '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+        $plan.WorktreeOperations[0].Action | Should -Be 'blocked'
+        $plan.WorktreeOperations[0].Reason | Should -Be 'incomplete-worktree-creation'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } |
+            Should -Throw '*incomplete-worktree-creation*'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/task.json') | Should -BeFalse
+        Test-Path -LiteralPath $markerPath | Should -BeTrue
+    }
+
+    It 'applies a remote-base branch with native tracking and the unchanged public shape' {
+        $root = New-ScaffoldCaseRoot
+        $fixture = New-ScaffoldRemoteBaseFixture -Root $root
+        $requestPath = Join-Path $root 'request.json'
+        Write-ScaffoldRecoveryRequest -Path $requestPath -RepositoryPath $fixture.Path
+        $tasksRoot = Join-Path $root 'tasks'
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+        $plan.WorktreeOperations[0].Action | Should -Be 'create-local'
+        $plan.WorktreeOperations[0].Source | Should -Be 'origin/main'
+        $plan.WorktreeOperations[0].PSObject.Properties.Name | Should -Not -Contain 'SourceCommit'
+        $plan.WorktreeOperations[0].PSObject.Properties.Name | Should -Not -Contain 'UpstreamRef'
+
+        & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity | Out-Null
+
+        $destination = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
+        (& git -C $destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
+        (& git -C $destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -Be 'refs/remotes/origin/main'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/.ai-task-scaffold-incomplete.api') | Should -BeFalse
+
+        $reuse = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $reuse.WorktreeOperations[0].Action | Should -Be 'reuse'
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $reuse.PlanIdentity } | Should -Not -Throw
+    }
+
+    It 'invalidates a reviewed plan when branch.autoSetupMerge changes' {
+        $root = New-ScaffoldCaseRoot
+        $fixture = New-ScaffoldRemoteBaseFixture -Root $root
+        $requestPath = Join-Path $root 'request.json'
+        Write-ScaffoldRecoveryRequest -Path $requestPath -RepositoryPath $fixture.Path
+        $tasksRoot = Join-Path $root 'tasks'
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        & git -C $fixture.Path config branch.autoSetupMerge false
+
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } |
+            Should -Throw '*plan identity changed since review*'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123') | Should -BeFalse
+    }
+}
