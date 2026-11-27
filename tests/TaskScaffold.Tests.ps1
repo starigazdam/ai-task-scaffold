@@ -247,9 +247,20 @@ $plan.WorktreeOperations[0].Action
         & git -C $repositoryPath commit -am moved | Out-Null
         & git -C $repositoryPath push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
         & git -C $repositoryPath fetch origin | Out-Null
+        $moved = (& git -C $repositoryPath rev-parse 'refs/remotes/origin/feature/FEATURE-123').Trim()
 
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*plan identity changed*'
         Test-Path -LiteralPath $plan.WorktreeOperations[0].Destination | Should -BeFalse
+
+        # A fresh plan is a new decision. Through the public API it binds the
+        # moved tip and applies, so the reviewed plan is the only one rejected.
+        $fresh = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $fresh.WorktreeOperations[0].Action | Should -Be 'create-remote'
+        $fresh.PlanIdentity | Should -Not -Be $plan.PlanIdentity
+        & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $fresh.PlanIdentity | Out-Null
+        (& git -C $fresh.WorktreeOperations[0].Destination rev-parse HEAD).Trim() | Should -Be $moved
+        (& git -C $fresh.WorktreeOperations[0].Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() |
+            Should -Be 'refs/remotes/origin/feature/FEATURE-123'
     }
 
     It 'changes the plan identity when a symbolic remote task ref is retargeted at an equal commit' {
@@ -290,6 +301,46 @@ $plan.WorktreeOperations[0].Action
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $before.PlanIdentity } |
             Should -Throw '*plan identity changed*'
         Test-Path -LiteralPath $before.WorktreeOperations[0].Destination | Should -BeFalse
+    }
+
+    It 'changes the plan identity when a symbolic base is retargeted and no upstream is written' {
+        $repositoryPath = Join-Path $TestDrive 'api-symbolic-base-retarget'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $remotePath = Join-Path $TestDrive 'api-symbolic-base-retarget.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $repositoryPath remote add origin $remotePath
+        & git -C $repositoryPath push origin 'main:refs/heads/main' 'main:refs/heads/release' | Out-Null
+        & git -C $repositoryPath fetch origin | Out-Null
+        & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/base' 'refs/remotes/origin/main'
+        # Implicit base tracking is off, so this plan writes no upstream at all.
+        & git -C $repositoryPath config branch.autoSetupMerge false
+
+        $requestPath = Join-Path $TestDrive 'symbolic-base-retarget.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'origin/base'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $tasksRoot = Join-Path $TestDrive 'symbolic-base-retarget-tasks'
+
+        $before = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $before.WorktreeOperations[0].Action | Should -Be 'create-local'
+        @($before.WorktreeOperations[0].PSObject.Properties.Name | Sort-Object) |
+            Should -Be @('Action', 'BranchMode', 'Destination', 'Repository', 'Source', 'TaskKey', 'TasksRoot' | Sort-Object) -Because 'the source target stays internal'
+
+        # The selected base is symbolic; both targets share a commit. No upstream
+        # will be written, so only the bound canonical source target can change.
+        & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/base' 'refs/remotes/origin/release'
+        (& git -C $repositoryPath rev-parse 'refs/remotes/origin/main').Trim() | Should -Be $head
+        (& git -C $repositoryPath rev-parse 'refs/remotes/origin/release').Trim() | Should -Be $head
+        $after = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $after.WorktreeOperations[0].Action | Should -Be 'create-local'
+        $after.PlanIdentity | Should -Not -Be $before.PlanIdentity
+
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $before.PlanIdentity } |
+            Should -Throw '*plan identity changed*'
     }
 
     It 'rejects apply without a reviewed plan identity before creating task state' {

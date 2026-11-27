@@ -459,6 +459,37 @@ Describe 'dotnet task plan' {
             $result.plan.worktreeOperations[0].branchMode | Should -Be 'track'
         }
 
+        It 'changes the identity when a symbolic remote task ref is retargeted at an equal commit' {
+            $repositoryPath = New-TestRepository -Name 'api-symbolic-retarget'
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $remotePath = Join-Path $TestDrive 'api-symbolic-retarget.git'
+            & git init --bare $remotePath | Out-Null
+            & git -C $repositoryPath remote add origin $remotePath
+            & git -C $repositoryPath push origin 'main:refs/heads/main' 'main:refs/heads/release' | Out-Null
+            & git -C $repositoryPath fetch origin | Out-Null
+            & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/feature/FEATURE-123' 'refs/remotes/origin/main'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-symbolic-retarget.json') -Request $request
+            $tasksRoot = Join-Path $TestDrive 'tasks-symbolic-retarget'
+
+            $before = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'symbolic remote task ref plan'
+            $before.plan.worktreeOperations[0].action | Should -Be 'create-remote'
+            # The canonical source target stays internal, so the public shape is
+            # unchanged.
+            Assert-PropertySet -Object $before.plan.worktreeOperations[0] -Expected @('repository', 'action', 'source', 'branchMode', 'destination', 'reason') -Case 'the tracking worktree operation'
+
+            # Both targets point at the same commit, so only the canonical source
+            # target changes. The plan identity must still change.
+            & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/feature/FEATURE-123' 'refs/remotes/origin/release'
+            (& git -C $repositoryPath rev-parse 'refs/remotes/origin/main').Trim() | Should -Be $head
+            (& git -C $repositoryPath rev-parse 'refs/remotes/origin/release').Trim() | Should -Be $head
+            $after = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'retargeted symbolic remote task ref plan'
+
+            $after.plan.worktreeOperations[0].action | Should -Be 'create-remote'
+            $after.planIdentity | Should -Not -Be $before.planIdentity
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+
         It 'keeps a reuse plan at one start commit distinct from the same plan at another' {
             $repositoryPath = New-TestRepository -Name 'api-start-commit-identity'
             $older = (& git -C $repositoryPath rev-parse HEAD).Trim()

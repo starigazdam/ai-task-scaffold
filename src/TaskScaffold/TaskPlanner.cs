@@ -151,6 +151,8 @@ public sealed class CanonicalOperation
 
     public string? SourceCommit { get; init; }
 
+    public string? SourceTarget { get; init; }
+
     public string? DestinationIdentity { get; init; }
 }
 
@@ -506,6 +508,7 @@ public static class TaskPlanner
                     Head = head,
                     SourceRef = reuseRef,
                     SourceCommit = reuseTip.Commit,
+                    SourceTarget = ResolveRefTarget(repository.Path, reuseRef),
                     DestinationIdentity = GetGitDir(destination),
                 };
             }
@@ -537,7 +540,7 @@ public static class TaskPlanner
                 }
 
                 // Bind the SHA that was just validated.
-                return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, startCommit, commonDir, head);
+                return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, startCommit, ResolveRefTarget(repository.Path, requestedLocal), commonDir, head);
             }
 
             var remoteTip = ReadRefTip(repository.Path, requestedRemote);
@@ -563,10 +566,11 @@ public static class TaskPlanner
                     Head = head,
                     SourceRef = requestedRemote,
                     SourceCommit = startCommit,
+                    SourceTarget = ResolveRefTarget(repository.Path, requestedRemote),
                 };
             }
 
-            return CreateLocal(repository, destination, startCommit, "new", startCommit, startCommit, commonDir, head);
+            return CreateLocal(repository, destination, startCommit, "new", startCommit, startCommit, null, commonDir, head);
         }
 
         var localBranchTip = ReadRefTip(repository.Path, requestedLocal);
@@ -577,7 +581,7 @@ public static class TaskPlanner
                 return Blocked(repository, destination, "start-commit-missing", commonDir, head);
             }
 
-            return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, localBranchTip.Commit, commonDir, head);
+            return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, localBranchTip.Commit, ResolveRefTarget(repository.Path, requestedLocal), commonDir, head);
         }
 
         var remoteBranchTip = ReadRefTip(repository.Path, requestedRemote);
@@ -603,6 +607,7 @@ public static class TaskPlanner
                 Head = head,
                 SourceRef = requestedRemote,
                 SourceCommit = remoteBranchTip.Commit,
+                SourceTarget = ResolveRefTarget(repository.Path, requestedRemote),
             };
         }
 
@@ -615,7 +620,7 @@ public static class TaskPlanner
                 return Blocked(repository, destination, "base-branch-missing", commonDir, head);
             }
 
-            return CreateLocal(repository, destination, repository.BaseBranch, "new", localBase, localBaseTip.Commit, commonDir, head);
+            return CreateLocal(repository, destination, repository.BaseBranch, "new", localBase, localBaseTip.Commit, ResolveRefTarget(repository.Path, localBase), commonDir, head);
         }
 
         var remoteBase = RemoteQualifiedPattern.IsMatch(repository.BaseBranch) ? repository.BaseBranch : $"origin/{repository.BaseBranch}";
@@ -628,7 +633,7 @@ public static class TaskPlanner
                 return Blocked(repository, destination, "base-branch-missing", commonDir, head);
             }
 
-            return CreateLocal(repository, destination, remoteBase, "new", remoteBaseRef, remoteBaseTip.Commit, commonDir, head);
+            return CreateLocal(repository, destination, remoteBase, "new", remoteBaseRef, remoteBaseTip.Commit, ResolveRefTarget(repository.Path, remoteBaseRef), commonDir, head);
         }
 
         return new PlannedOperation
@@ -645,7 +650,7 @@ public static class TaskPlanner
         };
     }
 
-    private static PlannedOperation CreateLocal(NormalizedRepository repository, string destination, string source, string branchMode, string sourceRef, string sourceCommit, string commonDir, string head)
+    private static PlannedOperation CreateLocal(NormalizedRepository repository, string destination, string source, string branchMode, string sourceRef, string sourceCommit, string? sourceTarget, string commonDir, string head)
     {
         return new PlannedOperation
         {
@@ -662,6 +667,7 @@ public static class TaskPlanner
             Head = head,
             SourceRef = sourceRef,
             SourceCommit = sourceCommit,
+            SourceTarget = sourceTarget,
         };
     }
 
@@ -716,6 +722,7 @@ public static class TaskPlanner
                 Head = p.Head,
                 SourceRef = p.SourceRef,
                 SourceCommit = p.SourceCommit,
+                SourceTarget = p.SourceTarget,
                 DestinationIdentity = p.DestinationIdentity,
             }).ToList(),
             TaskExists = state.TaskExists,
@@ -805,6 +812,33 @@ public static class TaskPlanner
         // to a local one, which would validate an object that is not here.
         var result = RunGit(repositoryPath, "--no-replace-objects", "rev-parse", "--verify", "--quiet", $"{reference}^{{commit}}");
         return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
+    }
+
+    private static string? ResolveRefTarget(string repositoryPath, string reference)
+    {
+        // The canonical target of a symbolic ref, or the ref itself when it is
+        // not symbolic. Bound into the identity so retargeting a symref at an
+        // equal commit still changes the reviewed plan, whether or not a
+        // separate upstream will be written.
+        var current = reference;
+        for (var depth = 0; depth < 8; depth++)
+        {
+            var result = RunGit(repositoryPath, "symbolic-ref", "-q", current);
+            if (result.ExitCode != 0)
+            {
+                break;
+            }
+
+            var target = FirstLine(result.StdOut);
+            if (!target.StartsWith("refs/", StringComparison.Ordinal) || string.Equals(target, current, StringComparison.Ordinal))
+            {
+                break;
+            }
+
+            current = target;
+        }
+
+        return current;
     }
 
     private static (bool Exists, string? Commit) ReadRefTip(string repositoryPath, string reference)
@@ -1086,6 +1120,8 @@ public static class TaskPlanner
         public string? SourceRef { get; init; }
 
         public string? SourceCommit { get; init; }
+
+        public string? SourceTarget { get; init; }
 
         public string? DestinationIdentity { get; init; }
     }

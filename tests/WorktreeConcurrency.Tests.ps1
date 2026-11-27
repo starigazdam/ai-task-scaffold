@@ -377,12 +377,11 @@ Describe 'Worktree start gate' {
         $plan.Action | Should -Be 'create-remote'
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
-        # The reuse plan requires the upstream the create established. Removing it
-        # leaves exactly the repair a reuse would previously have performed.
+        # The reuse plan binds the branch's actual upstream, which is now absent.
         & git -C $plan.Destination branch --unset-upstream
         $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
         $reuse.Action | Should -Be 'reuse'
-        $reuse.UpstreamRef | Should -Be 'refs/remotes/origin/feature/CONCURRENCY-9'
+        $reuse.UpstreamRef | Should -BeNullOrEmpty
 
         $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1 })
         $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
