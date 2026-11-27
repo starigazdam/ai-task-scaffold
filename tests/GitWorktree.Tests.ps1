@@ -628,7 +628,7 @@ Describe 'Invoke-TaskWorktreePlan tracking start' {
         $moved = (& git -C $repositoryPath rev-parse HEAD).Trim()
         & git -C $repositoryPath branch -f feature/FEATURE-123 $moved | Out-Null
 
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*is not the reviewed commit*'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*is not the planned commit*'
     }
 
     It 'accepts a checked-out task branch that is itself a symbolic alias' {
@@ -755,7 +755,7 @@ Describe 'Worktree reuse verification and repair' {
         (& git -C $retry.Destination rev-parse "$($fixture.Branch)@{upstream}").Trim() | Should -Be $fixture.Head
     }
 
-    It 'repairs a missing upstream on reuse' {
+    It 'refuses reuse when a required upstream is missing and never writes it' {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'reuse-upstream-missing') -RemotePath (Join-Path $TestDrive 'reuse-upstream-missing.git')
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
         $tasksRoot = Join-Path $TestDrive 'reuse-upstream-missing-tasks'
@@ -769,12 +769,14 @@ Describe 'Worktree reuse verification and repair' {
         $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $reuse.Action | Should -Be 'reuse'
         $reuse.UpstreamRef | Should -Be "refs/remotes/origin/$($fixture.Branch)"
-        Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse
 
-        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        # Reuse verifies the planned upstream and refuses a missing one; it never
+        # writes an upstream, so the branch is left exactly as it was.
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Throw '*missing its required upstream*reuse never writes an upstream*'
+        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -BeNullOrEmpty
     }
 
-    It 'repairs a wrong upstream on reuse' {
+    It 'leaves a nonempty upstream alone on reuse and refuses a plan-time change' {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'reuse-upstream-wrong') -RemotePath (Join-Path $TestDrive 'reuse-upstream-wrong.git')
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
         $tasksRoot = Join-Path $TestDrive 'reuse-upstream-wrong-tasks'
@@ -786,11 +788,21 @@ Describe 'Worktree reuse verification and repair' {
         & git -C $plan.Destination branch --set-upstream-to=refs/remotes/origin/other-branch $fixture.Branch | Out-Null
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/other-branch'
 
+        # A nonempty upstream is the branch's decision: the plan binds it and
+        # apply leaves it alone instead of retargeting it to the task remote ref.
         $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $reuse.Action | Should -Be 'reuse'
-        Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse
+        $reuse.UpstreamRef | Should -Be 'refs/remotes/origin/other-branch'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Not -Throw
+        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/other-branch'
 
-        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        # When the live upstream changes after review, the plan-bound value wins
+        # and apply refuses rather than retargeting the nonempty upstream.
+        $reviewed = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        & git -C $reviewed.Destination branch --set-upstream-to=refs/remotes/origin/main $fixture.Branch | Out-Null
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reviewed } |
+            Should -Throw "*instead of the planned 'refs/remotes/origin/other-branch'*"
+        (& git -C $reviewed.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
     }
 
     It 'blocks reuse when the branch tip cannot be read locally' {
@@ -858,7 +870,7 @@ Describe 'Worktree reuse verification and repair' {
         & chmod +x $hookPath
 
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } |
-            Should -Throw "*is on 'refs/heads/feature/ALIAS' instead of 'refs/heads/feature/REAL'*"
+            Should -Throw "*/feature/ALIAS' instead of the planned*/feature/REAL*"
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
     }
 
@@ -914,7 +926,7 @@ Describe 'Worktree reuse verification and repair' {
 
         $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $reuse.Action | Should -Be 'reuse'
-        $reuse.UpstreamRef | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        $reuse.UpstreamRef | Should -Be 'refs/remotes/origin/main' -Because 'the plan binds the canonical target, not the alias spelling'
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Not -Throw
     }
 
@@ -944,7 +956,7 @@ Describe 'Worktree reuse verification and repair' {
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
     }
 
-    It 'refuses an existing branch that moved after planning without deleting it' {
+    It 'refuses a reviewed plan whose task branch moved and binds a fresh plan to the new tip' {
         $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-existing-moved')
         & git -C $fixture.Path branch feature/FEATURE-123 | Out-Null
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
@@ -958,14 +970,18 @@ Describe 'Worktree reuse verification and repair' {
         $moved = (& git -C $fixture.Path rev-parse HEAD).Trim()
         & git -C $fixture.Path branch -f feature/FEATURE-123 $moved | Out-Null
 
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*is not the reviewed commit*'
+        # The attach moved the destination to B and failed verification. The
+        # reviewed plan bound A, so it keeps refusing B instead of accepting the
+        # failed attach as proof of success.
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*is not the planned commit*replan and approve again*'
         (& git -C $fixture.Path rev-parse 'refs/heads/feature/FEATURE-123').Trim() | Should -Be $moved -Because 'the user branch must not be reset or deleted'
         Test-Path -LiteralPath $plan.Destination | Should -BeTrue
 
-        # The new state is consistent, so a fresh plan rebinds and reuses it.
+        # A fresh plan is a new decision: it binds the new tip explicitly.
         $replanned = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $replanned.Action | Should -Be 'reuse'
         $replanned.SourceCommit | Should -Be $moved
+        $replanned.HeadRef | Should -Be 'refs/heads/feature/FEATURE-123'
     }
 
     It 'keeps the worktree when the tracking upstream disappears and retries as reuse' {
@@ -1041,6 +1057,13 @@ Describe 'branch.autoSetupMerge upstream preservation' {
             $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $root -Force | Out-Null
             return $root
+        }
+
+        function Set-BareAutoSetupMerge {
+            param([string]$RepositoryPath)
+
+            # A bare key has no '=' line; git config --type=bool reads it as true.
+            Add-Content -LiteralPath (Join-Path $RepositoryPath '.git/config') -Value "[branch]`n`tautoSetupMerge"
         }
     }
 
@@ -1145,6 +1168,38 @@ Describe 'branch.autoSetupMerge upstream preservation' {
 
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -BeNullOrEmpty
+    }
+
+    It 'matches native git for a <Spelling> branch.autoSetupMerge spelling' -ForEach @(
+        @{ Spelling = 'bare'; NativeTracks = $true }
+        @{ Spelling = 'empty'; NativeTracks = $false }
+    ) {
+        $caseRoot = New-AutoSetupCaseRoot
+        $fixture = New-AutoSetupFixture -Root $caseRoot
+        if ($Spelling -ceq 'bare') {
+            Set-BareAutoSetupMerge -RepositoryPath $fixture.Path
+            (& git -C $fixture.Path config --type=bool --get branch.autoSetupMerge).Trim() | Should -Be 'true'
+        }
+        else {
+            & git -C $fixture.Path config branch.autoSetupMerge ''
+            (& git -C $fixture.Path config --type=bool --get branch.autoSetupMerge).Trim() | Should -Be 'false'
+        }
+
+        # Native Git is the oracle for the same remote-base request.
+        $nativeDestination = Join-Path $caseRoot 'native'
+        & git -C $fixture.Path worktree add -q -b feature/FEATURE-123 $nativeDestination refs/remotes/origin/main | Out-Null
+        $nativeUpstream = ([string](@(& git -C $nativeDestination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123') | Select-Object -First 1)).Trim()
+        & git -C $fixture.Path worktree remove $nativeDestination | Out-Null
+        & git -C $fixture.Path branch -D feature/FEATURE-123 | Out-Null
+        if ($NativeTracks) { $nativeUpstream | Should -Be 'refs/remotes/origin/main' } else { $nativeUpstream | Should -BeNullOrEmpty }
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
+        $plannedUpstream = if ($plan.PSObject.Properties['UpstreamRef'] -and $plan.UpstreamRef) { [string]$plan.UpstreamRef } else { '' }
+        $plannedUpstream | Should -Be $nativeUpstream
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -Be $nativeUpstream
     }
 
     It 'tracks a local base when branch.autoSetupMerge is always' {

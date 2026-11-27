@@ -547,11 +547,12 @@ phases:
     }
 }
 
-# The reviewed identity binds each resolved source commit and the upstream
-# decision derived from branch.autoSetupMerge internally, and apply uses them.
-# The public plan keeps its documented shape: strip those internal properties
-# from a copy so a consumer sees no new field, for dry run and apply alike.
-$internalWorktreeProperties = @('SourceCommit', 'UpstreamRef')
+# The reviewed identity binds each resolved source commit, immediate HEAD ref and
+# the upstream decision derived from branch.autoSetupMerge internally, and apply
+# uses them. The public plan keeps its documented shape: strip those internal
+# properties from a copy so a consumer sees no new field, for dry run and apply
+# alike.
+$internalWorktreeProperties = @('SourceCommit', 'HeadRef', 'UpstreamRef')
 $publicWorktreeOperations = @($plan['WorktreeOperations'] | ForEach-Object {
     $properties = [ordered]@{}
     foreach ($property in $_.PSObject.Properties) {

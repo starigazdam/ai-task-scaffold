@@ -362,6 +362,38 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
 }
 
 Describe 'Worktree start gate' {
+    It 'does not run a queued reuse after a failure is published' {
+        $case = New-ConcurrencyCaseRoot
+        $repositoryPath = Join-Path $case 'repos/reuse-gated'
+        New-ConcurrencyFixtureRepository -RepositoryPath $repositoryPath
+        $remotePath = Join-Path $case 'reuse-gated.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $repositoryPath remote add origin $remotePath
+        & git -C $repositoryPath push origin 'main:refs/heads/feature/CONCURRENCY-9' | Out-Null
+        & git -C $repositoryPath fetch origin | Out-Null
+        $repository = [pscustomobject]@{ Name = 'reuse-gated'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/CONCURRENCY-9' }
+        $tasksRoot = Join-Path $case 'tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-remote'
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        # The reuse plan requires the upstream the create established. Removing it
+        # leaves exactly the repair a reuse would previously have performed.
+        & git -C $plan.Destination branch --unset-upstream
+        $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
+        $reuse.Action | Should -Be 'reuse'
+        $reuse.UpstreamRef | Should -Be 'refs/remotes/origin/feature/CONCURRENCY-9'
+
+        $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1 })
+        $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
+        Set-TaskWorktreeFailure -State $state -Gate $gate -Index 0
+
+        $started = Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse -State $state -Gate $gate
+
+        $started | Should -BeFalse
+        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/CONCURRENCY-9').Trim() | Should -BeNullOrEmpty
+    }
+
     It 'starts no git process once a failure is published' {
         $case = New-ConcurrencyCaseRoot
         New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case 'repos/alpha')

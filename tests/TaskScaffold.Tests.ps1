@@ -252,6 +252,46 @@ $plan.WorktreeOperations[0].Action
         Test-Path -LiteralPath $plan.WorktreeOperations[0].Destination | Should -BeFalse
     }
 
+    It 'changes the plan identity when a symbolic remote task ref is retargeted at an equal commit' {
+        $repositoryPath = Join-Path $TestDrive 'api-symbolic-retarget'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $remotePath = Join-Path $TestDrive 'api-symbolic-retarget.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $repositoryPath remote add origin $remotePath
+        & git -C $repositoryPath push origin 'main:refs/heads/main' 'main:refs/heads/release' | Out-Null
+        & git -C $repositoryPath fetch origin | Out-Null
+        & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/feature/FEATURE-123' 'refs/remotes/origin/main'
+
+        $requestPath = Join-Path $TestDrive 'symbolic-retarget.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $tasksRoot = Join-Path $TestDrive 'symbolic-retarget-tasks'
+
+        $before = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $before.WorktreeOperations[0].Action | Should -Be 'create-remote'
+        $before.WorktreeOperations[0].Source | Should -Be 'origin/feature/FEATURE-123'
+        @($before.WorktreeOperations[0].PSObject.Properties.Name | Sort-Object) |
+            Should -Be @('Action', 'BranchMode', 'Destination', 'Repository', 'Source', 'TaskKey', 'TasksRoot' | Sort-Object)
+
+        # Both targets point at the same commit, so only the canonical upstream
+        # target changes. The plan identity must still change.
+        & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/feature/FEATURE-123' 'refs/remotes/origin/release'
+        (& git -C $repositoryPath rev-parse 'refs/remotes/origin/main').Trim() | Should -Be $head
+        (& git -C $repositoryPath rev-parse 'refs/remotes/origin/release').Trim() | Should -Be $head
+        $after = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $after.WorktreeOperations[0].Action | Should -Be 'create-remote'
+        $after.PlanIdentity | Should -Not -Be $before.PlanIdentity
+
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $before.PlanIdentity } |
+            Should -Throw '*plan identity changed*'
+        Test-Path -LiteralPath $before.WorktreeOperations[0].Destination | Should -BeFalse
+    }
+
     It 'rejects apply without a reviewed plan identity before creating task state' {
         $repositoryPath = Join-Path $TestDrive 'api-missing-plan-identity'
         New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
