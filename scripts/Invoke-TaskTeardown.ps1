@@ -152,20 +152,11 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
             }
             else {
             $worktreesPath = Join-Path $taskPath 'worktrees'
-            $markerProblem = $false
             if (Test-Path -LiteralPath $worktreesPath -PathType Container) {
                 $entries = @(Get-ChildItem -LiteralPath $worktreesPath -Force)
                 $entryNames = @($entries | ForEach-Object { $_.Name })
                 $registeredNames = @($manifest.repositories | ForEach-Object { [string]$_.name })
-                # A marker already reports its repository as incomplete; a
-                # second missing-worktree reason would hide that diagnostic.
-                # Marker names hash the repository name, so recognition maps
-                # each registered name back to its deterministic path.
-                $markedNames = @($registeredNames |
-                    Where-Object { Test-Path -LiteralPath (Get-TaskWorktreeCreationMarkerPath -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $_) -PathType Leaf })
-                $markerProblem = @($entries |
-                    Where-Object { -not $_.PSIsContainer -and (Test-TaskWorktreeMarkerName -Name $_.Name) }).Count -gt 0
-                foreach ($missingName in @($registeredNames | Where-Object { $_ -cnotin $entryNames -and $_ -cnotin $markedNames })) {
+                foreach ($missingName in @($registeredNames | Where-Object { $_ -cnotin $entryNames })) {
                     $operations += [ordered]@{
                         Repository = $missingName
                         RepositoryPath = $null
@@ -178,10 +169,6 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                     }
                 }
                 foreach ($entry in $entries) {
-                    # A creation marker means apply started but did not finish.
-                    # It is a task-level blocker, not a worktree operation: the
-                    # destination must be recovered before any removal.
-                    if (-not $entry.PSIsContainer -and (Test-TaskWorktreeMarkerName -Name $entry.Name)) { continue }
                     $action = 'blocked'
                     $reason = 'unexpected-worktree-entry'
                     $actualCommonDir = $null
@@ -208,11 +195,15 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                                 $expectedCommonDir = Get-GitCommonDir -RepositoryPath ([string]$registration[0].path)
                                 $actualCommonDir = Get-GitCommonDir -RepositoryPath $entry.FullName
                                 $actualGitDir = Get-GitDir -RepositoryPath $entry.FullName
-                                $actualBranch = (& git -C $entry.FullName branch --show-current 2>$null | Select-Object -First 1)
+                                # Compare HEAD's immediate target: an alias branch is
+                                # accepted only when it is the registered branch
+                                # itself, never when it merely resolves to it.
+                                $actualHeadRef = Get-TaskImmediateHeadRef -RepositoryPath $entry.FullName
+                                $actualBranch = if ($actualHeadRef -clike 'refs/heads/*') { $actualHeadRef.Substring('refs/heads/'.Length) } else { $actualHeadRef }
                                 if (-not $expectedCommonDir -or $expectedCommonDir -cne $actualCommonDir) {
                                     $reason = 'repository-mismatch'
                                 }
-                                elseif ([string]$registration[0].branch -cne [string]$actualBranch) {
+                                elseif ($actualHeadRef -cne "refs/heads/$([string]$registration[0].branch)") {
                                     $reason = 'branch-mismatch'
                                 }
                                 else {
@@ -254,10 +245,7 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                     }
                 }
             }
-            if ($markerProblem) {
-                $taskReason = 'incomplete-worktree-creation'
-            }
-            elseif ($operations | Where-Object Action -eq 'blocked') {
+            if ($operations | Where-Object Action -eq 'blocked') {
                 $taskReason = 'blocked-worktree'
             }
             else {

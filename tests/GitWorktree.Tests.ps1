@@ -526,6 +526,8 @@ Describe 'Invoke-TaskWorktreePlan tracking start' {
 
         $moved = Move-TrackingBranch -Fixture $fixture
         $moved | Should -Not -Be $fixture.Reviewed
+        (& git -C $fixture.Path rev-parse "refs/remotes/origin/$($fixture.Branch)").Trim() | Should -Be $moved -Because 'the race fixture must really move the remote ref'
+        (& git -C $fixture.Remote rev-parse "refs/heads/$($fixture.Branch)").Trim() | Should -Be $moved
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
@@ -545,6 +547,7 @@ Describe 'Invoke-TaskWorktreePlan tracking start' {
 
         $moved = Move-TrackingBranch -Fixture $fixture
         $moved | Should -Not -Be $fixture.Reviewed
+        (& git -C $fixture.Path rev-parse "refs/remotes/origin/$($fixture.Branch)").Trim() | Should -Be $moved -Because 'the race fixture must really move the remote ref'
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
@@ -672,9 +675,9 @@ Describe 'Invoke-TaskWorktreePlan tracking start' {
     }
 }
 
-Describe 'Worktree creation markers' {
+Describe 'Worktree reuse verification and repair' {
     BeforeAll {
-        function New-MarkerRepository {
+        function New-ReuseRepository {
             param([string]$Path)
 
             New-Item -ItemType Directory -Path $Path | Out-Null
@@ -684,154 +687,52 @@ Describe 'Worktree creation markers' {
             Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'first'
             & git -C $Path add README.md
             & git -C $Path commit -m first | Out-Null
-            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'second'
-            & git -C $Path commit -am second | Out-Null
-            return [pscustomobject]@{
-                Path = $Path
-                Head = (& git -C $Path rev-parse HEAD).Trim()
-                Previous = (& git -C $Path rev-parse HEAD~1).Trim()
-            }
+            return [pscustomobject]@{ Path = $Path; Head = (& git -C $Path rev-parse HEAD).Trim() }
         }
 
-        function Get-MarkerPath {
-            param([string]$TasksRoot, [string]$RepositoryName = 'api')
+        function New-TrackingRepository {
+            param([string]$Path, [string]$RemotePath, [string]$Branch = 'feature/FEATURE-123')
 
-            return Get-TaskWorktreeCreationMarkerPath -TasksRoot $TasksRoot -TaskKey 'FEATURE-123' -RepositoryName $RepositoryName
+            $fixture = New-ReuseRepository -Path $Path
+            & git init --bare $RemotePath | Out-Null
+            & git -C $Path remote add origin $RemotePath
+            & git -C $Path push origin 'main:refs/heads/main' "main:refs/heads/$Branch" | Out-Null
+            & git -C $Path fetch origin | Out-Null
+            return [pscustomobject]@{ Path = $Path; Remote = $RemotePath; Branch = $Branch; Head = $fixture.Head }
+        }
+
+        function New-FailureShim {
+            param([string]$Directory, [string]$Body)
+
+            New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+            $shimPath = Join-Path $Directory 'git'
+            $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+            @(
+                '#!/bin/sh'
+                "REAL_GIT='$realGit'"
+                'case " $* " in'
+                ('  *" worktree add "*) ' + $Body + '; exit 1 ;;')
+                'esac'
+                'exec "$REAL_GIT" "$@"'
+            ) | Set-Content -LiteralPath $shimPath
+            & chmod +x $shimPath
+            return $shimPath
         }
     }
 
-    It 'blocks a retry when the upstream is lost after the worktree was created' {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-pruned')
-        $remotePath = Join-Path $TestDrive 'marker-pruned.git'
-        & git init --bare $remotePath | Out-Null
-        & git -C $fixture.Path remote add origin $remotePath
-        & git -C $fixture.Path push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
-        & git -C $fixture.Path fetch origin | Out-Null
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-pruned-tasks'
+    It 'attaches the branch left by a failed tracking add and repairs its upstream' -Skip:(-not $IsLinux) {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'retry-branch-only') -RemotePath (Join-Path $TestDrive 'retry-branch-only.git')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $tasksRoot = Join-Path $TestDrive 'retry-branch-only-tasks'
         $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $plan.Action | Should -Be 'create-remote'
-
-        # The remote ref is pruned between planning and the upstream step.
-        & git -C $fixture.Path update-ref -d refs/remotes/origin/feature/FEATURE-123
-
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*set-upstream-to failed*'
-        Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-
-        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $retry.Action | Should -Be 'blocked'
-        $retry.Reason | Should -Be 'incomplete-worktree-creation'
-        (& git -C $plan.Destination branch --show-current) | Should -Be 'feature/FEATURE-123'
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-    }
-
-    It 'blocks reuse when an existing branch moved and the created worktree HEAD is wrong' {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-head-moved')
-        & git -C $fixture.Path branch feature/FEATURE-123 $fixture.Head | Out-Null
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-head-moved-tasks'
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $plan.Action | Should -Be 'create-local'
-        $plan.BranchMode | Should -Be 'existing'
-
-        Set-Content -LiteralPath (Join-Path $fixture.Path 'README.md') -Value 'third'
-        & git -C $fixture.Path commit -am third | Out-Null
-        $moved = (& git -C $fixture.Path rev-parse HEAD).Trim()
-        & git -C $fixture.Path branch -f feature/FEATURE-123 $moved | Out-Null
-
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*is not the reviewed commit*'
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-
-        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $retry.Action | Should -Be 'blocked'
-        $retry.Reason | Should -Be 'incomplete-worktree-creation'
-        (& git -C $fixture.Path rev-parse feature/FEATURE-123).Trim() | Should -Be $moved -Because 'the user branch must not be reset or deleted'
-    }
-
-    It 'clears the marker when git fails before creating a worktree' -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-git-failure')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-git-failure-tasks'
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $plan.Action | Should -Be 'create-local'
-
-        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
-        $shimDir = Join-Path $TestDrive 'marker-git-shim'
-        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
-        $shimPath = Join-Path $shimDir 'git'
-        @(
-            '#!/bin/sh'
-            "REAL_GIT='$realGit'"
-            'case " $* " in'
-            '  *" worktree add "*) echo "shim: forced failure" >&2; exit 1 ;;'
-            'esac'
-            'exec "$REAL_GIT" "$@"'
-        ) | Set-Content -LiteralPath $shimPath
-        & chmod +x $shimPath
-
-        $savedPath = $env:PATH
-        $env:PATH = "${shimDir}:${savedPath}"
-        try {
-            { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*git worktree add failed*'
-        }
-        finally { $env:PATH = $savedPath }
-
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
-        Test-Path -LiteralPath $markerPath | Should -BeFalse
-
-        # A failure that provably created no worktree must not strand a retry.
-        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
-        Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
-        Test-Path -LiteralPath $markerPath | Should -BeFalse
-    }
-
-    It 'blocks a plan on a marker left by an interruption until the marker is removed' {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-interrupted')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-interrupted-tasks'
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        New-Item -ItemType Directory -Path (Split-Path -Parent $markerPath) -Force | Out-Null
-        '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
-
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $plan.Action | Should -Be 'blocked'
-        $plan.Reason | Should -Be 'incomplete-worktree-creation'
-
-        Remove-Item -LiteralPath $markerPath -Force
-        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $retry.Action | Should -Be 'create-local'
-    }
-
-    It 'clears the marker when a concurrent creator left the task branch at the reviewed commit' -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-branch-only')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-branch-only-tasks'
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $plan.Action | Should -Be 'create-local'
         $plan.SourceCommit | Should -Be $fixture.Head
 
-        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
-        $shimDir = Join-Path $TestDrive 'marker-branch-only-shim'
-        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
-        $shimPath = Join-Path $shimDir 'git'
-        @(
-            '#!/bin/sh'
-            "REAL_GIT='$realGit'"
-            "REPO='$($fixture.Path)'"
-            'case " $* " in'
-            '  *" worktree add "*) "$REAL_GIT" -C "$REPO" branch feature/FEATURE-123 "__REVIEWED__" >/dev/null 2>&1; echo "shim: branch-only failure" >&2; exit 1 ;;'
-            'esac'
-            'exec "$REAL_GIT" "$@"'
-        ) | Set-Content -LiteralPath $shimPath
-        # Substitute the reviewed commit so the shim reproduces a branch that
-        # exists without a destination or a worktree registration.
-        $shimText = (Get-Content -LiteralPath $shimPath -Raw) -replace '__REVIEWED__', $fixture.Head
-        Set-Content -LiteralPath $shimPath -Value $shimText -NoNewline
-        & chmod +x $shimPath
+        # The add fails after creating only the branch at the pinned commit: no
+        # destination, no worktree registration, nothing recorded by the scaffold.
+        $shimDir = Join-Path $TestDrive 'retry-branch-only-shim'
+        $body = '"$REAL_GIT" -C ''{0}'' branch ''{1}'' ''{2}'' >/dev/null 2>&1; echo ''shim: branch-only failure'' >&2' -f $fixture.Path, $fixture.Branch, $fixture.Head
+        New-FailureShim -Directory $shimDir -Body $body | Out-Null
 
         $savedPath = $env:PATH
         $env:PATH = "${shimDir}:${savedPath}"
@@ -840,248 +741,253 @@ Describe 'Worktree creation markers' {
         }
         finally { $env:PATH = $savedPath }
 
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
         Test-Path -LiteralPath $plan.Destination | Should -BeFalse
-        (& git -C $fixture.Path rev-parse refs/heads/feature/FEATURE-123).Trim() | Should -Be $fixture.Head -Because 'the task branch must be preserved'
-        @(& git -C $fixture.Path worktree list --porcelain) -join "`n" | Should -Not -Match ([regex]::Escape($plan.Destination))
-        # The branch did not exist before the start and is exactly the reviewed
-        # commit: a fresh plan can attach it, so the marker must not strand it.
-        Test-Path -LiteralPath $markerPath | Should -BeFalse
+        (& git -C $fixture.Path rev-parse "refs/heads/$($fixture.Branch)").Trim() | Should -Be $fixture.Head -Because 'a failed attempt must preserve the branch, never delete it'
 
         $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $retry.Action | Should -Be 'create-local'
         $retry.BranchMode | Should -Be 'existing'
-        $retry.Source | Should -Be 'feature/FEATURE-123'
+        $retry.UpstreamRef | Should -Be "refs/remotes/origin/$($fixture.Branch)"
         Invoke-TaskWorktreePlan -Repository $repository -Plan $retry
-        Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
-        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
-        Test-Path -LiteralPath $markerPath | Should -BeFalse
+
+        (& git -C $retry.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+        (& git -C $retry.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        (& git -C $retry.Destination rev-parse "$($fixture.Branch)@{upstream}").Trim() | Should -Be $fixture.Head
     }
 
-    It 'keeps the marker when the leftover task branch is not the reviewed commit' -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-branch-unexpected')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-branch-unexpected-tasks'
+    It 'repairs a missing upstream on reuse' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'reuse-upstream-missing') -RemotePath (Join-Path $TestDrive 'reuse-upstream-missing.git')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $tasksRoot = Join-Path $TestDrive 'reuse-upstream-missing-tasks'
         $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $plan.SourceCommit | Should -Be $fixture.Head
+        $plan.Action | Should -Be 'create-remote'
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
-        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
-        $shimDir = Join-Path $TestDrive 'marker-branch-unexpected-shim'
-        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
-        $shimPath = Join-Path $shimDir 'git'
-        @(
-            '#!/bin/sh'
-            "REAL_GIT='$realGit'"
-            "REPO='$($fixture.Path)'"
-            'case " $* " in'
-            '  *" worktree add "*) "$REAL_GIT" -C "$REPO" branch feature/FEATURE-123 "__PREVIOUS__" >/dev/null 2>&1; echo "shim: unexpected branch failure" >&2; exit 1 ;;'
-            'esac'
-            'exec "$REAL_GIT" "$@"'
-        ) | Set-Content -LiteralPath $shimPath
-        $shimText = (Get-Content -LiteralPath $shimPath -Raw) -replace '__PREVIOUS__', $fixture.Previous
-        Set-Content -LiteralPath $shimPath -Value $shimText -NoNewline
-        & chmod +x $shimPath
+        & git -C $plan.Destination branch --unset-upstream
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -BeNullOrEmpty
 
-        $savedPath = $env:PATH
-        $env:PATH = "${shimDir}:${savedPath}"
-        try {
-            { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*git worktree add failed*'
-        }
-        finally { $env:PATH = $savedPath }
+        $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $reuse.Action | Should -Be 'reuse'
+        $reuse.UpstreamRef | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse
 
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
-        (& git -C $fixture.Path rev-parse refs/heads/feature/FEATURE-123).Trim() | Should -Be $fixture.Previous
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-
-        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $retry.Action | Should -Be 'blocked'
-        $retry.Reason | Should -Be 'incomplete-worktree-creation'
+        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
     }
 
-    It 'keeps the marker when a failed checkout leaves a worktree registration' -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-registration')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-registration-tasks'
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-
-        $hooksDir = Join-Path $fixture.Path '.git/hooks'
-        New-Item -ItemType Directory -Path $hooksDir -Force | Out-Null
-        $hookPath = Join-Path $hooksDir 'post-checkout'
-        # A failing hook can leave a registration behind even when its own
-        # cleanup removes the destination directory and the task branch. With
-        # both gone, only registration detection can keep the marker.
-        @(
-            '#!/bin/sh'
-            'git update-ref -d refs/heads/feature/FEATURE-123'
-            'rm -f README.md .git'
-            'cd ..'
-            'rmdir "$OLDPWD" 2>/dev/null || true'
-            'exit 1'
-        ) | Set-Content -LiteralPath $hookPath
-        & chmod +x $hookPath
-
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*git worktree add failed*'
-
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
-        @(& git -C $fixture.Path worktree list --porcelain) -join "`n" | Should -Match ([regex]::Escape($plan.Destination))
-        & git -C $fixture.Path show-ref --verify --quiet refs/heads/feature/FEATURE-123
-        $LASTEXITCODE | Should -Be 1
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-
-        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $retry.Reason | Should -Be 'incomplete-worktree-creation'
-    }
-
-    It 'parses a NUL-delimited registration whose destination contains a newline' -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-newline')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive "marker-newline-tasks`nsecond-line"
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $plan.Destination | Should -Match "`n"
-
-        $hookPath = Join-Path $fixture.Path '.git/hooks/post-checkout'
-        @(
-            '#!/bin/sh'
-            'git update-ref -d refs/heads/feature/FEATURE-123'
-            'rm -f README.md .git'
-            'cd ..'
-            'rmdir "$OLDPWD" 2>/dev/null || true'
-            'exit 1'
-        ) | Set-Content -LiteralPath $hookPath
-        & chmod +x $hookPath
-
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*git worktree add failed*'
-
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
-        @(& git -C $fixture.Path worktree list --porcelain) -join "`n" | Should -Match ([regex]::Escape($plan.Destination))
-        Test-Path -LiteralPath (Join-Path $fixture.Path '.git/refs/heads/feature/FEATURE-123') | Should -BeFalse
-        # A newline inside the registered path must not split the record and
-        # turn a real registration into a conclusive miss.
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-    }
-
-    It 'matches a registration through a symlink above the tasks root' -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-symlink')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $realBase = Join-Path $TestDrive 'marker-symlink-real'
-        $linkBase = Join-Path $TestDrive 'marker-symlink-link'
-        New-Item -ItemType Directory -Path $realBase -Force | Out-Null
-        New-Item -ItemType SymbolicLink -Path $linkBase -Target $realBase | Out-Null
-        # The symlink is above the tasks root itself, which stays a real
-        # directory while Git stores the canonical destination.
-        $realRoot = Join-Path $realBase 'tasks'
-        $linkRoot = Join-Path $linkBase 'tasks'
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $linkRoot
-
-        $hookPath = Join-Path $fixture.Path '.git/hooks/post-checkout'
-        @(
-            '#!/bin/sh'
-            'git update-ref -d refs/heads/feature/FEATURE-123'
-            'rm -f README.md .git'
-            'cd ..'
-            'rmdir "$OLDPWD" 2>/dev/null || true'
-            'exit 1'
-        ) | Set-Content -LiteralPath $hookPath
-        & chmod +x $hookPath
-
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*git worktree add failed*'
-
-        # Git stored the canonical destination while the plan used the symlink.
-        $listing = @(& git -C $fixture.Path worktree list --porcelain) -join "`n"
-        $listing | Should -Match ([regex]::Escape($realRoot))
-        $markerPath = Get-MarkerPath -TasksRoot $linkRoot
-        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
-        Test-Path -LiteralPath (Join-Path $fixture.Path '.git/refs/heads/feature/FEATURE-123') | Should -BeFalse
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-
-        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $linkRoot
-        $retry.Reason | Should -Be 'incomplete-worktree-creation'
-    }
-
-    It 'keeps the marker when the registration readback is <Case>' -ForEach @(
-        @{ Case = 'a parse gap'; Body = "printf 'not-porcelain\n'" }
-        @{ Case = 'duplicated'; Body = "printf 'worktree /tmp/duplicate\000worktree /tmp/duplicate\000\000'" }
-    ) -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive "marker-indeterminate-$($Case -replace '[^a-z]', '')")
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive "marker-indeterminate-tasks-$($Case -replace '[^a-z]', '')"
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-
-        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
-        $shimDir = Join-Path $TestDrive "marker-indeterminate-shim-$($Case -replace '[^a-z]', '')"
-        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
-        $shimPath = Join-Path $shimDir 'git'
-        @(
-            '#!/bin/sh'
-            "REAL_GIT='$realGit'"
-            'case " $* " in'
-            '  *" worktree list "*) __BODY__; exit 0 ;;'
-            '  *" worktree add "*) echo "shim: forced failure" >&2; exit 1 ;;'
-            'esac'
-            'exec "$REAL_GIT" "$@"'
-        ) -replace '__BODY__', $Body | Set-Content -LiteralPath $shimPath
-        & chmod +x $shimPath
-
-        $savedPath = $env:PATH
-        $env:PATH = "${shimDir}:${savedPath}"
-        try {
-            { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*git worktree add failed*'
-        }
-        finally { $env:PATH = $savedPath }
-
-        # Neither an unknown record nor a duplicate path is proof of absence.
-        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
-        Test-Path -LiteralPath (Get-MarkerPath -TasksRoot $tasksRoot) | Should -BeTrue
-    }
-
-    It 'refuses and keeps the marker when a hook detaches HEAD at the reviewed commit' -Skip:(-not $IsLinux) {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-detached')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-detached-tasks'
-        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $plan.SourceCommit | Should -Be $fixture.Head
-
-        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
-        $hookPath = Join-Path $fixture.Path '.git/hooks/post-checkout'
-        @(
-            '#!/bin/sh'
-            "REAL_GIT='$realGit'"
-            'if [ "$3" = "1" ]; then'
-            '  "$REAL_GIT" -c core.hooksPath=/dev/null checkout -q --detach'
-            'fi'
-        ) | Set-Content -LiteralPath $hookPath
-        & chmod +x $hookPath
-
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*detached HEAD*'
-
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
-        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
-        (& git -C $fixture.Path rev-parse refs/heads/feature/FEATURE-123).Trim() | Should -Be $fixture.Head
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-
-        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
-        $retry.Reason | Should -Be 'incomplete-worktree-creation'
-    }
-
-    It 'reuses a healthy destination and leaves no marker behind' {
-        $fixture = New-MarkerRepository -Path (Join-Path $TestDrive 'marker-healthy-reuse')
-        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
-        $tasksRoot = Join-Path $TestDrive 'marker-healthy-reuse-tasks'
+    It 'repairs a wrong upstream on reuse' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'reuse-upstream-wrong') -RemotePath (Join-Path $TestDrive 'reuse-upstream-wrong.git')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $tasksRoot = Join-Path $TestDrive 'reuse-upstream-wrong-tasks'
         $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
-        $markerPath = Get-MarkerPath -TasksRoot $tasksRoot
-        Test-Path -LiteralPath $markerPath | Should -BeFalse
+
+        & git -C $fixture.Path push origin 'main:refs/heads/other-branch' | Out-Null
+        & git -C $fixture.Path fetch origin | Out-Null
+        & git -C $plan.Destination branch --set-upstream-to=refs/remotes/origin/other-branch $fixture.Branch | Out-Null
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/other-branch'
 
         $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $reuse.Action | Should -Be 'reuse'
         Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse
 
-        Test-Path -LiteralPath $markerPath | Should -BeFalse
-        (& git -C $reuse.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+    }
+
+    It 'blocks reuse when the branch tip cannot be read locally' {
+        $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-unreadable')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $tasksRoot = Join-Path $TestDrive 'reuse-unreadable-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        $refPath = Join-Path $fixture.Path ".git/refs/heads/$($repository.Branch)"
+        Set-Content -LiteralPath $refPath -Value ('1' * 40) -NoNewline
+
+        $blocked = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+
+        $blocked.Action | Should -Be 'blocked'
+        $blocked.Reason | Should -Be 'reuse-unreadable'
+        $blocked.SourceCommit | Should -BeNullOrEmpty -Because 'an unreadable tip must never be returned as a verified reuse commit'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $blocked } | Should -Throw '*cannot apply blocked plan*'
+    }
+
+    It 'rejects a new worktree whose HEAD was detached at the reviewed commit' -Skip:(-not $IsLinux) {
+        $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-detached')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $tasksRoot = Join-Path $TestDrive 'reuse-detached-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.SourceCommit | Should -Be $fixture.Head
+
+        $hookPath = Join-Path $fixture.Path '.git/hooks/post-checkout'
+        @(
+            '#!/bin/sh'
+            'if [ "$3" = "1" ]; then git -c core.hooksPath=/dev/null checkout -q --detach; fi'
+        ) | Set-Content -LiteralPath $hookPath
+        & chmod +x $hookPath
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*detached HEAD*'
+
+        Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+        (& git -C $fixture.Path rev-parse "refs/heads/$($repository.Branch)").Trim() | Should -Be $fixture.Head
+
+        # A detached destination is not a reuse candidate: the requested branch
+        # is not checked out.
+        $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $retry.Action | Should -Be 'blocked'
+        $retry.Reason | Should -Be 'destination-exists'
+    }
+
+    It 'rejects an indirect alias that only resolves to the requested branch' -Skip:(-not $IsLinux) {
+        $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-indirect-alias')
+        & git -C $fixture.Path branch feature/REAL | Out-Null
+        & git -C $fixture.Path symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/REAL' }
+        $tasksRoot = Join-Path $TestDrive 'reuse-indirect-alias-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'existing'
+
+        # The checkout ends on an alias whose target is the requested branch. A
+        # recursive read would accept it; the immediate HEAD target must not.
+        $hookPath = Join-Path $fixture.Path '.git/hooks/post-checkout'
+        @(
+            '#!/bin/sh'
+            'if [ "$3" = "1" ]; then git symbolic-ref HEAD refs/heads/feature/ALIAS; fi'
+        ) | Set-Content -LiteralPath $hookPath
+        & chmod +x $hookPath
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } |
+            Should -Throw "*is on 'refs/heads/feature/ALIAS' instead of 'refs/heads/feature/REAL'*"
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+    }
+
+    It 'accepts a reuse whose requested branch is itself a symbolic alias' {
+        $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-alias-accept')
+        & git -C $fixture.Path branch feature/REAL | Out-Null
+        & git -C $fixture.Path symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/ALIAS' }
+        $tasksRoot = Join-Path $TestDrive 'reuse-alias-accept-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $reuse.Action | Should -Be 'reuse'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Not -Throw
+        (& git -C $reuse.Destination symbolic-ref -q --no-recurse HEAD) | Should -Be 'refs/heads/feature/ALIAS'
+    }
+
+    It 'refuses reuse when HEAD only indirectly resolves to the requested branch' {
+        $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-indirect-alias-stale')
+        & git -C $fixture.Path branch feature/REAL | Out-Null
+        & git -C $fixture.Path symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/REAL' }
+        $tasksRoot = Join-Path $TestDrive 'reuse-indirect-alias-stale-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $reuse.Action | Should -Be 'reuse'
+
+        & git -C $reuse.Destination symbolic-ref HEAD refs/heads/feature/ALIAS
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Throw '*reused worktree changed since planning*'
+
+        $replanned = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $replanned.Action | Should -Be 'blocked'
+        $replanned.Reason | Should -Be 'destination-exists'
+    }
+
+    It 'accepts a symbolic remote task ref as the upstream target' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'reuse-symbolic-upstream') -RemotePath (Join-Path $TestDrive 'reuse-symbolic-upstream.git')
+        & git -C $fixture.Path symbolic-ref "refs/remotes/origin/$($fixture.Branch)" refs/remotes/origin/main
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $tasksRoot = Join-Path $TestDrive 'reuse-symbolic-upstream-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+
+        $plan.Action | Should -Be 'create-remote'
+        $plan.SourceCommit | Should -Be $fixture.Head
+
+        # Git stores and reads the symbolic ref back as its target, so the
+        # literal spelling never matches; the resolved target does.
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
+
+        $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $reuse.Action | Should -Be 'reuse'
+        $reuse.UpstreamRef | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Not -Throw
+    }
+
+    It 'leaves no state when git fails before creating a worktree' -Skip:(-not $IsLinux) {
+        $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-git-failure')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $tasksRoot = Join-Path $TestDrive 'reuse-git-failure-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'new'
+
+        $shimDir = Join-Path $TestDrive 'reuse-git-failure-shim'
+        New-FailureShim -Directory $shimDir -Body "echo 'shim: forced failure' >&2" | Out-Null
+        $savedPath = $env:PATH
+        $env:PATH = "${shimDir}:${savedPath}"
+        try {
+            { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*git worktree add failed*'
+        }
+        finally { $env:PATH = $savedPath }
+
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
+        & git -C $fixture.Path show-ref --verify --quiet "refs/heads/$($repository.Branch)"
+        $LASTEXITCODE | Should -Be 1
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+        Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+    }
+
+    It 'refuses an existing branch that moved after planning without deleting it' {
+        $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-existing-moved')
+        & git -C $fixture.Path branch feature/FEATURE-123 | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $tasksRoot = Join-Path $TestDrive 'reuse-existing-moved-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.BranchMode | Should -Be 'existing'
+        $plan.SourceCommit | Should -Be $fixture.Head
+
+        Set-Content -LiteralPath (Join-Path $fixture.Path 'README.md') -Value 'moved'
+        & git -C $fixture.Path commit -am moved | Out-Null
+        $moved = (& git -C $fixture.Path rev-parse HEAD).Trim()
+        & git -C $fixture.Path branch -f feature/FEATURE-123 $moved | Out-Null
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*is not the reviewed commit*'
+        (& git -C $fixture.Path rev-parse 'refs/heads/feature/FEATURE-123').Trim() | Should -Be $moved -Because 'the user branch must not be reset or deleted'
+        Test-Path -LiteralPath $plan.Destination | Should -BeTrue
+
+        # The new state is consistent, so a fresh plan rebinds and reuses it.
+        $replanned = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $replanned.Action | Should -Be 'reuse'
+        $replanned.SourceCommit | Should -Be $moved
+    }
+
+    It 'keeps the worktree when the tracking upstream disappears and retries as reuse' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'reuse-upstream-pruned') -RemotePath (Join-Path $TestDrive 'reuse-upstream-pruned.git')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $tasksRoot = Join-Path $TestDrive 'reuse-upstream-pruned-tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-remote'
+
+        # The remote ref is pruned between planning and the upstream step.
+        & git -C $fixture.Path update-ref -d "refs/remotes/origin/$($fixture.Branch)"
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*set-upstream-to failed*'
+        Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
+        (& git -C $plan.Destination symbolic-ref -q --no-recurse HEAD) | Should -Be "refs/heads/$($fixture.Branch)"
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+
+        # No upstream is expected any more, so the complete worktree is reusable.
+        $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $reuse.Action | Should -Be 'reuse'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Not -Throw
+        Test-Path -LiteralPath $reuse.Destination -PathType Container | Should -BeTrue
     }
 }
 
@@ -1195,6 +1101,7 @@ Describe 'branch.autoSetupMerge upstream preservation' {
 
         $moved = Move-AutoSetupRemoteBase -Fixture $fixture
         $moved | Should -Not -Be $fixture.Reviewed
+        (& git -C $fixture.Path rev-parse 'refs/remotes/origin/main').Trim() | Should -Be $moved -Because 'the race fixture must really move the remote base'
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
@@ -1216,6 +1123,23 @@ Describe 'branch.autoSetupMerge upstream preservation' {
 
         $moved = Move-AutoSetupRemoteBase -Fixture $fixture
         $moved | Should -Not -Be $fixture.Reviewed
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -BeNullOrEmpty
+    }
+
+    It 'creates no upstream when branch.autoSetupMerge is an empty value' {
+        $caseRoot = New-AutoSetupCaseRoot
+        $fixture = New-AutoSetupFixture -Root $caseRoot
+        # Git treats an explicitly empty value as boolean false, not as unset.
+        & git -C $fixture.Path config branch.autoSetupMerge ''
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.UpstreamRef | Should -BeNullOrEmpty
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 

@@ -405,43 +405,39 @@ Describe 'dotnet task plan' {
             $validResult.plan.worktreeOperations[0].source | Should -Be 'feature/FEATURE-123'
         }
 
-        It 'blocks reuse when the per-repository incomplete-creation marker exists' {
-            $repositoryPath = New-TestRepository -Name 'api-incomplete-marker'
-            $tasksRoot = Join-Path $TestDrive 'tasks-incomplete-marker'
+        It 'blocks reuse when the branch tip cannot be read locally' {
+            $repositoryPath = New-TestRepository -Name 'api-reuse-unreadable'
+            $tasksRoot = Join-Path $TestDrive 'tasks-reuse-unreadable'
             & git -C $repositoryPath worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
             $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
-            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-incomplete-marker.json') -Request $request
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-unreadable.json') -Request $request
 
             $healthy = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'healthy reuse plan'
             $healthy.plan.worktreeOperations[0].action | Should -Be 'reuse'
 
-            $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
-                [Text.Encoding]::UTF8.GetBytes('api'))).ToLowerInvariant()
-            $markerPath = Join-Path $tasksRoot "FEATURE-123/worktrees/$markerName"
-            '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
-            $blocked = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'incomplete marker plan'
+            $refPath = Join-Path $repositoryPath '.git/refs/heads/feature/FEATURE-123'
+            Set-Content -LiteralPath $refPath -Value ('1' * 40) -NoNewline
+            $blocked = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'unreadable reuse tip plan'
+
             $blocked.plan.worktreeOperations[0].action | Should -Be 'blocked'
-            $blocked.plan.worktreeOperations[0].reason | Should -Be 'incomplete-worktree-creation'
-            Test-Path -LiteralPath $markerPath | Should -BeTrue
+            $blocked.plan.worktreeOperations[0].reason | Should -Be 'reuse-unreadable'
         }
 
-        It 'finds the marker for a 250-character repository name' {
-            $name = 'a' * 250
-            $repositoryPath = New-TestRepository -Name 'api-long-marker'
-            $tasksRoot = Join-Path $TestDrive 'tasks-long-marker'
-            $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
-                [Text.Encoding]::UTF8.GetBytes($name))).ToLowerInvariant()
-            New-Item -ItemType Directory -Path (Join-Path $tasksRoot 'FEATURE-123/worktrees') -Force | Out-Null
-            $markerPath = Join-Path $tasksRoot "FEATURE-123/worktrees/$markerName"
-            '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
-            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = $name; Path = $repositoryPath })
-            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-long-marker.json') -Request $request
+        It 'does not reuse a worktree whose HEAD only indirectly resolves to the requested branch' {
+            $repositoryPath = New-TestRepository -Name 'api-reuse-indirect-alias'
+            $tasksRoot = Join-Path $TestDrive 'tasks-reuse-indirect-alias'
+            $destination = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
+            & git -C $repositoryPath branch feature/REAL | Out-Null
+            & git -C $repositoryPath symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+            & git -C $repositoryPath worktree add $destination feature/REAL | Out-Null
+            & git -C $destination symbolic-ref HEAD refs/heads/feature/ALIAS
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath }) -Branch 'feature/REAL'
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-indirect-alias.json') -Request $request
 
-            $blocked = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'long marker plan'
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'indirect alias reuse plan'
 
-            $blocked.plan.worktreeOperations[0].action | Should -Be 'blocked'
-            $blocked.plan.worktreeOperations[0].reason | Should -Be 'incomplete-worktree-creation'
-            [IO.Path]::GetFileName($markerPath).Length | Should -BeLessOrEqual 255
+            $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $result.plan.worktreeOperations[0].reason | Should -Be 'destination-exists' -Because 'HEAD targets the alias, not the requested branch'
         }
 
         It 'plans a tracking branch from the full remote ref when the start commit matches' {

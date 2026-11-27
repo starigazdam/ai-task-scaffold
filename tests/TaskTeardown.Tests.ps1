@@ -352,43 +352,39 @@ exit "$status"
         Test-Path -LiteralPath (Join-Path $script:taskPath 'agents.md') | Should -BeTrue
     }
 
-    It 'blocks teardown while an incomplete worktree creation marker exists' {
-        $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
-            [Text.Encoding]::UTF8.GetBytes('api'))).ToLowerInvariant()
-        $markerPath = Join-Path $script:taskPath "worktrees/$markerName"
-        '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
-
-        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
-
-        $plan.TaskOperation | Should -Be 'blocked'
-        $plan.TaskReason | Should -Be 'incomplete-worktree-creation'
-        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*incomplete-worktree-creation*'
-        Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
-        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
-    }
-
-    It 'recognizes a marker for a 250-character repository name without a component-length failure' {
-        $name = 'a' * 250
+    It 'accepts a registered branch that is itself a symbolic alias' {
+        & git -C $script:repositoryPath branch feature/REAL | Out-Null
+        & git -C $script:repositoryPath symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+        & git -C $script:repositoryPath worktree remove --force $script:worktreePath
+        & git -C $script:repositoryPath worktree add $script:worktreePath feature/ALIAS | Out-Null
         $manifestPath = Join-Path $script:taskPath 'task.json'
         $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-        $manifest.repositories = @($manifest.repositories) + [pscustomobject]@{
-            name = $name
-            path = $script:repositoryPath
-            baseBranch = 'main'
-            branch = 'feature/FEATURE-123'
-        }
-        $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
-        $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
-            [Text.Encoding]::UTF8.GetBytes($name))).ToLowerInvariant()
-        $markerPath = Join-Path $script:taskPath "worktrees/$markerName"
-        '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
+        $manifest.repositories[0].branch = 'feature/ALIAS'
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'remove'
+        & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply | Out-Null
+        Test-Path -LiteralPath $script:taskPath | Should -BeFalse
+    }
+
+    It 'refuses a worktree whose HEAD only indirectly resolves to the registered branch' {
+        & git -C $script:repositoryPath branch feature/REAL | Out-Null
+        & git -C $script:repositoryPath symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+        & git -C $script:worktreePath symbolic-ref HEAD refs/heads/feature/ALIAS
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $manifest.repositories[0].branch = 'feature/REAL'
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -NoNewline
 
         $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
 
         $plan.TaskOperation | Should -Be 'blocked'
-        $plan.TaskReason | Should -Be 'incomplete-worktree-creation'
-        @($plan.WorktreeOperations | Where-Object { $_.Repository -eq $name -and $_.Reason -eq 'missing-worktree' }) |
-            Should -BeNullOrEmpty -Because 'the marker must suppress the missing-worktree reason for that name'
+        $plan.TaskReason | Should -Be 'blocked-worktree'
+        $plan.WorktreeOperations[0].Reason | Should -Be 'branch-mismatch' -Because 'the immediate target is feature/ALIAS, not the registered feature/REAL'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*branch-mismatch*'
+        Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
     }
 }

@@ -116,86 +116,38 @@ function Get-GitDir {
     return ([string]($output | Select-Object -First 1)).Trim()
 }
 
-function Get-TaskPathIdentity {
-    param([string]$Path)
+function Get-TaskImmediateHeadRef {
+    param([string]$RepositoryPath)
 
-    # Resolve every existing component so a symlink above TasksRoot cannot make
-    # one path look different from another (Git stores the canonical path).
-    # Missing components are appended lexically, which keeps a destination that
-    # no longer exists comparable with its registration. An unreadable link
-    # chain is unknown, never a miss.
-    try { $full = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Path)) }
-    catch { return $null }
-    $root = [IO.Path]::GetPathRoot($full)
-    if ([string]::IsNullOrEmpty($root)) { return $full }
-
-    $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    $segments = $full.Substring($root.Length).Split($separators, [StringSplitOptions]::RemoveEmptyEntries)
-    $current = $root
-    foreach ($segment in $segments) {
-        $next = [IO.Path]::Combine($current, $segment)
-        $item = $null
-        try {
-            if ([IO.Directory]::Exists($next)) { $item = [IO.DirectoryInfo]::new($next) }
-            elseif ([IO.File]::Exists($next)) { $item = [IO.FileInfo]::new($next) }
-        }
-        catch { return $null }
-        if ($null -ne $item) {
-            try { $target = $item.ResolveLinkTarget($true) }
-            catch { return $null }
-            $current = if ($null -ne $target) { $target.FullName } else { $next }
-        }
-        else { $current = $next }
+    # Reuse, create, and teardown all decide on HEAD's immediate target: a task
+    # branch may itself be a symbolic alias, and a recursive read would compare
+    # the alias's target instead. Git without --no-recurse cannot answer that
+    # question, so it fails closed rather than resolving recursively.
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('symbolic-ref', '-q', '--no-recurse', 'HEAD') -NoLazyFetch
+    if ($result.ExitCode -eq 0) {
+        return ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
     }
-    return [IO.Path]::TrimEndingDirectorySeparator($current)
+    if ($result.Text -match 'unknown option|unrecognized option') {
+        throw "cannot read the immediate HEAD target in '$RepositoryPath': this Git does not support 'symbolic-ref --no-recurse'; refusing to resolve HEAD recursively (Git 2.46 or later is required)"
+    }
+    return $null
 }
 
-function Test-TaskWorktreeRegistration {
-    param([string]$RepositoryPath, [string]$WorktreePath)
+function Resolve-TaskRefTarget {
+    param([string]$RepositoryPath, [string]$Reference)
 
-    # A failed `git worktree add` can remove the destination yet leave the
-    # worktree registered (for example when a post-checkout hook fails). Ask
-    # Git for the registration instead of trusting the directory alone.
-    try {
-        $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('worktree', 'list', '--porcelain', '-z') -NoLazyFetch
+    # An upstream may be spelled as a symbolic remote ref (origin/HEAD, or a
+    # symbolic remote task ref). Git stores and reads it back as its target, so
+    # comparisons must use the resolved ref name, never the literal spelling.
+    $current = $Reference
+    for ($depth = 0; $depth -lt 8; $depth++) {
+        $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('symbolic-ref', '-q', $current) -NoLazyFetch
+        if ($result.ExitCode -ne 0) { break }
+        $target = ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+        if ($target -cnotlike 'refs/*' -or $target -ceq $current) { break }
+        $current = $target
     }
-    catch { return $null }
-    if ($result.ExitCode -ne 0) { return $null }
-    if ($result.PSObject.Properties['Error'] -and -not [string]::IsNullOrEmpty($result.Error)) { return $null }
-
-    # NUL-delimited records keep a destination containing a newline intact.
-    # Any record that is not a known porcelain key is a parse gap, and a
-    # duplicated path makes the answer ambiguous: both keep the marker.
-    $knownKeys = @('worktree', 'HEAD', 'branch', 'detached', 'bare', 'locked', 'prunable')
-    $paths = [System.Collections.Generic.List[string]]::new()
-    $sawEntry = $false
-    foreach ($record in @($result.Output.Split([char]0))) {
-        if ($record -ceq '') { continue }
-        $separator = $record.IndexOf(' ')
-        $key = if ($separator -lt 0) { $record } else { $record.Substring(0, $separator) }
-        if ($key -cnotin $knownKeys) { return $null }
-        if ($key -ceq 'worktree') {
-            if ($separator -lt 0) { return $null }
-            $path = $record.Substring($separator + 1)
-            if ([string]::IsNullOrWhiteSpace($path)) { return $null }
-            $paths.Add($path)
-            $sawEntry = $true
-        }
-        elseif (-not $sawEntry) { return $null }
-    }
-    if (-not $sawEntry) { return $null }
-
-    $expected = Get-TaskPathIdentity -Path $WorktreePath
-    if (-not $expected) { return $null }
-    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($path in $paths) {
-        $candidate = Get-TaskPathIdentity -Path $path
-        if (-not $candidate) { return $null }
-        # Case-insensitive on purpose: a false match keeps the marker (fails
-        # closed), while a false miss could reopen a mutated destination.
-        if (-not $seen.Add($candidate)) { return $null }
-    }
-    return $seen.Contains($expected)
+    return $current
 }
 
 function Test-TaskWorktreeIdentity {
@@ -211,8 +163,12 @@ function Test-TaskWorktreeIdentity {
     $worktreeCommonDir = Get-GitCommonDir -RepositoryPath $WorktreePath
     $worktreeGitDir = Get-GitDir -RepositoryPath $WorktreePath
     $expectedWorktreeGitDir = if ($ExpectedGitDir) { $ExpectedGitDir } else { $worktreeGitDir }
-    $worktreeBranch = (& git -C $WorktreePath branch --show-current 2>$null | Select-Object -First 1)
-    return $repositoryCommonDir -and $repositoryCommonDir -ceq $worktreeCommonDir -and $worktreeGitDir -ceq $expectedWorktreeGitDir -and $worktreeBranch -ceq $Branch
+    # HEAD's immediate target, not a recursive alias resolution: the worktree
+    # belongs to the task only when the checked-out branch is the requested one.
+    $worktreeHeadRef = $null
+    try { $worktreeHeadRef = Get-TaskImmediateHeadRef -RepositoryPath $WorktreePath }
+    catch { return $false }
+    return $repositoryCommonDir -and $repositoryCommonDir -ceq $worktreeCommonDir -and $worktreeGitDir -ceq $expectedWorktreeGitDir -and $worktreeHeadRef -ceq "refs/heads/$Branch"
 }
 
 function Test-TaskWorktreeOperationSafety {
@@ -238,114 +194,6 @@ function Get-TaskWorktreeDestination {
     return [IO.Path]::GetFullPath((Join-Path $TasksRoot (Join-Path (Join-Path $TaskKey 'worktrees') $RepositoryName)))
 }
 
-# A creation marker records that worktree creation for one destination started
-# but has not completed. It lives next to the destination inside the scaffold
-# owned worktrees container, so no caller task file can ever collide with it.
-# The name is a fixed prefix plus a hash of the repository name: a component
-# limit applies to every name TaskContract accepts, so the repository name
-# itself cannot be part of the file name.
-$script:TaskWorktreeMarkerPrefix = '.ai-task-scaffold-incomplete.'
-$script:TaskWorktreeMarkerNamePattern = '^\.ai-task-scaffold-incomplete\.[0-9a-f]{64}$'
-
-function Get-TaskWorktreeMarkerName {
-    param([string]$RepositoryName)
-
-    $hash = [Convert]::ToHexString(
-        [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($RepositoryName))).ToLowerInvariant()
-    return "$($script:TaskWorktreeMarkerPrefix)$hash"
-}
-
-function Test-TaskWorktreeMarkerName {
-    param([string]$Name)
-
-    return $Name -cmatch $script:TaskWorktreeMarkerNamePattern
-}
-
-function Get-TaskWorktreeCreationMarkerPath {
-    param([string]$TasksRoot, [string]$TaskKey, [string]$RepositoryName)
-
-    $destination = Get-TaskWorktreeDestination -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $RepositoryName
-    return Join-Path (Split-Path -Parent $destination) (Get-TaskWorktreeMarkerName -RepositoryName $RepositoryName)
-}
-
-function New-TaskWorktreeCreationMarker {
-    param([string]$Path, [psobject]$Plan, [string]$Branch)
-
-    $sourceCommit = if ($Plan.PSObject.Properties['SourceCommit']) { $Plan.SourceCommit } else { $null }
-    $material = [ordered]@{
-        markerVersion = 1
-        repository = $Plan.Repository
-        branch = $Branch
-        action = $Plan.Action
-        source = $Plan.Source
-        sourceCommit = $sourceCommit
-        destination = $Plan.Destination
-        startedUtc = [DateTimeOffset]::UtcNow.ToString('o')
-    }
-    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($material | ConvertTo-Json -Compress))
-    # Exclusive create: an existing marker means another attempt owns this
-    # destination, so it must never be overwritten.
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
-}
-
-function Clear-TaskWorktreeCreationMarkerIfNoWorktree {
-    param(
-        [string]$Path,
-        [string]$Destination,
-        [switch]$GitStarted,
-        [string]$RepositoryPath,
-        [string]$Branch,
-        [bool]$BranchSnapshotAvailable,
-        [bool]$BranchExistedBefore,
-        [string]$BranchCommitBefore,
-        [string]$SourceCommit
-    )
-
-    # A missing destination proves nothing on its own: Git can leave a task
-    # branch and/or a worktree registration behind without the directory.
-    # Before any Git process starts there is nothing to prove; afterwards the
-    # marker may only go when every piece of state reads back as absent. An
-    # unreadable state is unknown and keeps the marker.
-    if (Test-Path -LiteralPath $Destination) { return }
-    if (-not $GitStarted) {
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-        return
-    }
-
-    if ((Test-TaskWorktreeRegistration -RepositoryPath $RepositoryPath -WorktreePath $Destination) -ne $false) { return }
-
-    # Only a pre-Git snapshot can distinguish a branch this attempt created from
-    # one that already existed or a concurrent creator's branch. Without it,
-    # nothing explains the branch and the marker stays.
-    if (-not $BranchSnapshotAvailable) { return }
-    try {
-        $branchSnapshot = Get-TaskGitRefCommit -RepositoryPath $RepositoryPath -Reference "refs/heads/$Branch"
-    }
-    catch { return }
-
-    if ($branchSnapshot.Exists) {
-        if (-not $branchSnapshot.Commit) { return }
-        if ($BranchExistedBefore) {
-            # An attach plan leaves its existing branch untouched.
-            if ($BranchCommitBefore -and $branchSnapshot.Commit -ceq $BranchCommitBefore) {
-                Remove-Item -LiteralPath $Path -Force
-            }
-            return
-        }
-        # A branch that did not exist before this attempt is safe to attach only
-        # when it is exactly the reviewed commit; a fresh plan then reuses it.
-        # Anything else is an unexplained state and keeps the marker.
-        if ($SourceCommit -and $branchSnapshot.Commit -ceq $SourceCommit) {
-            Remove-Item -LiteralPath $Path -Force
-        }
-        return
-    }
-
-    if ($BranchExistedBefore) { return }
-    Remove-Item -LiteralPath $Path -Force
-}
-
 function Get-TaskRemoteTrackingBranchName {
     param([string]$Reference)
 
@@ -363,9 +211,10 @@ function Get-TaskBranchAutoSetupMerge {
     if ($result.ExitCode -ne 0) {
         throw "cannot read branch.autoSetupMerge for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
     }
-    $value = ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
-    if ([string]::IsNullOrWhiteSpace($value)) { return 'true' }
-    return $value.ToLowerInvariant()
+    $raw = [string](@($result.Output -split "`r?`n") | Select-Object -First 1)
+    # An explicitly empty value is boolean false to Git, not the implicit default.
+    if ($raw -ceq '') { return 'false' }
+    return $raw.Trim().ToLowerInvariant()
 }
 
 function Resolve-TaskSymbolicRef {
@@ -424,6 +273,23 @@ function Get-TaskNewBranchUpstreamRef {
     throw "unsupported branch.autoSetupMerge value '$mode' for '$RepositoryPath'"
 }
 
+function Get-TaskExistingBranchUpstreamRef {
+    param([string]$RepositoryPath, [string]$Branch)
+
+    # An existing task branch should track the task's remote ref when that ref is
+    # readable: that is the upstream a tracking add would have set, so a retry
+    # can repair a lost or wrong one. Otherwise keep whatever the branch already
+    # tracks, and expect nothing when it tracks nothing.
+    $remoteRef = "refs/remotes/origin/$Branch"
+    try {
+        $remote = Get-TaskGitRefCommit -RepositoryPath $RepositoryPath -Reference $remoteRef
+        if ($remote.Exists -and $remote.Commit) { return $remoteRef }
+    }
+    catch { }
+    try { return Get-TaskRefUpstreamRef -RepositoryPath $RepositoryPath -Reference "refs/heads/$Branch" }
+    catch { return $null }
+}
+
 function Enter-TaskMutationLock {
     param([string]$TasksRoot)
 
@@ -480,19 +346,22 @@ function New-TaskWorktreePlan {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
     }
-    # A marker outlives an interrupted or failed creation. It must win over the
-    # destination check: a partially created worktree can look like a healthy
-    # one, and reusing it would silently accept a half-applied plan.
-    $markerPath = Get-TaskWorktreeCreationMarkerPath -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $Repository.Name
-    if (Test-Path -LiteralPath $markerPath -PathType Leaf) {
-        return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'incomplete-worktree-creation'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
-    }
     if (Test-Path -LiteralPath $destination) {
-        if (Test-TaskWorktreeIdentity -RepositoryPath $repositoryPath -WorktreePath $destination -Branch $Repository.Branch -ExpectedCommonDir $repositoryCommonDir) {
-            $reuseCommit = (Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference "refs/heads/$($Repository.Branch)").Commit
-            return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $reuseCommit; RepositoryCommonDir = $repositoryCommonDir; WorktreeGitDir = (Get-GitDir -RepositoryPath $destination); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        # Reuse is proved at reuse time: the destination is this repository's
+        # worktree, on the requested branch, with a readable branch tip. The
+        # branch tip is bound into the plan, so apply can verify it later.
+        if (-not (Test-TaskWorktreeIdentity -RepositoryPath $repositoryPath -WorktreePath $destination -Branch $Repository.Branch -ExpectedCommonDir $repositoryCommonDir)) {
+            return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'destination-exists'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
-        return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'destination-exists'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        $reuseSnapshot = $null
+        try {
+            $reuseSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference "refs/heads/$($Repository.Branch)"
+        }
+        catch { $reuseSnapshot = $null }
+        if (-not $reuseSnapshot -or -not $reuseSnapshot.Exists -or -not $reuseSnapshot.Commit) {
+            return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'reuse-unreadable'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
+        return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $reuseSnapshot.Commit; UpstreamRef = (Get-TaskExistingBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); RepositoryCommonDir = $repositoryCommonDir; WorktreeGitDir = (Get-GitDir -RepositoryPath $destination); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     # Every create operation binds an immutable commit. Apply starts the branch
@@ -507,7 +376,7 @@ function New-TaskWorktreePlan {
             if (-not $localSnapshot.Commit -or $localSnapshot.Commit -cne $startCommit) {
                 return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-mismatch'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
             }
-            return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $startCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+            return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $startCommit; UpstreamRef = (Get-TaskExistingBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
 
         $remoteSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $remoteBranchRef
@@ -526,7 +395,7 @@ function New-TaskWorktreePlan {
         if (-not $localSnapshot.Commit) {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localSnapshot.Commit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localSnapshot.Commit; UpstreamRef = (Get-TaskExistingBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     # Resolve the remote branch only through its exact ref: the shorthand
@@ -701,6 +570,68 @@ function Start-TaskWorktreeGitProcess {
     return [System.Diagnostics.Process]::Start($startInfo)
 }
 
+function Assert-TaskWorktreeBranchState {
+    param(
+        [string]$RepositoryName,
+        [string]$WorktreePath,
+        [string]$Branch,
+        [string]$ExpectedCommit,
+        [string]$UpstreamRef,
+        [switch]$RepairUpstream
+    )
+
+    # Branch tip first: the branch must be at the reviewed commit, read exactly.
+    $expectedHeadRef = "refs/heads/$Branch"
+    $tip = $null
+    try { $tip = Get-TaskGitRefCommit -RepositoryPath $WorktreePath -Reference $expectedHeadRef }
+    catch { $tip = $null }
+    if (-not $tip -or -not $tip.Exists -or -not $tip.Commit) {
+        throw "cannot verify the branch tip '$expectedHeadRef' for '$RepositoryName' at '$WorktreePath'"
+    }
+    if ($ExpectedCommit -and $tip.Commit -cne $ExpectedCommit) {
+        throw "branch '$Branch' tip '$($tip.Commit)' for '$RepositoryName' is not the reviewed commit '$ExpectedCommit'"
+    }
+
+    $headRef = Get-TaskImmediateHeadRef -RepositoryPath $WorktreePath
+    if (-not $headRef) {
+        throw "worktree for '$RepositoryName' has a detached HEAD instead of '$expectedHeadRef'"
+    }
+    if ($headRef -cne $expectedHeadRef) {
+        throw "worktree HEAD for '$RepositoryName' is on '$headRef' instead of '$expectedHeadRef'"
+    }
+
+    if (-not $UpstreamRef) { return }
+
+    $readBack = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('for-each-ref', '--format=%(upstream)', $expectedHeadRef) -NoLazyFetch
+    if ($readBack.ExitCode -ne 0) {
+        throw "cannot verify the upstream for '$RepositoryName': $(Get-TaskGitDiagnostic -Text $readBack.Text)"
+    }
+    $actualUpstream = ([string](@($readBack.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+    if ((Resolve-TaskRefTarget -RepositoryPath $WorktreePath -Reference $actualUpstream) -ceq
+        (Resolve-TaskRefTarget -RepositoryPath $WorktreePath -Reference $UpstreamRef)) {
+        return
+    }
+    if (-not $RepairUpstream) {
+        throw "branch '$Branch' for '$RepositoryName' tracks '$actualUpstream' instead of '$UpstreamRef'"
+    }
+
+    $setResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('branch', "--set-upstream-to=$UpstreamRef", $Branch)
+    if ($setResult.ExitCode -ne 0) {
+        $detail = Get-TaskGitDiagnostic -Text $setResult.Text
+        if ($detail) { throw "git branch --set-upstream-to failed for '$RepositoryName': $detail" }
+        throw "git branch --set-upstream-to failed for '$RepositoryName'"
+    }
+    $readBack = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('for-each-ref', '--format=%(upstream)', $expectedHeadRef) -NoLazyFetch
+    if ($readBack.ExitCode -ne 0) {
+        throw "cannot verify the upstream for '$RepositoryName': $(Get-TaskGitDiagnostic -Text $readBack.Text)"
+    }
+    $actualUpstream = ([string](@($readBack.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+    if ((Resolve-TaskRefTarget -RepositoryPath $WorktreePath -Reference $actualUpstream) -cne
+        (Resolve-TaskRefTarget -RepositoryPath $WorktreePath -Reference $UpstreamRef)) {
+        throw "branch '$Branch' for '$RepositoryName' tracks '$actualUpstream' instead of '$UpstreamRef'"
+    }
+}
+
 function Invoke-TaskWorktreePlan {
     [CmdletBinding()]
     param(
@@ -723,6 +654,17 @@ function Invoke-TaskWorktreePlan {
             -not (Test-TaskWorktreeIdentity -RepositoryPath $repositoryPath -WorktreePath $Plan.Destination -Branch $Plan.Source -ExpectedCommonDir $Plan.RepositoryCommonDir -ExpectedGitDir $Plan.WorktreeGitDir)) {
             throw "reused worktree changed since planning: '$($Plan.Destination)'"
         }
+        $reuseCommit = if ($Plan.PSObject.Properties['SourceCommit']) { [string]$Plan.SourceCommit } else { $null }
+        if ([string]::IsNullOrWhiteSpace($reuseCommit)) {
+            throw "cannot verify the reused worktree for '$($Repository.Name)': no reviewed branch tip was bound"
+        }
+        $reuseUpstream =
+            if ($Plan.PSObject.Properties['UpstreamRef'] -and $Plan.UpstreamRef) { [string]$Plan.UpstreamRef }
+            else { $null }
+        # The branch tip and the immediate HEAD target must already be right; the
+        # only repairable mismatch is a lost or wrong upstream. A retry after a
+        # failed attach or set-upstream therefore heals instead of stranding.
+        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Plan.Source -ExpectedCommit $reuseCommit -UpstreamRef $reuseUpstream -RepairUpstream
         return
     }
     if (Test-Path -LiteralPath $Plan.Destination) {
@@ -744,36 +686,8 @@ function Invoke-TaskWorktreePlan {
         else { throw "unsupported worktree action '$($Plan.Action)'" }
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $Plan.Destination) -Force | Out-Null
-    $markerPath = Get-TaskWorktreeCreationMarkerPath -TasksRoot $Plan.TasksRoot -TaskKey $Plan.TaskKey -RepositoryName $Repository.Name
-    try {
-        # Durable and exclusive before any Git side effect: an interruption at
-        # any later point leaves a marker that blocks a blind retry.
-        New-TaskWorktreeCreationMarker -Path $markerPath -Plan $Plan -Branch $Repository.Branch
-    }
-    catch {
-        throw "worktree creation for '$($Repository.Name)' is incomplete at '$($Plan.Destination)'; inspect it and remove '$markerPath' only after recovery: $($_.Exception.Message)"
-    }
-
-    # Snapshot the task branch immediately before the gated start. After a
-    # failure, only this pre-existing state can prove whether a branch found
-    # afterwards belongs to this attempt.
-    $branchRef = "refs/heads/$($Repository.Branch)"
-    $branchBefore = $null
-    try { $branchBefore = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $branchRef }
-    catch { $branchBefore = $null }
-    $branchSnapshotAvailable = $null -ne $branchBefore
-    $branchExistedBefore = [bool]($branchSnapshotAvailable -and $branchBefore.Exists)
-    $branchCommitBefore = if ($branchExistedBefore) { [string]$branchBefore.Commit } else { $null }
-
-    try {
-        $process = Start-TaskWorktreeGitProcess -RepositoryPath $repositoryPath -Arguments $gitArguments -State $State -Gate $Gate
-    }
-    catch {
-        Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
-        throw
-    }
+    $process = Start-TaskWorktreeGitProcess -RepositoryPath $repositoryPath -Arguments $gitArguments -State $State -Gate $Gate
     if ($null -eq $process) {
-        Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
         return $false
     }
     # Native stderr becomes a terminating error inside a parallel runspace, so
@@ -785,7 +699,6 @@ function Invoke-TaskWorktreePlan {
         $process.WaitForExit()
         $gitText = $standardError.GetAwaiter().GetResult() + $standardOutput.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchSnapshotAvailable $branchSnapshotAvailable -BranchExistedBefore $branchExistedBefore -BranchCommitBefore $branchCommitBefore -SourceCommit $sourceCommit
             $detail = Get-TaskGitDiagnostic -Text $gitText
             if ($detail) { throw "git worktree add failed for '$($Repository.Name)': $detail" }
             throw "git worktree add failed for '$($Repository.Name)'"
@@ -795,69 +708,16 @@ function Invoke-TaskWorktreePlan {
         $process.Dispose()
     }
 
-    if ($sourceCommit) {
-        $headResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('rev-parse', 'HEAD^{commit}') -NoLazyFetch
-        if ($headResult.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchSnapshotAvailable $branchSnapshotAvailable -BranchExistedBefore $branchExistedBefore -BranchCommitBefore $branchCommitBefore -SourceCommit $sourceCommit
-            $detail = Get-TaskGitDiagnostic -Text $headResult.Text
-            if ($detail) { throw "cannot verify the new worktree HEAD for '$($Repository.Name)': $detail" }
-            throw "cannot verify the new worktree HEAD for '$($Repository.Name)'"
-        }
-        $head = ([string](@($headResult.Output -split "`r?`n") | Select-Object -First 1)).Trim()
-        if ($head -cne $sourceCommit) {
-            throw "worktree HEAD '$head' for '$($Repository.Name)' is not the reviewed commit '$sourceCommit'"
-        }
-    }
-
-    # A commit match alone cannot prove the task branch is checked out: a hook
-    # can detach HEAD or switch to another branch at the same commit. The
-    # immediate target matters: a task branch may itself be a symbolic alias,
-    # and a recursive read would compare the alias's target instead.
-    $headRefResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('symbolic-ref', '-q', '--no-recurse', 'HEAD') -NoLazyFetch
-    if ($headRefResult.ExitCode -ne 0 -and ($headRefResult.Text -match 'unknown option|unrecognized option')) {
-        # Git without --no-recurse: the recursive form is the only read left.
-        $headRefResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('symbolic-ref', '-q', 'HEAD') -NoLazyFetch
-    }
-    $expectedHeadRef = "refs/heads/$($Repository.Branch)"
-    if ($headRefResult.ExitCode -ne 0) {
-        throw "worktree for '$($Repository.Name)' has a detached HEAD instead of '$expectedHeadRef'"
-    }
-    $headRef = ([string](@($headRefResult.Output -split "`r?`n") | Select-Object -First 1)).Trim()
-    if ($headRef -cne $expectedHeadRef) {
-        throw "worktree HEAD for '$($Repository.Name)' is on '$headRef' instead of '$expectedHeadRef'"
-    }
-
     # A tracking plan always keeps its upstream on the full, unambiguous remote
     # ref. A new branch from a remote-tracking base carries the decision git
     # itself would have made from branch.autoSetupMerge, resolved at plan time
-    # and bound into the identity.
+    # and bound into the identity. An attach plan expects the task's remote ref
+    # when it exists, so a failed tracking add is repaired on retry.
     $upstreamRef =
         if ($Plan.Action -eq 'create-remote') { "refs/remotes/origin/$($Repository.Branch)" }
         elseif ($Plan.PSObject.Properties['UpstreamRef'] -and $Plan.UpstreamRef) { [string]$Plan.UpstreamRef }
         else { $null }
-    if ($upstreamRef) {
-        $upstreamResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('branch', "--set-upstream-to=$upstreamRef", $Repository.Branch)
-        if ($upstreamResult.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchSnapshotAvailable $branchSnapshotAvailable -BranchExistedBefore $branchExistedBefore -BranchCommitBefore $branchCommitBefore -SourceCommit $sourceCommit
-            $detail = Get-TaskGitDiagnostic -Text $upstreamResult.Text
-            if ($detail) { throw "git branch --set-upstream-to failed for '$($Repository.Name)': $detail" }
-            throw "git branch --set-upstream-to failed for '$($Repository.Name)'"
-        }
-        $upstreamReadBack = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('for-each-ref', '--format=%(upstream)', "refs/heads/$($Repository.Branch)") -NoLazyFetch
-        if ($upstreamReadBack.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchSnapshotAvailable $branchSnapshotAvailable -BranchExistedBefore $branchExistedBefore -BranchCommitBefore $branchCommitBefore -SourceCommit $sourceCommit
-            $detail = Get-TaskGitDiagnostic -Text $upstreamReadBack.Text
-            if ($detail) { throw "cannot verify the upstream for '$($Repository.Name)': $detail" }
-            throw "cannot verify the upstream for '$($Repository.Name)'"
-        }
-        $actualUpstream = ([string](@($upstreamReadBack.Output -split "`r?`n") | Select-Object -First 1)).Trim()
-        if ($actualUpstream -cne $upstreamRef) {
-            throw "created branch for '$($Repository.Name)' tracks '$actualUpstream' instead of '$upstreamRef'"
-        }
-    }
-
-    # Every required check passed; the destination is complete.
-    Remove-Item -LiteralPath $markerPath -Force
+    Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -UpstreamRef $upstreamRef -RepairUpstream
     return $true
 }
 
@@ -957,4 +817,4 @@ function Invoke-TaskWorktreePlanBatch {
     return ,@($parallelResults | Sort-Object Index)
 }
 
-Export-ModuleMember -Function Enter-TaskMutationLock, Resolve-TaskRepositoryPath, Get-GitCommitWithoutLazyFetch, Get-TaskGitRefCommit, Invoke-TaskWorktreeGitCommand, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Start-TaskWorktreeGitProcess, Set-TaskWorktreeFailure, Get-TaskWorktreeCreationMarkerPath, Test-TaskWorktreeMarkerName
+Export-ModuleMember -Function Enter-TaskMutationLock, Resolve-TaskRepositoryPath, Get-GitCommitWithoutLazyFetch, Get-TaskGitRefCommit, Invoke-TaskWorktreeGitCommand, Get-GitCommonDir, Get-GitDir, Get-TaskImmediateHeadRef, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Start-TaskWorktreeGitProcess, Set-TaskWorktreeFailure

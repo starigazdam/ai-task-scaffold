@@ -332,17 +332,16 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         $results.Index | Should -Be @(0, 1)
         $results.Status | Should -Be @('created', 'failed')
         $results[1].Message | Should -Match 'git worktree add failed'
-        $secondMarker = Get-TaskWorktreeCreationMarkerPath -TasksRoot $tasksRoot -TaskKey 'CONCURRENCY-1' -RepositoryName 'two'
-        Test-Path -LiteralPath $secondMarker | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $tasksRoot 'CONCURRENCY-1/worktrees/two') | Should -BeFalse
+        @(Get-ChildItem -LiteralPath (Join-Path $tasksRoot 'CONCURRENCY-1/worktrees') -Force).Count |
+            Should -Be 1 -Because 'a failed add must not leave scaffold state behind'
 
         # The existing branch is exactly the reviewed commit, so a fresh plan
-        # must not be blocked by the marker. Git itself still refuses a second
-        # checkout of a branch already used by the first worktree.
+        # attaches it. Git itself still refuses a second checkout of a branch
+        # already used by the first worktree.
         $retry = New-TaskWorktreePlan -Repository $second -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
         $retry.Action | Should -Be 'create-local'
         $retry.BranchMode | Should -Be 'existing'
-        Test-Path -LiteralPath $secondMarker | Should -BeFalse
     }
 
     It 'keeps the serial behavior and message when the limit is one' {

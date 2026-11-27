@@ -78,7 +78,8 @@ function Get-TaskRepositoryIdentity {
             # Read-only: a partial clone must not fetch just to answer this lookup.
             $headResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $operation.Destination -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD^{commit}') -NoLazyFetch
             $head = if ($headResult.ExitCode -eq 0) { ([string](@($headResult.Output -split "`r?`n") | Select-Object -First 1)).Trim() } else { $null }
-            $branch = & git -C $operation.Destination branch --show-current 2>$null
+            # HEAD's immediate target, not a recursive alias resolution.
+            $branch = Get-TaskImmediateHeadRef -RepositoryPath $operation.Destination
             $worktree = [ordered]@{
                 CommonDir = Get-PlanGitCommonDir -RepositoryPath $operation.Destination
                 GitDir = Get-PlanGitDir -RepositoryPath $operation.Destination

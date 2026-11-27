@@ -1717,43 +1717,6 @@ Describe 'Invoke-TaskScaffold worktree creation recovery' {
             } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -NoNewline
         }
 
-        function Get-ScaffoldMarkerPath {
-            param([string]$TasksRoot, [string]$RepositoryName)
-
-            $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
-                [Text.Encoding]::UTF8.GetBytes($RepositoryName))).ToLowerInvariant()
-            return Join-Path $TasksRoot "FEATURE-123/worktrees/$markerName"
-        }
-    }
-
-    It 'refuses a fresh review and apply of an incomplete worktree creation' {
-        $root = New-ScaffoldCaseRoot
-        $repositoryPath = Join-Path $root 'api'
-        New-Item -ItemType Directory -Path $repositoryPath -Force | Out-Null
-        & git -C $repositoryPath init -b main | Out-Null
-        & git -C $repositoryPath config user.name Test
-        & git -C $repositoryPath config user.email test@example.invalid
-        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
-        & git -C $repositoryPath add README.md
-        & git -C $repositoryPath commit -m fixture | Out-Null
-
-        $requestPath = Join-Path $root 'request.json'
-        Write-ScaffoldRecoveryRequest -Path $requestPath -RepositoryPath $repositoryPath
-        $tasksRoot = Join-Path $root 'tasks'
-        $worktreesPath = Join-Path $tasksRoot 'FEATURE-123/worktrees'
-        New-Item -ItemType Directory -Path $worktreesPath -Force | Out-Null
-        $markerPath = Get-ScaffoldMarkerPath -TasksRoot $tasksRoot -RepositoryName 'api'
-        '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
-        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
-
-        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
-
-        $plan.WorktreeOperations[0].Action | Should -Be 'blocked'
-        $plan.WorktreeOperations[0].Reason | Should -Be 'incomplete-worktree-creation'
-        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } |
-            Should -Throw '*incomplete-worktree-creation*'
-        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/task.json') | Should -BeFalse
-        Test-Path -LiteralPath $markerPath | Should -BeTrue
     }
 
     It 'applies a remote-base branch with native tracking and the unchanged public shape' {
@@ -1776,14 +1739,13 @@ Describe 'Invoke-TaskScaffold worktree creation recovery' {
         $destination = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
         (& git -C $destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
         (& git -C $destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -Be 'refs/remotes/origin/main'
-        Test-Path -LiteralPath (Get-ScaffoldMarkerPath -TasksRoot $tasksRoot -RepositoryName 'api') | Should -BeFalse
 
         $reuse = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
         $reuse.WorktreeOperations[0].Action | Should -Be 'reuse'
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $reuse.PlanIdentity } | Should -Not -Throw
     }
 
-    It 'plans and applies a 250-character repository name without exceeding the marker component limit' {
+    It 'plans and applies a 250-character repository name' {
         $root = New-ScaffoldCaseRoot
         $repositoryPath = Join-Path $root 'repo'
         New-Item -ItemType Directory -Path $repositoryPath -Force | Out-Null
@@ -1802,14 +1764,14 @@ Describe 'Invoke-TaskScaffold worktree creation recovery' {
         $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
 
         $plan.WorktreeOperations[0].Action | Should -Be 'create-local'
-        $markerPath = Get-ScaffoldMarkerPath -TasksRoot $tasksRoot -RepositoryName $name
-        [IO.Path]::GetFileName($markerPath).Length | Should -BeLessOrEqual 255
         & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity | Out-Null
 
         $destination = Join-Path $tasksRoot "FEATURE-123/worktrees/$name"
         Test-Path -LiteralPath (Join-Path $destination '.git') | Should -BeTrue
         (& git -C $destination branch --show-current) | Should -Be 'feature/FEATURE-123'
-        Test-Path -LiteralPath $markerPath | Should -BeFalse
+
+        $reuse = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $reuse.WorktreeOperations[0].Action | Should -Be 'reuse'
     }
 
     It 'invalidates a reviewed plan when branch.autoSetupMerge changes' {

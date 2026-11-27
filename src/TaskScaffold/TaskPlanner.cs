@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -469,18 +468,29 @@ public static class TaskPlanner
             return Blocked(repository, destination, "start-commit-missing", commonDir, head);
         }
 
-        // A creation marker outlives a failed or interrupted worktree add and
-        // must win over the destination check, exactly as in the PowerShell plan.
-        if (WorktreeCreationMarkerExists(tasksRoot, taskKey, repository.Name))
-        {
-            return Blocked(repository, destination, "incomplete-worktree-creation", commonDir, head);
-        }
-
         if (TryGetAttributes(destination, out var destinationAttributes))
         {
             if ((destinationAttributes & FileAttributes.Directory) != 0 && IsMatchingWorktree(repository.Path, destination, repository.Branch, commonDir))
             {
+                // Reuse is proved at reuse time: the destination is this
+                // repository's worktree, on the requested branch, with a readable
+                // branch tip. An unreadable tip blocks instead of reusing blind.
                 var reuseRef = $"refs/heads/{repository.Branch}";
+                var reuseTip = (Exists: false, Commit: (string?)null);
+                try
+                {
+                    reuseTip = ReadRefTip(repository.Path, reuseRef);
+                }
+                catch (OperationalException)
+                {
+                    return Blocked(repository, destination, "reuse-unreadable", commonDir, head);
+                }
+
+                if (!reuseTip.Exists || reuseTip.Commit is null)
+                {
+                    return Blocked(repository, destination, "reuse-unreadable", commonDir, head);
+                }
+
                 return new PlannedOperation
                 {
                     Operation = new WorktreeOperation
@@ -495,7 +505,7 @@ public static class TaskPlanner
                     CommonDir = commonDir,
                     Head = head,
                     SourceRef = reuseRef,
-                    SourceCommit = ReadRefTip(repository.Path, reuseRef).Commit,
+                    SourceCommit = reuseTip.Commit,
                     DestinationIdentity = GetGitDir(destination),
                 };
             }
@@ -751,10 +761,42 @@ public static class TaskPlanner
         return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
     }
 
-    private static string? GetBranch(string repositoryPath)
+    private static string? GetImmediateHeadRef(string repositoryPath)
     {
-        var result = RunGit(repositoryPath, "branch", "--show-current");
-        return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
+        // HEAD's immediate target, never a recursive alias resolution: a task
+        // branch may itself be a symbolic alias, and an indirect alias that only
+        // resolves to the requested branch is not that branch.
+        var result = RunGit(repositoryPath, "symbolic-ref", "-q", "--no-recurse", "HEAD");
+        if (result.ExitCode == 0)
+        {
+            return FirstLine(result.StdOut);
+        }
+
+        if (result.StdErr.Contains("unknown option", StringComparison.Ordinal) ||
+            result.StdErr.Contains("unrecognized option", StringComparison.Ordinal))
+        {
+            throw new OperationalException(
+                $"cannot read the immediate HEAD target in '{repositoryPath}': this Git does not support 'symbolic-ref --no-recurse'; refusing to resolve HEAD recursively (Git 2.46 or later is required)");
+        }
+
+        return null;
+    }
+
+    private static bool IsMatchingWorktree(string repositoryPath, string destination, string branch, string commonDir)
+    {
+        if (string.IsNullOrEmpty(commonDir))
+        {
+            return false;
+        }
+
+        var destinationCommonDir = GetCommonDir(destination);
+        if (destinationCommonDir is null || !string.Equals(destinationCommonDir, commonDir, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var destinationHeadRef = GetImmediateHeadRef(destination);
+        return string.Equals(destinationHeadRef, $"refs/heads/{branch}", StringComparison.Ordinal);
     }
 
     private static string? ResolveCommit(string repositoryPath, string reference)
@@ -838,39 +880,6 @@ public static class TaskPlanner
 
         var commit = FirstLine(verify.StdOut);
         return (true, string.Equals(commit, objectId, StringComparison.Ordinal) ? objectId : null);
-    }
-
-    private static bool IsMatchingWorktree(string repositoryPath, string destination, string branch, string commonDir)
-    {
-        if (string.IsNullOrEmpty(commonDir))
-        {
-            return false;
-        }
-
-        var destinationCommonDir = GetCommonDir(destination);
-        if (destinationCommonDir is null || !string.Equals(destinationCommonDir, commonDir, StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        var destinationBranch = GetBranch(destination);
-        return string.Equals(destinationBranch, branch, StringComparison.Ordinal);
-    }
-
-    private static bool WorktreeCreationMarkerExists(string tasksRoot, string taskKey, string repositoryName)
-    {
-        // The marker lives in the scaffold-owned worktrees container, whose
-        // safety the destination check above already established. Its name is
-        // a fixed prefix plus a hash of the repository name, because every name
-        // TaskContract accepts must still fit one filesystem component.
-        var markerPath = Path.Combine(tasksRoot, taskKey, "worktrees", WorktreeMarkerName(repositoryName));
-        return TryGetAttributes(markerPath, out var attributes) && (attributes & FileAttributes.Directory) == 0;
-    }
-
-    private static string WorktreeMarkerName(string repositoryName)
-    {
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(repositoryName))).ToLowerInvariant();
-        return ".ai-task-scaffold-incomplete." + hash;
     }
 
     private static bool HasUnsafePathComponent(string tasksRoot, string taskKey, string repositoryName)
