@@ -352,18 +352,54 @@ Describe 'New-TaskWorktreePlan start commit' {
         $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit')
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Older }
         $tasksRoot = Join-Path $TestDrive 'workspace-start-commit'
+        $noLazyFetchBefore = [Environment]::GetEnvironmentVariable('GIT_NO_LAZY_FETCH')
 
         $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
 
         $plan.Action | Should -Be 'create-local'
         $plan.Source | Should -Be $fixture.Older
         $plan.BranchMode | Should -Be 'new'
+        [Environment]::GetEnvironmentVariable('GIT_NO_LAZY_FETCH') | Should -Be $noLazyFetchBefore -Because 'the fetch guard must not leak into worktree add'
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
         Test-Path -LiteralPath $plan.Destination | Should -BeTrue
         (& git -C $fixture.Path rev-parse 'feature/FEATURE-123').Trim() | Should -Be $fixture.Older
         (& git -C $fixture.Path rev-parse 'main').Trim() | Should -Be $fixture.Head
+    }
+
+    It 'scopes the no-lazy-fetch guard to read-only git calls' -Skip:(-not $IsLinux) {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-no-lazy-fetch')
+        $logPath = Join-Path $TestDrive 'no-lazy-fetch.log'
+        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+        $shimDir = Join-Path $TestDrive 'no-lazy-fetch-shim'
+        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+        $shimPath = Join-Path $shimDir 'git'
+        @(
+            '#!/bin/sh'
+            "REAL_GIT='$realGit'"
+            "LOG='$logPath'"
+            'case " $* " in'
+            '  *" rev-parse --verify "*) echo "verify ${GIT_NO_LAZY_FETCH:-unset}" >> "$LOG" ;;'
+            '  *" worktree add "*) echo "add ${GIT_NO_LAZY_FETCH:-unset}" >> "$LOG" ;;'
+            'esac'
+            'exec "$REAL_GIT" "$@"'
+        ) | Set-Content -LiteralPath $shimPath
+        & chmod +x $shimPath
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Older }
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-no-lazy-fetch')
+            Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+        }
+        finally { $env:PATH = $savedPath }
+
+        $log = @(Get-Content -LiteralPath $logPath)
+        $log | Should -Contain 'verify 1'
+        $log | Should -Contain 'add unset'
+        @($log | Where-Object { $_ -cne 'verify 1' -and $_ -cne 'add unset' }) | Should -BeNullOrEmpty -Because 'only the read-only resolution is guarded, never the checkout'
     }
 
     It 'blocks a start commit that is missing locally' {
@@ -398,5 +434,197 @@ Describe 'New-TaskWorktreePlan start commit' {
         $plan.Action | Should -Be 'create-local'
         $plan.Source | Should -Be 'feature/FEATURE-123'
         $plan.BranchMode | Should -Be 'existing'
+    }
+
+    It 'blocks a missing start commit before reusing a matching worktree' {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit-reuse-missing')
+        $tasksRoot = Join-Path $TestDrive 'workspace-start-commit-reuse-missing'
+        & git -C $fixture.Path worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = ('a' * 40) }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'reuses a matching worktree when a valid start commit is supplied' {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit-reuse-valid')
+        $tasksRoot = Join-Path $TestDrive 'workspace-start-commit-reuse-valid'
+        & git -C $fixture.Path worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Older }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+
+        $plan.Action | Should -Be 'reuse'
+        $plan.Source | Should -Be 'feature/FEATURE-123'
+    }
+
+    It 'plans and applies a tracking branch from the full remote ref' {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit-remote')
+        $remotePath = Join-Path $TestDrive 'api-start-commit-remote.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $fixture.Path remote add origin $remotePath
+        & git -C $fixture.Path push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
+        & git -C $fixture.Path fetch origin | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Head }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-start-commit-remote')
+
+        $plan.Action | Should -Be 'create-remote'
+        $plan.Source | Should -Be 'refs/remotes/origin/feature/FEATURE-123'
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        (& git -C $plan.Destination branch --show-current) | Should -Be 'feature/FEATURE-123'
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+    }
+}
+
+Describe 'Invoke-TaskWorktreePlan tracking start' {
+    BeforeAll {
+        function New-TrackingFixture {
+            param([string]$Path, [string]$RemotePath, [string]$Branch = 'feature/FEATURE-123')
+
+            New-Item -ItemType Directory -Path $Path | Out-Null
+            & git -C $Path init -b main | Out-Null
+            & git -C $Path config user.name Test
+            & git -C $Path config user.email test@example.invalid
+            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'first'
+            & git -C $Path add README.md
+            & git -C $Path commit -m first | Out-Null
+            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'second'
+            & git -C $Path commit -am second | Out-Null
+            $reviewed = (& git -C $Path rev-parse HEAD).Trim()
+
+            & git init --bare $RemotePath | Out-Null
+            & git -C $Path remote add origin $RemotePath
+            & git -C $Path push origin "main:refs/heads/$Branch" | Out-Null
+            & git -C $Path fetch origin | Out-Null
+
+            [pscustomobject]@{ Path = $Path; Remote = $RemotePath; Branch = $Branch; Reviewed = $reviewed }
+        }
+
+        function Move-TrackingBranch {
+            param([pscustomobject]$Fixture)
+
+            Set-Content -LiteralPath (Join-Path $Fixture.Path 'README.md') -Value 'third'
+            & git -C $Fixture.Path commit -am third | Out-Null
+            & git -C $Fixture.Path push origin "main:refs/heads/$($Fixture.Branch)" | Out-Null
+            & git -C $Fixture.Path fetch origin | Out-Null
+            return (& git -C $Fixture.Path rev-parse HEAD).Trim()
+        }
+    }
+
+    It 'creates a tracking branch at the reviewed commit when the remote ref moves after planning' {
+        $fixture = New-TrackingFixture -Path (Join-Path $TestDrive 'api-track-moved') -RemotePath (Join-Path $TestDrive 'api-track-moved.git')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch; StartCommit = $fixture.Reviewed }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-track-moved')
+
+        $plan.Action | Should -Be 'create-remote'
+        $plan.SourceCommit | Should -Be $fixture.Reviewed
+
+        $moved = Move-TrackingBranch -Fixture $fixture
+        $moved | Should -Not -Be $fixture.Reviewed
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        (& git -C $plan.Destination rev-parse "$($fixture.Branch)@{upstream}").Trim() | Should -Be $moved -Because 'the upstream stays on origin even though the branch starts at the reviewed commit'
+    }
+
+    It 'binds the remote commit without startCommit and still starts at it after the ref moves' {
+        $fixture = New-TrackingFixture -Path (Join-Path $TestDrive 'api-track-moved-none') -RemotePath (Join-Path $TestDrive 'api-track-moved-none.git')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-track-moved-none')
+
+        $plan.Action | Should -Be 'create-remote'
+        $plan.Source | Should -Be "origin/$($fixture.Branch)"
+        $plan.SourceCommit | Should -Be $fixture.Reviewed
+
+        $moved = Move-TrackingBranch -Fixture $fixture
+        $moved | Should -Not -Be $fixture.Reviewed
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+    }
+
+    It 'ignores a local branch named like the origin shorthand' {
+        $fixture = New-TrackingFixture -Path (Join-Path $TestDrive 'api-track-decoy') -RemotePath (Join-Path $TestDrive 'api-track-decoy.git')
+        Set-Content -LiteralPath (Join-Path $fixture.Path 'README.md') -Value 'decoy'
+        & git -C $fixture.Path commit -am decoy | Out-Null
+        $decoy = (& git -C $fixture.Path rev-parse HEAD).Trim()
+        & git -C $fixture.Path branch "origin/$($fixture.Branch)" $decoy | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-track-decoy')
+        $plan.Action | Should -Be 'create-remote'
+        $plan.SourceCommit | Should -Be $fixture.Reviewed -Because 'a local origin/<branch> branch must not redirect the start'
+
+        $startCommitRepository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch; StartCommit = $fixture.Reviewed }
+        $startCommitPlan = New-TaskWorktreePlan -Repository $startCommitRepository -TaskKey 'FEATURE-124' -TasksRoot (Join-Path $TestDrive 'workspace-track-decoy-start-commit')
+        $startCommitPlan.Action | Should -Be 'create-remote'
+        $startCommitPlan.SourceCommit | Should -Be $fixture.Reviewed
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Not -Be $decoy
+    }
+
+    It 'creates a local branch at the reviewed base commit when the base branch moves after planning' {
+        $repositoryPath = Join-Path $TestDrive 'api-base-moved'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'first'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m first | Out-Null
+        $reviewed = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-base-moved')
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.Source | Should -Be 'main'
+        $plan.SourceCommit | Should -Be $reviewed
+
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'moved'
+        & git -C $repositoryPath commit -am moved | Out-Null
+        $moved = (& git -C $repositoryPath rev-parse HEAD).Trim()
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $reviewed
+        (& git -C $repositoryPath rev-parse main).Trim() | Should -Be $moved
+    }
+
+    It 'refuses an existing branch that moved after planning' {
+        $repositoryPath = Join-Path $TestDrive 'api-existing-moved'
+        New-Item -ItemType Directory -Path $repositoryPath | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'first'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m first | Out-Null
+        $reviewed = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        & git -C $repositoryPath branch feature/FEATURE-123 $reviewed | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-existing-moved')
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'existing'
+        $plan.SourceCommit | Should -Be $reviewed
+
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'moved'
+        & git -C $repositoryPath commit -am moved | Out-Null
+        $moved = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        & git -C $repositoryPath branch -f feature/FEATURE-123 $moved | Out-Null
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*is not the reviewed commit*'
     }
 }

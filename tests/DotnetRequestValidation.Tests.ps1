@@ -331,6 +331,7 @@ Describe 'dotnet request validate' {
                 'ref name start commit'    = 'main'
                 'empty start commit'       = ''
                 'non-string start commit'  = 12
+                'boolean start commit'     = $true
             }
 
             $index = 0
@@ -343,6 +344,13 @@ Describe 'dotnet request validate' {
                 $run.StdErr | Should -Match 'invalid start commit' -Because "$name should name the start commit"
                 $index++
             }
+
+            $newlineRequest = New-BaseRequest -RepositoryPath $repository.FullName
+            $newlineRequest.repositories[0]['startCommit'] = "$valid`n"
+            $newlinePath = Write-Request -Path (Join-Path $root 'start-commit-newline.json') -Request $newlineRequest
+            $newlineRun = Invoke-RequestValidation -RequestPath $newlinePath
+            Assert-CommandFailure -Run $newlineRun -Case 'a start commit with a trailing newline'
+            $newlineRun.StdErr | Should -Match 'invalid start commit' -Because 'a trailing newline must not pass the object ID check'
         }
     }
 

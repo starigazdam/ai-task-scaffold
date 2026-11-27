@@ -250,7 +250,7 @@ public static class RequestValidator
                     var rawStartCommit = startCommitElement.ValueKind == JsonValueKind.String
                         ? startCommitElement.GetString() ?? string.Empty
                         : startCommitElement.GetRawText();
-                    if (!StartCommitPattern.IsMatch(rawStartCommit))
+                    if (startCommitElement.ValueKind != JsonValueKind.String || !StartCommitPattern.IsMatch(rawStartCommit))
                     {
                         throw new InputException($"invalid start commit '{rawStartCommit}' for repository '{name}': expected a full 40- or 64-character lowercase object ID");
                     }

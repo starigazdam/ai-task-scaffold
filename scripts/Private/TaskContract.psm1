@@ -339,9 +339,12 @@ function ConvertTo-TaskRequest {
         }
         $startCommitProperty = $repository.PSObject.Properties['startCommit']
         if ($startCommitProperty -and $null -ne $startCommitProperty.Value) {
-            $startCommit = [string]$startCommitProperty.Value
-            if ($startCommit -cnotmatch '^([0-9a-f]{40}|[0-9a-f]{64})$') {
-                throw "invalid start commit '$startCommit' for repository '$($repository.name)': expected a full 40- or 64-character lowercase object ID"
+            $startCommitError = "invalid start commit '$($startCommitProperty.Value)' for repository '$($repository.name)': expected a full 40- or 64-character lowercase object ID"
+            if ($startCommitProperty.Value -isnot [string]) {
+                throw $startCommitError
+            }
+            if ($startCommitProperty.Value -cnotmatch '\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z') {
+                throw $startCommitError
             }
         }
     }

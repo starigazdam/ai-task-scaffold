@@ -100,6 +100,106 @@ Describe 'Invoke-TaskScaffold' {
         $nonePlan.WorktreeOperations[0].Source | Should -Be 'main'
     }
 
+    It 'plans blocked worktree operations without failing the public dry run' {
+        $repositoryPath = Join-Path $TestDrive 'api-blocked-start-commit'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+        & git -C $repositoryPath commit -am 'advance main' | Out-Null
+        & git -C $repositoryPath branch task/FEATURE-123 | Out-Null
+
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $tasksRoot = Join-Path $TestDrive 'blocked-tasks'
+        $cases = @(
+            [pscustomobject]@{ Reason = 'start-commit-missing'; Branch = 'task/FEATURE-123'; BaseBranch = 'main'; StartCommit = ('a' * 40) }
+            [pscustomobject]@{ Reason = 'start-commit-mismatch'; Branch = 'task/FEATURE-123'; BaseBranch = 'main'; StartCommit = $older }
+            [pscustomobject]@{ Reason = 'base-branch-missing'; Branch = 'task/BLOCKED'; BaseBranch = 'release/9'; StartCommit = $null }
+        )
+
+        foreach ($case in $cases) {
+            $repository = [ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = $case.BaseBranch; branch = $case.Branch }
+            if ($case.StartCommit) { $repository['startCommit'] = $case.StartCommit }
+            $requestPath = Join-Path $TestDrive "blocked-$($case.Reason).json"
+            [ordered]@{
+                schemaVersion = 2
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+                repositories = @($repository)
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+
+            $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+            $plan.WorktreeOperations[0].Action | Should -Be 'blocked' -Because "$($case.Reason) must report a blocked operation"
+            $plan.WorktreeOperations[0].Reason | Should -Be $case.Reason
+            $plan.PlanIdentity | Should -Match '^[a-f0-9]{64}$'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+    }
+
+    It 'keeps a reuse plan at one start commit distinct from the same plan at another' {
+        $repositoryPath = Join-Path $TestDrive 'api-reuse-start-commit'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+        & git -C $repositoryPath commit -am 'advance main' | Out-Null
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $tasksRoot = Join-Path $TestDrive 'reuse-start-commit-tasks'
+        & git -C $repositoryPath worktree add -b task/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+
+        $requests = [ordered]@{}
+        foreach ($commit in @($older, $head)) {
+            $path = Join-Path $TestDrive "reuse-start-commit-$commit.json"
+            [ordered]@{
+                schemaVersion = 2
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+                repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123'; startCommit = $commit })
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -NoNewline
+            $requests[$commit] = $path
+        }
+
+        $olderPlan = & $script -RequestPath $requests[$older] -TasksRoot $tasksRoot | ConvertFrom-Json
+        $headPlan = & $script -RequestPath $requests[$head] -TasksRoot $tasksRoot | ConvertFrom-Json
+
+        $olderPlan.WorktreeOperations[0].Action | Should -Be 'reuse'
+        $headPlan.WorktreeOperations[0].Action | Should -Be 'reuse'
+        $headPlan.PlanIdentity | Should -Not -Be $olderPlan.PlanIdentity
+        { & $script -RequestPath $requests[$head] -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $olderPlan.PlanIdentity } | Should -Throw '*plan identity changed*'
+    }
+
+    It 'refuses a reviewed tracking plan after the remote branch moves' {
+        $repositoryPath = Join-Path $TestDrive 'api-tracking-moved'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $remotePath = Join-Path $TestDrive 'api-tracking-moved.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $repositoryPath remote add origin $remotePath
+        & git -C $repositoryPath push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
+        & git -C $repositoryPath fetch origin | Out-Null
+
+        $requestPath = Join-Path $TestDrive 'tracking-moved.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'feature/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $tasksRoot = Join-Path $TestDrive 'tracking-moved-tasks'
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $plan.WorktreeOperations[0].Action | Should -Be 'create-remote'
+        $plan.WorktreeOperations[0].Source | Should -Be 'origin/feature/FEATURE-123'
+        @($plan.WorktreeOperations[0].PSObject.Properties.Name | Sort-Object) |
+            Should -Be @('Action', 'BranchMode', 'Destination', 'Repository', 'Source', 'TaskKey', 'TasksRoot' | Sort-Object) -Because 'a tracking plan must keep the documented public shape without the internal source commit'
+
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'moved'
+        & git -C $repositoryPath commit -am moved | Out-Null
+        & git -C $repositoryPath push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
+        & git -C $repositoryPath fetch origin | Out-Null
+
+        { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*plan identity changed*'
+        Test-Path -LiteralPath $plan.WorktreeOperations[0].Destination | Should -BeFalse
+    }
+
     It 'rejects apply without a reviewed plan identity before creating task state' {
         $repositoryPath = Join-Path $TestDrive 'api-missing-plan-identity'
         New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath

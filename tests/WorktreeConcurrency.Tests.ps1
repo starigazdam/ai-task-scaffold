@@ -145,6 +145,38 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         }
     }
 
+    It 'creates a tracking branch at the planned commit through the batch runner' {
+        $case = New-ConcurrencyCaseRoot
+        $trackPath = Join-Path $case 'repos/track'
+        New-ConcurrencyFixtureRepository -RepositoryPath $trackPath
+        $reviewed = (& git -C $trackPath rev-parse HEAD).Trim()
+        $remotePath = Join-Path $case 'track.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $trackPath remote add origin $remotePath
+        & git -C $trackPath push origin 'main:refs/heads/feature/TRACK' | Out-Null
+        & git -C $trackPath fetch origin | Out-Null
+        $trackRepository = [pscustomobject]@{ Name = 'track'; Path = $trackPath; BaseBranch = 'main'; Branch = 'feature/TRACK' }
+        $trackPlan = New-TaskWorktreePlan -Repository $trackRepository -TaskKey 'CONCURRENCY-1' -TasksRoot (Join-Path $case 'tasks')
+
+        Set-Content -LiteralPath (Join-Path $trackPath 'README.md') -Value 'moved'
+        & git -C $trackPath commit -am moved | Out-Null
+        & git -C $trackPath push origin 'main:refs/heads/feature/TRACK' | Out-Null
+        & git -C $trackPath fetch origin | Out-Null
+
+        New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case 'repos/plain')
+        $items = @(
+            [pscustomobject]@{ Index = 0; Plan = $trackPlan; Repository = $trackRepository },
+            (New-WorkItem -CaseRoot $case -Name 'plain' -Index 1)
+        )
+
+        $results = Invoke-TaskWorktreePlanBatch -WorkItems $items -Limit 2 -ModulePath $modulePath
+
+        $results.Index | Should -Be @(0, 1)
+        $results.Status | Should -Be @('created', 'created')
+        (& git -C $trackPlan.Destination rev-parse HEAD).Trim() | Should -Be $reviewed
+        (& git -C $trackPlan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/TRACK').Trim() | Should -Be 'refs/remotes/origin/feature/TRACK'
+    }
+
     It 'runs independent repositories in parallel' -Skip:(-not $IsLinux) {
         $case = New-ConcurrencyCaseRoot
         $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'parallel.log')
@@ -249,9 +281,10 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         foreach ($name in $names) { New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case "repos/$name") }
         $items = @(for ($index = 0; $index -lt $names.Count; $index++) { New-WorkItem -CaseRoot $case -Name $names[$index] -Index $index })
 
-        # charlie (index 2) fails at once because its base branch is gone; alpha
-        # (index 0) fails after 0.6 s through the shim; bravo succeeds at 0.2 s.
-        & git -C (Join-Path $case 'repos/charlie') branch -m main main-renamed
+        # charlie (index 2) fails at once because its planned branch already
+        # exists; alpha (index 0) fails after 0.6 s through the shim; bravo
+        # succeeds at 0.2 s.
+        & git -C (Join-Path $case 'repos/charlie') branch 'feature/CONCURRENCY-2' | Out-Null
         $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'order.log')
         $savedPath = $env:PATH
         $env:PATH = "$($shim.Directory):$savedPath"

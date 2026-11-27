@@ -106,6 +106,10 @@ Each repository entry may include an optional `startCommit`. It must be a full l
 
 When `startCommit` is set, the scaffold verifies the commit exists locally and does not fetch. A missing commit blocks the plan with `start-commit-missing`. An existing local or `origin` branch for the requested branch must point at that commit, otherwise the plan is blocked with `start-commit-mismatch`. Otherwise the branch is created from the commit. Reusing an existing matching worktree is unchanged.
 
+Every plan pins the commit it resolved — including a tracking plan without `startCommit` — and binds that pin into `PlanIdentity`; it stays internal, so the public plan shape is unchanged. Apply creates the branch at the pinned commit rather than at the movable `origin/<branch>` ref, sets the upstream to the full `refs/remotes/origin/<branch>` ref, and verifies the new worktree HEAD equals the reviewed commit. A failed git command or verification stops apply; existing branches and worktrees are not deleted. Because the remote ref is always resolved through its full name, a local branch named `origin/<branch>` cannot redirect the start. Planning lookups are read-only: they resolve local objects only and never lazily fetch, and the guard is scoped to those git processes.
+
+The .NET CLI plans the worktree operation and binds the same internal pin into its plan identity without changing its plan output; the PowerShell scaffold applies it. The .NET CLI does not create worktrees.
+
 ## Reviewed Plan Identity
 
 Run `Invoke-TaskScaffold.ps1` without `-Apply` to receive the complete deterministic plan and its opaque `PlanIdentity` (a SHA-256 digest). To apply that exact reviewed plan, pass the identity back through the public script interface:

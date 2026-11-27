@@ -547,5 +547,16 @@ phases:
     }
 }
 
+# The reviewed identity binds each resolved source commit internally, and apply
+# starts from it. The public plan keeps its documented shape: strip the internal
+# pin from a copy so a consumer sees no new field, for dry run and apply alike.
+$publicWorktreeOperations = @($plan['WorktreeOperations'] | ForEach-Object {
+    $properties = [ordered]@{}
+    foreach ($property in $_.PSObject.Properties) {
+        if ($property.Name -cne 'SourceCommit') { $properties[$property.Name] = $property.Value }
+    }
+    [pscustomobject]$properties
+})
+$plan['WorktreeOperations'] = $publicWorktreeOperations
 $plan['PlanIdentity'] = $planIdentity
 $plan | ConvertTo-Json -Depth 8

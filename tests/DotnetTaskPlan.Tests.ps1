@@ -381,6 +381,70 @@ Describe 'dotnet task plan' {
             $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
             $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
         }
+
+        It 'blocks a missing start commit before reusing an existing worktree and reuses a valid one' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-reuse'
+            $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+            & git -C $repositoryPath commit -am 'advance main' | Out-Null
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit-reuse'
+            & git -C $repositoryPath worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+
+            $missing = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $missing.repositories[0]['startCommit'] = ('a' * 40)
+            $missingPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-missing.json') -Request $missing
+            $missingResult = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $missingPath -TasksRoot $tasksRoot) -Case 'missing start commit with an existing worktree'
+            $missingResult.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $missingResult.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+
+            $valid = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $valid.repositories[0]['startCommit'] = $older
+            $validPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-valid.json') -Request $valid
+            $validResult = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $validPath -TasksRoot $tasksRoot) -Case 'valid start commit with an existing worktree'
+            $validResult.plan.worktreeOperations[0].action | Should -Be 'reuse'
+            $validResult.plan.worktreeOperations[0].source | Should -Be 'feature/FEATURE-123'
+        }
+
+        It 'plans a tracking branch from the full remote ref when the start commit matches' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-remote'
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $remotePath = Join-Path $TestDrive 'api-start-commit-remote.git'
+            & git init --bare $remotePath | Out-Null
+            & git -C $repositoryPath remote add origin $remotePath
+            & git -C $repositoryPath push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
+            & git -C $repositoryPath fetch origin | Out-Null
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $request.repositories[0]['startCommit'] = $head
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-remote.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'tasks-start-commit-remote')) -Case 'remote start commit plan'
+
+            $result.plan.worktreeOperations[0].action | Should -Be 'create-remote'
+            $result.plan.worktreeOperations[0].source | Should -Be 'refs/remotes/origin/feature/FEATURE-123'
+            $result.plan.worktreeOperations[0].branchMode | Should -Be 'track'
+        }
+
+        It 'keeps a reuse plan at one start commit distinct from the same plan at another' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-identity'
+            $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+            & git -C $repositoryPath commit -am 'advance main' | Out-Null
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit-identity'
+            & git -C $repositoryPath worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+
+            $plans = @()
+            foreach ($commit in @($older, $head)) {
+                $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+                $request.repositories[0]['startCommit'] = $commit
+                $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive "task-request-identity-$commit.json") -Request $request
+                $plans += (Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case "reuse plan at $commit")
+            }
+
+            $plans[0].plan.worktreeOperations[0].action | Should -Be 'reuse'
+            $plans[1].plan.worktreeOperations[0].action | Should -Be 'reuse'
+            $plans[1].planIdentity | Should -Not -Be $plans[0].planIdentity
+        }
     }
 }
 

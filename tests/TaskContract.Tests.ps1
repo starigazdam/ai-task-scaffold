@@ -170,6 +170,24 @@ Describe 'ConvertTo-TaskRequest' {
         }
     }
 
+    It 'refuses a start commit with a trailing newline or a non-string value' {
+        $requestPath = Join-Path $TestDrive 'start-commit-shape.json'
+        $validStartCommit = ('0123456789abcdef' * 3).Substring(0, 40)
+        $prefix = '{"schemaVersion":2,"task":{"key":"FEATURE-123","title":"Add endpoint"},"repositories":[{"name":"api","path":"C:/work/canons/api","baseBranch":"main","branch":"feature/FEATURE-123","startCommit":'
+
+        $newlineRequest = $prefix + '"' + $validStartCommit + '\n"}]}'
+        $newlineRequest | Set-Content -LiteralPath $requestPath -NoNewline
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid start commit*'
+
+        $numberRequest = $prefix + '12}]}'
+        $numberRequest | Set-Content -LiteralPath $requestPath -NoNewline
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid start commit*'
+
+        $booleanRequest = $prefix + 'true}]}'
+        $booleanRequest | Set-Content -LiteralPath $requestPath -NoNewline
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid start commit*'
+    }
+
     It 'rejects duplicate repository names' {
         $requestPath = Join-Path $TestDrive 'duplicate-repository.json'
         @'

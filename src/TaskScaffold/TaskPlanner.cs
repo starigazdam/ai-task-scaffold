@@ -459,6 +459,13 @@ public static class TaskPlanner
             };
         }
 
+        var startCommit = repository.StartCommit;
+        if (startCommit is not null &&
+            !string.Equals(ResolveCommit(repository.Path, startCommit), startCommit, StringComparison.Ordinal))
+        {
+            return Blocked(repository, destination, "start-commit-missing", commonDir, head);
+        }
+
         if (TryGetAttributes(destination, out var destinationAttributes))
         {
             if ((destinationAttributes & FileAttributes.Directory) != 0 && IsMatchingWorktree(repository.Path, destination, repository.Branch, commonDir))
@@ -499,13 +506,8 @@ public static class TaskPlanner
 
         var requestedLocal = $"refs/heads/{repository.Branch}";
         var requestedRemote = $"refs/remotes/origin/{repository.Branch}";
-        if (repository.StartCommit is { } startCommit)
+        if (startCommit is not null)
         {
-            if (!string.Equals(ResolveCommit(repository.Path, startCommit), startCommit, StringComparison.Ordinal))
-            {
-                return Blocked(repository, destination, "start-commit-missing", commonDir, head);
-            }
-
             if (RefExists(repository.Path, requestedLocal))
             {
                 if (!string.Equals(ResolveCommit(repository.Path, requestedLocal), startCommit, StringComparison.Ordinal))
@@ -529,7 +531,7 @@ public static class TaskPlanner
                     {
                         Repository = repository.Name,
                         Action = "create-remote",
-                        Source = $"origin/{repository.Branch}",
+                        Source = requestedRemote,
                         BranchMode = "track",
                         Destination = destination,
                         Reason = null,
@@ -808,6 +810,10 @@ public static class TaskPlanner
         {
             startInfo.ArgumentList.Add(argument);
         }
+
+        // Planner git calls are read-only. A partial clone would otherwise
+        // lazily fetch a missing object just to answer rev-parse.
+        startInfo.Environment["GIT_NO_LAZY_FETCH"] = "1";
 
         try
         {

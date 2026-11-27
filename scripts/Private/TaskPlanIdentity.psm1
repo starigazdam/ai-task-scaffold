@@ -56,9 +56,8 @@ function Get-TaskProfileIdentity {
 function Get-TaskGitCommit {
     param([string]$RepositoryPath, [string]$Reference)
 
-    $result = & git -C $RepositoryPath rev-parse --verify --quiet "$Reference^{commit}" 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return ([string]($result | Select-Object -First 1)).Trim()
+    # Identity lookups are read-only planning reads: never let them lazily fetch.
+    return Get-GitCommitWithoutLazyFetch -RepositoryPath $RepositoryPath -Reference $Reference
 }
 
 function Get-TaskRepositoryIdentity {
@@ -70,13 +69,14 @@ function Get-TaskRepositoryIdentity {
         $remoteBase = if ($repository.BaseBranch -match '^[^/]+/.+') { $repository.BaseBranch } else { "origin/$($repository.BaseBranch)" }
         $worktree = $null
         if ($operation -and (Test-Path -LiteralPath $operation.Destination -PathType Container)) {
-            $head = & git -C $operation.Destination rev-parse --verify --quiet 'HEAD^{commit}' 2>$null
-            $headExitCode = $LASTEXITCODE
+            # Read-only: a partial clone must not fetch just to answer this lookup.
+            $headResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $operation.Destination -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD^{commit}') -NoLazyFetch
+            $head = if ($headResult.ExitCode -eq 0) { ([string](@($headResult.Output -split "`r?`n") | Select-Object -First 1)).Trim() } else { $null }
             $branch = & git -C $operation.Destination branch --show-current 2>$null
             $worktree = [ordered]@{
                 CommonDir = Get-PlanGitCommonDir -RepositoryPath $operation.Destination
                 GitDir = Get-PlanGitDir -RepositoryPath $operation.Destination
-                Head = if ($headExitCode -eq 0) { ([string]($head | Select-Object -First 1)).Trim() } else { $null }
+                Head = $head
                 Branch = ([string]($branch | Select-Object -First 1)).Trim()
             }
         }
@@ -91,8 +91,17 @@ function Get-TaskRepositoryIdentity {
             RemoteBranchCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/remotes/origin/$($repository.Branch)"
             LocalBaseCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/heads/$($repository.BaseBranch)"
             RemoteBaseCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/remotes/$remoteBase"
-            SelectedSource = if ($operation) { $operation.Source } else { $null }
-            SelectedSourceCommit = if ($operation -and $operation.Source) { Get-TaskGitCommit -RepositoryPath $repository.Path -Reference $operation.Source } else { $null }
+            SelectedSource = if ($operation -and $operation.PSObject.Properties['Source']) { $operation.Source } else { $null }
+            # Bind the commit selected at plan time. Re-resolving a ref here would
+            # let a moved remote ref, or a local branch named like the shorthand,
+            # change the reviewed identity and the applied start point.
+            SelectedSourceCommit = if ($operation -and $operation.PSObject.Properties['SourceCommit'] -and $operation.SourceCommit) {
+                [string]$operation.SourceCommit
+            }
+            elseif ($operation -and $operation.PSObject.Properties['Source'] -and $operation.Source) {
+                Get-TaskGitCommit -RepositoryPath $repository.Path -Reference $operation.Source
+            }
+            else { $null }
             Operation = $operation
             Worktree = $worktree
         }
