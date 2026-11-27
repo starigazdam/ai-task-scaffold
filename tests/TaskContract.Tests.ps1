@@ -153,6 +153,14 @@ Describe 'ConvertTo-TaskRequest' {
         $absent | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
         (ConvertTo-TaskRequest -Path $requestPath).Repositories[0].StartCommit | Should -BeNullOrEmpty
 
+        $explicitNull = [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123'; startCommit = $null })
+        }
+        $explicitNull | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        (ConvertTo-TaskRequest -Path $requestPath).Repositories[0].StartCommit | Should -BeNullOrEmpty -Because 'explicit null means the same as omission'
+
         $invalidValues = @(
             $validStartCommit.Substring(0, 12)
             $validStartCommit.ToUpperInvariant()

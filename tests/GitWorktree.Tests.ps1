@@ -918,3 +918,169 @@ Describe 'branch.autoSetupMerge upstream preservation' {
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Exact task ref resolution' {
+    BeforeAll {
+        function New-ExactRefRepository {
+            param([string]$Path)
+
+            New-Item -ItemType Directory -Path $Path | Out-Null
+            & git -C $Path init -b main | Out-Null
+            & git -C $Path config user.name Test
+            & git -C $Path config user.email test@example.invalid
+            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'first'
+            & git -C $Path add README.md
+            & git -C $Path commit -m first | Out-Null
+            return (& git -C $Path rev-parse HEAD).Trim()
+        }
+
+        function Set-UnreadableLooseRef {
+            param([string]$RepositoryPath, [string]$Reference)
+
+            $refPath = Join-Path $RepositoryPath ".git/$Reference"
+            New-Item -ItemType Directory -Path (Split-Path -Parent $refPath) -Force | Out-Null
+            Set-Content -LiteralPath $refPath -Value ('1' * 40) -NoNewline
+        }
+    }
+
+    It 'blocks a present local task ref whose tip cannot be verified against the pin' {
+        $repositoryPath = Join-Path $TestDrive 'exact-ref-unverified'
+        $head = New-ExactRefRepository -Path $repositoryPath
+        Set-UnreadableLooseRef -RepositoryPath $repositoryPath -Reference 'refs/heads/feature/FEATURE-123'
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $head }
+        $tasksRoot = Join-Path $TestDrive 'exact-ref-unverified-tasks'
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'start-commit-mismatch' -Because 'a present ref with an unreadable tip must not fall through to create-local/new'
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
+    }
+
+    It 'blocks a no-pin local task ref whose tip is missing locally' {
+        $repositoryPath = Join-Path $TestDrive 'exact-ref-no-pin-unverified'
+        [void](New-ExactRefRepository -Path $repositoryPath)
+        Set-UnreadableLooseRef -RepositoryPath $repositoryPath -Reference 'refs/heads/feature/FEATURE-123'
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'exact-ref-no-pin-tasks')
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'does not let a lookalike tag stand in for the remote task ref' {
+        $repositoryPath = Join-Path $TestDrive 'exact-ref-tag-lookalike'
+        $head = New-ExactRefRepository -Path $repositoryPath
+        & git -C $repositoryPath tag 'refs/remotes/origin/feature/FEATURE-123' $head
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'exact-ref-tag-tasks')
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.Source | Should -Be 'main'
+        $plan.BranchMode | Should -Be 'new'
+
+        $pinned = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $head }
+        $pinnedPlan = New-TaskWorktreePlan -Repository $pinned -TaskKey 'FEATURE-124' -TasksRoot (Join-Path $TestDrive 'exact-ref-tag-pinned-tasks')
+
+        $pinnedPlan.Action | Should -Be 'create-local'
+        $pinnedPlan.BranchMode | Should -Be 'new'
+        $pinnedPlan.Source | Should -Be $head
+        $pinnedPlan.SourceCommit | Should -Be $head
+    }
+}
+
+Describe 'No-lazy-fetch capability' {
+    BeforeAll {
+        function New-CapabilitySourceRepository {
+            param([string]$Path)
+
+            New-Item -ItemType Directory -Path $Path -Force | Out-Null
+            & git -C $Path init -b main | Out-Null
+            & git -C $Path config user.name Test
+            & git -C $Path config user.email test@example.invalid
+            & git -C $Path config uploadpack.allowFilter true
+            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'first'
+            & git -C $Path add README.md
+            & git -C $Path commit -m first | Out-Null
+            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'second'
+            & git -C $Path commit -am second | Out-Null
+        }
+
+        function New-PartialCloneFixture {
+            param([string]$SourcePath, [string]$ClonePath)
+
+            New-CapabilitySourceRepository -Path $SourcePath
+            & git clone --filter=blob:none --no-local "file://$SourcePath" $ClonePath 2>&1 | Out-Null
+            return [pscustomobject]@{
+                Path = $ClonePath
+                Head = (& git -C $ClonePath rev-parse HEAD).Trim()
+            }
+        }
+
+        function New-OldGitShim {
+            param([string]$Directory)
+
+            New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+            $shimPath = Join-Path $Directory 'git'
+            $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+            @(
+                '#!/bin/sh'
+                "REAL_GIT='$realGit'"
+                'if [ "$1" = "--no-lazy-fetch" ]; then'
+                '  echo "error: unknown option: --no-lazy-fetch" >&2'
+                '  exit 129'
+                'fi'
+                'exec "$REAL_GIT" "$@"'
+            ) | Set-Content -LiteralPath $shimPath
+            & chmod +x $shimPath
+            return $shimPath
+        }
+    }
+
+    It 'fails closed on a partial clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $fixture = New-PartialCloneFixture -SourcePath (Join-Path $TestDrive 'capability-source-old') -ClonePath (Join-Path $TestDrive 'capability-partial-old')
+        (& git -C $fixture.Path config --get remote.origin.promisor) | Should -Be 'true'
+        $shimDir = Join-Path $TestDrive 'capability-shim-old'
+        New-OldGitShim -Directory $shimDir | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            { New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'capability-old-tasks') } |
+                Should -Throw '*partial clone*--no-lazy-fetch*'
+        }
+        finally { $env:PATH = $savedPath }
+    }
+
+    It 'still plans a full clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'capability-full-old'
+        New-CapabilitySourceRepository -Path $repositoryPath
+        $shimDir = Join-Path $TestDrive 'capability-shim-full'
+        New-OldGitShim -Directory $shimDir | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'capability-full-tasks')
+        }
+        finally { $env:PATH = $savedPath }
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'new'
+    }
+
+    It 'plans a real partial clone with a Git that supports --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $fixture = New-PartialCloneFixture -SourcePath (Join-Path $TestDrive 'capability-source-modern') -ClonePath (Join-Path $TestDrive 'capability-partial-modern')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'capability-modern-tasks')
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.Source | Should -Be 'main'
+        $plan.SourceCommit | Should -Be $fixture.Head
+    }
+}

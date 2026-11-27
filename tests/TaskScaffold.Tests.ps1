@@ -100,6 +100,58 @@ Describe 'Invoke-TaskScaffold' {
         $nonePlan.WorktreeOperations[0].Source | Should -Be 'main'
     }
 
+    It 'resolves a relative repository path once when PowerShell location and process cwd differ' {
+        $root = Join-Path $TestDrive 'relative-path-scaffold'
+        $location = Join-Path $root 'location'
+        $repositoryPath = Join-Path $location 'canons/api'
+        $processCwd = Join-Path $root 'process-cwd'
+        New-Item -ItemType Directory -Path $processCwd -Force | Out-Null
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+
+        $requestPath = Join-Path $root 'task-request.json'
+        [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = 'canons/api'; baseBranch = 'main'; branch = 'task/FEATURE-123' })
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+
+        $script = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'))
+        $tasksRoot = Join-Path $root 'tasks'
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new('pwsh')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.WorkingDirectory = $processCwd
+        $startInfo.ArgumentList.Add('-NoProfile')
+        $startInfo.ArgumentList.Add('-Command')
+        $startInfo.ArgumentList.Add(@'
+Set-Location -LiteralPath $env:F3_LOCATION
+$plan = & $env:F3_SCRIPT -RequestPath $env:F3_REQUEST -TasksRoot $env:F3_TASKS | ConvertFrom-Json
+& $env:F3_SCRIPT -RequestPath $env:F3_REQUEST -TasksRoot $env:F3_TASKS -Apply -ExpectedPlanIdentity $plan.PlanIdentity | Out-Null
+$plan.WorktreeOperations[0].Action
+'@)
+        $startInfo.Environment['F3_LOCATION'] = $location
+        $startInfo.Environment['F3_SCRIPT'] = $script
+        $startInfo.Environment['F3_REQUEST'] = $requestPath
+        $startInfo.Environment['F3_TASKS'] = $tasksRoot
+
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $exitCode = $process.ExitCode
+        $process.Dispose()
+
+        $exitCode | Should -Be 0 -Because "dry-run and apply should use the PowerShell location (stderr: $stderr)"
+        $stdout | Should -Be 'create-local'
+        $worktreePath = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
+        Test-Path -LiteralPath $worktreePath | Should -BeTrue
+        (& git -C $worktreePath branch --show-current) | Should -Be 'task/FEATURE-123'
+    }
+
     It 'plans blocked worktree operations without failing the public dry run' {
         $repositoryPath = Join-Path $TestDrive 'api-blocked-start-commit'
         New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath

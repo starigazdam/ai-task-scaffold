@@ -1,8 +1,33 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Resolve-TaskRepositoryPath {
+    param([string]$Path)
+
+    # Native Git run from PowerShell resolves a relative -C path against the
+    # PowerShell file-system location, while a child process inherits the
+    # process working directory. Resolve once here so both see one path, and
+    # leave the raw value untouched in durable manifests.
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ([IO.Path]::IsPathFullyQualified($Path)) {
+        return [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Path))
+    }
+
+    $location = $null
+    try { $location = (Get-Location -PSProvider FileSystem -ErrorAction Stop).ProviderPath }
+    catch { $location = [Environment]::CurrentDirectory }
+    if ([string]::IsNullOrWhiteSpace($location)) { $location = [Environment]::CurrentDirectory }
+    return [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath([IO.Path]::Combine($location, $Path)))
+}
+
 function Get-GitCommitWithoutLazyFetch {
     param([string]$RepositoryPath, [string]$Reference)
+
+    # Full ref names are resolved exactly: revision DWIM can fall back to a tag
+    # literally named like the ref (for example refs/tags/refs/remotes/origin/x).
+    if ($Reference -clike 'refs/*') {
+        return (Get-TaskGitRefCommit -RepositoryPath $RepositoryPath -Reference $Reference).Commit
+    }
 
     # A partial clone can lazily fetch a missing object during rev-parse. These
     # planning lookups are read-only, so they must only resolve local objects.
@@ -11,10 +36,47 @@ function Get-GitCommitWithoutLazyFetch {
     return ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
 }
 
+function Get-TaskGitRefCommit {
+    param([string]$RepositoryPath, [string]$Reference)
+
+    # for-each-ref lists the ref name and its raw object ID. Match the exact
+    # name, then verify that raw ID is a locally available commit. A ref whose
+    # tip cannot be read is present-but-unverified, never absent, so callers
+    # fail closed instead of falling through to another ref.
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('for-each-ref', '--format=%(refname) %(objectname)', $Reference) -NoLazyFetch
+    if ($result.ExitCode -ne 0) {
+        throw "cannot read ref '$Reference' in '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
+    }
+
+    $found = $false
+    $objectId = $null
+    foreach ($line in @($result.Output -split "`r?`n")) {
+        $separator = $line.IndexOf(' ')
+        if ($separator -le 0) { continue }
+        if ($line.Substring(0, $separator) -cne $Reference) { continue }
+        $found = $true
+        $candidate = $line.Substring($separator + 1).Trim()
+        if ($candidate -cmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') { $objectId = $candidate }
+        break
+    }
+
+    if (-not $found) { return [pscustomobject]@{ Exists = $false; Commit = $null } }
+    if (-not $objectId) { return [pscustomobject]@{ Exists = $true; Commit = $null } }
+
+    $verify = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--verify', '--quiet', "$objectId^{commit}") -NoLazyFetch
+    if ($verify.ExitCode -ne 0) { return [pscustomobject]@{ Exists = $true; Commit = $null } }
+    $commit = ([string](@($verify.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+    return [pscustomobject]@{
+        Exists = $true
+        Commit = $(if ($commit -ceq $objectId) { $objectId } else { $null })
+    }
+}
+
 function Get-GitCommonDir {
     param([string]$RepositoryPath)
 
-    $output = & git -C $RepositoryPath rev-parse --path-format=absolute --git-common-dir 2>$null
+    $resolvedPath = Resolve-TaskRepositoryPath -Path $RepositoryPath
+    $output = & git -C $resolvedPath rev-parse --path-format=absolute --git-common-dir 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
     return ([string]($output | Select-Object -First 1)).Trim()
 }
@@ -22,7 +84,8 @@ function Get-GitCommonDir {
 function Get-GitDir {
     param([string]$RepositoryPath)
 
-    $output = & git -C $RepositoryPath rev-parse --path-format=absolute --git-dir 2>$null
+    $resolvedPath = Resolve-TaskRepositoryPath -Path $RepositoryPath
+    $output = & git -C $resolvedPath rev-parse --path-format=absolute --git-dir 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
     return ([string]($output | Select-Object -First 1)).Trim()
 }
@@ -203,19 +266,20 @@ function New-TaskWorktreePlan {
         [Parameter(Mandatory)][string]$TasksRoot
     )
 
-    & git -C $Repository.Path rev-parse --is-inside-work-tree 2>$null | Out-Null
+    $repositoryPath = Resolve-TaskRepositoryPath -Path $Repository.Path
+    & git -C $repositoryPath rev-parse --is-inside-work-tree 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "repository '$($Repository.Name)' is not a Git worktree"
     }
 
-    $repositoryCommonDir = Get-GitCommonDir -RepositoryPath $Repository.Path
+    $repositoryCommonDir = Get-GitCommonDir -RepositoryPath $repositoryPath
     $destination = Get-TaskWorktreeDestination -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $Repository.Name
     if (-not (Test-TaskPathSafety -TasksRoot $TasksRoot -TaskKey $TaskKey -RepositoryName $Repository.Name)) {
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'unsafe-worktree-path'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
     $startCommit = if ($Repository.PSObject.Properties['StartCommit']) { $Repository.StartCommit } else { $null }
     if ($startCommit) {
-        if ((Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $startCommit) -cne $startCommit) {
+        if ((Get-GitCommitWithoutLazyFetch -RepositoryPath $repositoryPath -Reference $startCommit) -cne $startCommit) {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
     }
@@ -227,8 +291,8 @@ function New-TaskWorktreePlan {
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'incomplete-worktree-creation'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
     if (Test-Path -LiteralPath $destination) {
-        if (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $destination -Branch $Repository.Branch -ExpectedCommonDir $repositoryCommonDir) {
-            $reuseCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference "refs/heads/$($Repository.Branch)"
+        if (Test-TaskWorktreeIdentity -RepositoryPath $repositoryPath -WorktreePath $destination -Branch $Repository.Branch -ExpectedCommonDir $repositoryCommonDir) {
+            $reuseCommit = (Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference "refs/heads/$($Repository.Branch)").Commit
             return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $reuseCommit; RepositoryCommonDir = $repositoryCommonDir; WorktreeGitDir = (Get-GitDir -RepositoryPath $destination); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'destination-exists'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -241,17 +305,17 @@ function New-TaskWorktreePlan {
     $remoteBranchRef = "refs/remotes/origin/$($Repository.Branch)"
 
     if ($startCommit) {
-        $localCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $localBranchRef
-        if ($localCommit) {
-            if ($localCommit -cne $startCommit) {
+        $localSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $localBranchRef
+        if ($localSnapshot.Exists) {
+            if (-not $localSnapshot.Commit -or $localSnapshot.Commit -cne $startCommit) {
                 return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-mismatch'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
             }
             return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $startCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
 
-        $remoteCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $remoteBranchRef
-        if ($remoteCommit) {
-            if ($remoteCommit -cne $startCommit) {
+        $remoteSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $remoteBranchRef
+        if ($remoteSnapshot.Exists) {
+            if (-not $remoteSnapshot.Commit -or $remoteSnapshot.Commit -cne $startCommit) {
                 return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-mismatch'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
             }
             return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = $remoteBranchRef; BranchMode = 'track'; Repository = $Repository.Name; SourceCommit = $startCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -260,33 +324,46 @@ function New-TaskWorktreePlan {
         return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $startCommit; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $startCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
-    $localCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $localBranchRef
-    if ($localCommit) {
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+    $localSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $localBranchRef
+    if ($localSnapshot.Exists) {
+        if (-not $localSnapshot.Commit) {
+            return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localSnapshot.Commit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
-    # Resolve the remote branch only through its full ref: the shorthand
-    # 'origin/<branch>' resolves a local branch of that name first.
-    $remoteCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $remoteBranchRef
-    if ($remoteCommit) {
-        return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = "origin/$($Repository.Branch)"; BranchMode = 'track'; Repository = $Repository.Name; SourceCommit = $remoteCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+    # Resolve the remote branch only through its exact ref: the shorthand
+    # 'origin/<branch>' resolves a local branch of that name first, and revision
+    # DWIM can fall back to a tag named like the full remote ref.
+    $remoteSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $remoteBranchRef
+    if ($remoteSnapshot.Exists) {
+        if (-not $remoteSnapshot.Commit) {
+            return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
+        return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = "origin/$($Repository.Branch)"; BranchMode = 'track'; Repository = $Repository.Name; SourceCommit = $remoteSnapshot.Commit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     $localBaseRef = "refs/heads/$($Repository.BaseBranch)"
-    $localBaseCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $localBaseRef
-    if ($localBaseCommit) {
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseCommit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+    $localBaseSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $localBaseRef
+    if ($localBaseSnapshot.Exists) {
+        if (-not $localBaseSnapshot.Commit) {
+            return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseSnapshot.Commit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     $remoteBase = if ($Repository.BaseBranch -match '^[^/]+/.+') { $Repository.BaseBranch } else { "origin/$($Repository.BaseBranch)" }
     $remoteBaseRef = "refs/remotes/$remoteBase"
-    $remoteBaseCommit = Get-GitCommitWithoutLazyFetch -RepositoryPath $Repository.Path -Reference $remoteBaseRef
-    if ($remoteBaseCommit) {
+    $remoteBaseSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $remoteBaseRef
+    if ($remoteBaseSnapshot.Exists) {
+        if (-not $remoteBaseSnapshot.Commit) {
+            return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
         # Starting a new branch from a remote-tracking base normally auto-tracks
         # it. That upstream decision is resolved from branch.autoSetupMerge and
         # bound into the identity, because apply starts from a bare commit.
-        $upstreamRef = Get-TaskNewBranchUpstreamRef -RepositoryPath $Repository.Path -Branch $Repository.Branch -StartRef $remoteBaseRef
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseCommit; UpstreamRef = $upstreamRef; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        $upstreamRef = Get-TaskNewBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch -StartRef $remoteBaseRef
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseSnapshot.Commit; UpstreamRef = $upstreamRef; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -295,12 +372,13 @@ function New-TaskWorktreePlan {
 function New-TaskGitStartInfo {
     param([string]$RepositoryPath, [string[]]$Arguments, [switch]$NoLazyFetch)
 
+    $resolvedPath = Resolve-TaskRepositoryPath -Path $RepositoryPath
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new('git')
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardError = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.ArgumentList.Add('-C')
-    $startInfo.ArgumentList.Add($RepositoryPath)
+    $startInfo.ArgumentList.Add($resolvedPath)
     foreach ($argument in $Arguments) { $startInfo.ArgumentList.Add($argument) }
     if ($NoLazyFetch) {
         # Scoped to this child only: the calling process environment never changes,
@@ -317,9 +395,70 @@ function Get-TaskGitDiagnostic {
     return ((@($Text -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -First 20) -join '; ')
 }
 
+$script:TaskGitNoLazyFetchSupport = @{}
+
+function Test-TaskGitNoLazyFetchSupport {
+    # Git before 2.45 supports partial clones but ignores GIT_NO_LAZY_FETCH.
+    # Probe the global option itself; cache per resolved git executable so a
+    # test shim added to PATH is not masked by an earlier real-git result.
+    $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $key = [string]$git.Source
+    if ($script:TaskGitNoLazyFetchSupport.ContainsKey($key)) {
+        return [bool]$script:TaskGitNoLazyFetchSupport[$key]
+    }
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new('git')
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.ArgumentList.Add('--no-lazy-fetch')
+    $startInfo.ArgumentList.Add('--version')
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        $standardError = $process.StandardError.ReadToEndAsync()
+        $standardOutput = $process.StandardOutput.ReadToEndAsync()
+        $process.WaitForExit()
+        [void]$standardError.GetAwaiter().GetResult()
+        [void]$standardOutput.GetAwaiter().GetResult()
+        $supported = $process.ExitCode -eq 0
+    }
+    finally { $process.Dispose() }
+    $script:TaskGitNoLazyFetchSupport[$key] = $supported
+    return $supported
+}
+
+function Test-TaskGitPartialClone {
+    param([string]$RepositoryPath)
+
+    # extensions.partialClone marks a filtered clone; remote.<name>.promisor=true
+    # marks a promisor remote. Either can make an object read fetch.
+    $extensions = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--get', 'extensions.partialClone')
+    if ($extensions.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($extensions.Output)) { return $true }
+
+    $promisors = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--bool', '--get-regexp', '^remote\..*\.promisor$')
+    if ($promisors.ExitCode -ne 0) { return $false }
+    foreach ($line in @($promisors.Output -split "`r?`n")) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $separator = $line.IndexOfAny([char[]]@(' ', "`t"))
+        if ($separator -le 0) { continue }
+        $value = $line.Substring($separator + 1).Trim()
+        if ($value -ceq 'true') { return $true }
+    }
+    return $false
+}
+
+function Assert-TaskNoLazyFetchAllowed {
+    param([string]$RepositoryPath)
+
+    if (Test-TaskGitNoLazyFetchSupport) { return }
+    if (-not (Test-TaskGitPartialClone -RepositoryPath $RepositoryPath)) { return }
+    throw "repository '$RepositoryPath' is a partial clone, but this Git does not support --no-lazy-fetch (Git 2.45 or later is required); refusing a read-only planning lookup that could fetch a missing object. Upgrade Git or use a full clone."
+}
+
 function Invoke-TaskWorktreeGitCommand {
     param([string]$RepositoryPath, [string[]]$Arguments, [switch]$NoLazyFetch)
 
+    if ($NoLazyFetch) { Assert-TaskNoLazyFetchAllowed -RepositoryPath $RepositoryPath }
     $process = [System.Diagnostics.Process]::Start((New-TaskGitStartInfo -RepositoryPath $RepositoryPath -Arguments $Arguments -NoLazyFetch:$NoLazyFetch))
     try {
         # Native stderr becomes a terminating error inside a parallel runspace.
@@ -373,13 +512,14 @@ function Invoke-TaskWorktreePlan {
     if ($Plan.Action -eq 'blocked') {
         throw "cannot apply blocked plan: $($Plan.Reason)"
     }
+    $repositoryPath = Resolve-TaskRepositoryPath -Path $Repository.Path
     $expectedDestination = Get-TaskWorktreeDestination -TasksRoot $Plan.TasksRoot -TaskKey $Plan.TaskKey -RepositoryName $Repository.Name
     if (-not (Test-TaskPathSafety -TasksRoot $Plan.TasksRoot -TaskKey $Plan.TaskKey -RepositoryName $Repository.Name) -or $Plan.Destination -cne $expectedDestination) {
         throw "refusing unsafe worktree destination '$($Plan.Destination)'"
     }
     if ($Plan.Action -eq 'reuse') {
-        if ((Get-GitCommonDir -RepositoryPath $Repository.Path) -cne $Plan.RepositoryCommonDir -or
-            -not (Test-TaskWorktreeIdentity -RepositoryPath $Repository.Path -WorktreePath $Plan.Destination -Branch $Plan.Source -ExpectedCommonDir $Plan.RepositoryCommonDir -ExpectedGitDir $Plan.WorktreeGitDir)) {
+        if ((Get-GitCommonDir -RepositoryPath $repositoryPath) -cne $Plan.RepositoryCommonDir -or
+            -not (Test-TaskWorktreeIdentity -RepositoryPath $repositoryPath -WorktreePath $Plan.Destination -Branch $Plan.Source -ExpectedCommonDir $Plan.RepositoryCommonDir -ExpectedGitDir $Plan.WorktreeGitDir)) {
             throw "reused worktree changed since planning: '$($Plan.Destination)'"
         }
         return
@@ -414,7 +554,7 @@ function Invoke-TaskWorktreePlan {
     }
 
     try {
-        $process = Start-TaskWorktreeGitProcess -RepositoryPath $Repository.Path -Arguments $gitArguments -State $State -Gate $Gate
+        $process = Start-TaskWorktreeGitProcess -RepositoryPath $repositoryPath -Arguments $gitArguments -State $State -Gate $Gate
     }
     catch {
         Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
@@ -473,7 +613,7 @@ function Invoke-TaskWorktreePlan {
             if ($detail) { throw "git branch --set-upstream-to failed for '$($Repository.Name)': $detail" }
             throw "git branch --set-upstream-to failed for '$($Repository.Name)'"
         }
-        $upstreamReadBack = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('for-each-ref', '--format=%(upstream)', "refs/heads/$($Repository.Branch)")
+        $upstreamReadBack = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('for-each-ref', '--format=%(upstream)', "refs/heads/$($Repository.Branch)") -NoLazyFetch
         if ($upstreamReadBack.ExitCode -ne 0) {
             Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
             $detail = Get-TaskGitDiagnostic -Text $upstreamReadBack.Text
@@ -587,4 +727,4 @@ function Invoke-TaskWorktreePlanBatch {
     return ,@($parallelResults | Sort-Object Index)
 }
 
-Export-ModuleMember -Function Enter-TaskMutationLock, Get-GitCommitWithoutLazyFetch, Invoke-TaskWorktreeGitCommand, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Start-TaskWorktreeGitProcess, Set-TaskWorktreeFailure, Get-TaskWorktreeMarkerRepository
+Export-ModuleMember -Function Enter-TaskMutationLock, Resolve-TaskRepositoryPath, Get-GitCommitWithoutLazyFetch, Get-TaskGitRefCommit, Invoke-TaskWorktreeGitCommand, Get-GitCommonDir, Get-GitDir, Test-TaskWorktreeIdentity, Test-TaskWorktreeOperationSafety, Test-TaskPathSafety, New-TaskWorktreePlan, Invoke-TaskWorktreePlan, Get-TaskWorktreeConcurrencyLimit, Invoke-TaskWorktreePlanItem, Invoke-TaskWorktreePlanBatch, Start-TaskWorktreeGitProcess, Set-TaskWorktreeFailure, Get-TaskWorktreeMarkerRepository

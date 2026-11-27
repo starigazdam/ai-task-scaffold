@@ -4,7 +4,8 @@ $ErrorActionPreference = 'Stop'
 function Get-PlanGitCommonDir {
     param([string]$RepositoryPath)
 
-    $output = & git -C $RepositoryPath rev-parse --path-format=absolute --git-common-dir 2>$null
+    $resolvedPath = Resolve-TaskRepositoryPath -Path $RepositoryPath
+    $output = & git -C $resolvedPath rev-parse --path-format=absolute --git-common-dir 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
     return ([string]($output | Select-Object -First 1)).Trim()
 }
@@ -12,7 +13,8 @@ function Get-PlanGitCommonDir {
 function Get-PlanGitDir {
     param([string]$RepositoryPath)
 
-    $output = & git -C $RepositoryPath rev-parse --path-format=absolute --git-dir 2>$null
+    $resolvedPath = Resolve-TaskRepositoryPath -Path $RepositoryPath
+    $output = & git -C $resolvedPath rev-parse --path-format=absolute --git-dir 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
     return ([string]($output | Select-Object -First 1)).Trim()
 }
@@ -56,7 +58,11 @@ function Get-TaskProfileIdentity {
 function Get-TaskGitCommit {
     param([string]$RepositoryPath, [string]$Reference)
 
-    # Identity lookups are read-only planning reads: never let them lazily fetch.
+    # Identity lookups are read-only planning reads: never let them lazily fetch,
+    # and resolve full ref names exactly so a lookalike tag cannot stand in.
+    if ($Reference -clike 'refs/*') {
+        return (Get-TaskGitRefCommit -RepositoryPath $RepositoryPath -Reference $Reference).Commit
+    }
     return Get-GitCommitWithoutLazyFetch -RepositoryPath $RepositoryPath -Reference $Reference
 }
 
@@ -82,7 +88,7 @@ function Get-TaskRepositoryIdentity {
         }
         [ordered]@{
             Name = $repository.Name
-            Path = [IO.Path]::GetFullPath($repository.Path)
+            Path = Resolve-TaskRepositoryPath -Path $repository.Path
             CommonDir = Get-PlanGitCommonDir -RepositoryPath $repository.Path
             RequestedBranch = $repository.Branch
             BaseBranch = $repository.BaseBranch
@@ -169,7 +175,7 @@ function Get-TaskScaffoldIdentityMaterial {
         }
         Repositories = @($Request.Repositories | ForEach-Object {
             $startCommit = if ($_.PSObject.Properties['StartCommit']) { $_.StartCommit } else { $null }
-            [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path); BaseBranch = $_.BaseBranch; Branch = $_.Branch; StartCommit = $startCommit }
+            [ordered]@{ Name = $_.Name; Path = Resolve-TaskRepositoryPath -Path $_.Path; BaseBranch = $_.BaseBranch; Branch = $_.Branch; StartCommit = $startCommit }
         })
         Profiles = @($Request.Profiles | ForEach-Object {
             [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path) }

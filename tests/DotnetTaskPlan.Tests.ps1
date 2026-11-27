@@ -448,6 +448,187 @@ Describe 'dotnet task plan' {
     }
 }
 
+Describe 'dotnet task plan ref resolution and Git capability' {
+    BeforeAll {
+        function New-OldGitShimDirectory {
+            param([string]$Path)
+
+            New-Item -ItemType Directory -Path $Path -Force | Out-Null
+            $shimPath = Join-Path $Path 'git'
+            $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+            @(
+                '#!/bin/sh'
+                "REAL_GIT='$realGit'"
+                'if [ "$1" = "--no-lazy-fetch" ]; then'
+                '  echo "error: unknown option: --no-lazy-fetch" >&2'
+                '  exit 129'
+                'fi'
+                'exec "$REAL_GIT" "$@"'
+            ) | Set-Content -LiteralPath $shimPath
+            & chmod +x $shimPath
+            return $Path
+        }
+
+        function New-PartialCloneRepository {
+            param([string]$SourcePath, [string]$ClonePath)
+
+            New-Item -ItemType Directory -Path $SourcePath -Force | Out-Null
+            & git -C $SourcePath init -b main | Out-Null
+            & git -C $SourcePath config user.name Test
+            & git -C $SourcePath config user.email test@example.invalid
+            & git -C $SourcePath config uploadpack.allowFilter true
+            Set-Content -LiteralPath (Join-Path $SourcePath 'README.md') -Value 'first'
+            & git -C $SourcePath add README.md
+            & git -C $SourcePath commit -m first | Out-Null
+            Set-Content -LiteralPath (Join-Path $SourcePath 'README.md') -Value 'second'
+            & git -C $SourcePath commit -am second | Out-Null
+            & git clone --filter=blob:none --no-local "file://$SourcePath" $ClonePath 2>&1 | Out-Null
+            return $ClonePath
+        }
+
+        function Set-UnreadableLooseRef {
+            param([string]$RepositoryPath, [string]$Reference)
+
+            $refPath = Join-Path $RepositoryPath ".git/$Reference"
+            New-Item -ItemType Directory -Path (Split-Path -Parent $refPath) -Force | Out-Null
+            Set-Content -LiteralPath $refPath -Value ('1' * 40) -NoNewline
+        }
+    }
+
+    It 'fails closed on a partial clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-PartialCloneRepository -SourcePath (Join-Path $TestDrive 'cli-partial-source-old') -ClonePath (Join-Path $TestDrive 'cli-partial-old')
+        (& git -C $repositoryPath config --get remote.origin.promisor) | Should -Be 'true'
+        $shimDir = New-OldGitShimDirectory -Path (Join-Path $TestDrive 'cli-shim-old')
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-partial-old.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $run = Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-partial-old')
+        }
+        finally { $env:PATH = $savedPath }
+
+        $run.ExitCode | Should -Be 1
+        $run.StdErr | Should -Match 'partial clone'
+        $run.StdErr | Should -Match '--no-lazy-fetch'
+    }
+
+    It 'still plans a full clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-TestRepository -Name 'cli-full-old'
+        $shimDir = New-OldGitShimDirectory -Path (Join-Path $TestDrive 'cli-shim-full')
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-full-old.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-full-old')) -Case 'full clone with old git'
+        }
+        finally { $env:PATH = $savedPath }
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].branchMode | Should -Be 'new'
+    }
+
+    It 'plans a real partial clone with a Git that supports --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-PartialCloneRepository -SourcePath (Join-Path $TestDrive 'cli-partial-source-modern') -ClonePath (Join-Path $TestDrive 'cli-partial-modern')
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-partial-modern.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-partial-modern')) -Case 'partial clone with modern git'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].source | Should -Be 'main'
+    }
+
+    It 'does not let a lookalike tag stand in for the remote task ref' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-tag-lookalike'
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        & git -C $repositoryPath tag 'refs/remotes/origin/feature/FEATURE-123' $head
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-tag.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-tag')) -Case 'lookalike tag without pin'
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].source | Should -Be 'main'
+        $result.plan.worktreeOperations[0].branchMode | Should -Be 'new'
+
+        $pinned = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $pinned.repositories[0]['startCommit'] = $head
+        $pinnedPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-tag-pinned.json') -Request $pinned
+        $pinnedResult = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $pinnedPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-tag-pinned')) -Case 'lookalike tag with pin'
+        $pinnedResult.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $pinnedResult.plan.worktreeOperations[0].branchMode | Should -Be 'new'
+        $pinnedResult.plan.worktreeOperations[0].source | Should -Be $head
+    }
+
+    It 'blocks a present local task ref whose tip cannot be verified against the pin' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-unverified'
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        Set-UnreadableLooseRef -RepositoryPath $repositoryPath -Reference 'refs/heads/feature/FEATURE-123'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request.repositories[0]['startCommit'] = $head
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-unverified.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-unverified')) -Case 'unverified ref with pin'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-mismatch'
+    }
+
+    It 'blocks a no-pin local task ref whose tip is missing locally' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-unverified-no-pin'
+        Set-UnreadableLooseRef -RepositoryPath $repositoryPath -Reference 'refs/heads/feature/FEATURE-123'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-unverified-no-pin.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-unverified-no-pin')) -Case 'unverified ref without pin'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'binds the validated pin without re-reading the mutable task ref' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-single-read'
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        & git -C $repositoryPath branch feature/FEATURE-123 $head
+        $logPath = Join-Path $TestDrive 'cli-ref-single-read.log'
+        $shimDir = Join-Path $TestDrive 'cli-shim-single-read'
+        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+        $shimPath = Join-Path $shimDir 'git'
+        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+        @(
+            '#!/bin/sh'
+            "REAL_GIT='$realGit'"
+            "LOG='$logPath'"
+            'printf ''%s\n'' "$*" >> "$LOG"'
+            'exec "$REAL_GIT" "$@"'
+        ) | Set-Content -LiteralPath $shimPath
+        & chmod +x $shimPath
+
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request.repositories[0]['startCommit'] = $head
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-single-read.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-single-read')) -Case 'single read pin plan'
+        }
+        finally { $env:PATH = $savedPath }
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].branchMode | Should -Be 'existing'
+        $log = @(Get-Content -LiteralPath $logPath)
+        @($log | Where-Object { $_ -match 'rev-parse.*refs/heads/feature/FEATURE-123' }) |
+            Should -BeNullOrEmpty -Because 'the pin path must not resolve the mutable ref a second time'
+        @($log | Where-Object { $_ -match 'for-each-ref.*refs/heads/feature/FEATURE-123' }) |
+            Should -Not -BeNullOrEmpty -Because 'the exact ref snapshot is the one verified read'
+    }
+}
+
 Describe 'dotnet task plan ctx roots' {
     It 'plans root-mode .ctx with relative directives and does not touch the tasks root or environment' {
         $repositoryPath = New-TestRepository -Name 'api-ctx-roots-plan'
