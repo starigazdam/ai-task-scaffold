@@ -468,6 +468,13 @@ public static class TaskPlanner
             return Blocked(repository, destination, "start-commit-missing", commonDir, head);
         }
 
+        // A creation marker outlives a failed or interrupted worktree add and
+        // must win over the destination check, exactly as in the PowerShell plan.
+        if (WorktreeCreationMarkerExists(tasksRoot, taskKey, repository.Name))
+        {
+            return Blocked(repository, destination, "incomplete-worktree-creation", commonDir, head);
+        }
+
         if (TryGetAttributes(destination, out var destinationAttributes))
         {
             if ((destinationAttributes & FileAttributes.Directory) != 0 && IsMatchingWorktree(repository.Path, destination, repository.Branch, commonDir))
@@ -823,6 +830,14 @@ public static class TaskPlanner
 
         var destinationBranch = GetBranch(destination);
         return string.Equals(destinationBranch, branch, StringComparison.Ordinal);
+    }
+
+    private static bool WorktreeCreationMarkerExists(string tasksRoot, string taskKey, string repositoryName)
+    {
+        // The marker lives in the scaffold-owned worktrees container, whose
+        // safety the destination check above already established.
+        var markerPath = Path.Combine(tasksRoot, taskKey, "worktrees", ".ai-task-scaffold-incomplete." + repositoryName);
+        return TryGetAttributes(markerPath, out var attributes) && (attributes & FileAttributes.Directory) == 0;
     }
 
     private static bool HasUnsafePathComponent(string tasksRoot, string taskKey, string repositoryName)

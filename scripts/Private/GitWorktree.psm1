@@ -90,6 +90,29 @@ function Get-GitDir {
     return ([string]($output | Select-Object -First 1)).Trim()
 }
 
+function Test-TaskWorktreeRegistration {
+    param([string]$RepositoryPath, [string]$WorktreePath)
+
+    # A failed `git worktree add` can remove the destination yet leave the
+    # worktree registered (for example when a post-checkout hook fails). Ask
+    # Git for the registration instead of trusting the directory alone.
+    try {
+        $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('worktree', 'list', '--porcelain') -NoLazyFetch
+    }
+    catch { return $null }
+    if ($result.ExitCode -ne 0) { return $null }
+
+    $expected = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($WorktreePath))
+    foreach ($line in @($result.Output -split "`r?`n")) {
+        if ($line -cnotmatch '^worktree (?<path>.+)$') { continue }
+        $candidate = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Matches['path']))
+        # Case-insensitive on purpose: a false match keeps the marker (fails
+        # closed), while a false miss could reopen a mutated destination.
+        if ([string]::Equals($candidate, $expected, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
 function Test-TaskWorktreeIdentity {
     param(
         [string]$RepositoryPath,
@@ -171,14 +194,37 @@ function Get-TaskWorktreeMarkerRepository {
 }
 
 function Clear-TaskWorktreeCreationMarkerIfNoWorktree {
-    param([string]$Path, [string]$Destination)
+    param(
+        [string]$Path,
+        [string]$Destination,
+        [switch]$GitStarted,
+        [string]$RepositoryPath,
+        [string]$Branch,
+        [switch]$BranchCreated
+    )
 
-    # A failure before git started, or a git failure that left no worktree at
-    # the destination, is provably not an incomplete creation. Keeping the
-    # marker there would strand a perfectly normal retry.
-    if (-not (Test-Path -LiteralPath $Destination)) {
+    # A missing destination proves nothing on its own: Git can leave a task
+    # branch and/or a worktree registration behind without the directory.
+    # Before any Git process starts there is nothing to prove; afterwards the
+    # marker may only go when every piece of state reads back as absent. An
+    # unreadable state is unknown and keeps the marker.
+    if (Test-Path -LiteralPath $Destination) { return }
+    if (-not $GitStarted) {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        return
     }
+
+    if ((Test-TaskWorktreeRegistration -RepositoryPath $RepositoryPath -WorktreePath $Destination) -ne $false) { return }
+
+    if ($BranchCreated) {
+        try {
+            $branchSnapshot = Get-TaskGitRefCommit -RepositoryPath $RepositoryPath -Reference "refs/heads/$Branch"
+        }
+        catch { return }
+        if ($branchSnapshot.Exists) { return }
+    }
+
+    Remove-Item -LiteralPath $Path -Force
 }
 
 function Get-TaskRemoteTrackingBranchName {
@@ -203,23 +249,55 @@ function Get-TaskBranchAutoSetupMerge {
     return $value.ToLowerInvariant()
 }
 
+function Resolve-TaskSymbolicRef {
+    param([string]$RepositoryPath, [string]$Reference)
+
+    # A symbolic start point (a remote's HEAD, or a local alias branch) behaves
+    # like its target for tracking: native git records the target ref. Keep the
+    # name itself only when it is not symbolic.
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('symbolic-ref', '-q', $Reference) -NoLazyFetch
+    if ($result.ExitCode -eq 0) {
+        $target = ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+        if ($target -clike 'refs/*') { return $target }
+    }
+    return $Reference
+}
+
+function Get-TaskRefUpstreamRef {
+    param([string]$RepositoryPath, [string]$Reference)
+
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('for-each-ref', '--format=%(upstream)', $Reference) -NoLazyFetch
+    if ($result.ExitCode -ne 0) {
+        throw "cannot read the upstream for '$Reference' in '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
+    }
+    $upstream = ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+    if ($upstream -clike 'refs/*') { return $upstream }
+    return $null
+}
+
 function Get-TaskNewBranchUpstreamRef {
     param([string]$RepositoryPath, [string]$Branch, [string]$StartRef)
 
-    # Native `git worktree add -b <branch> <dest> <start>` sets an upstream only
-    # when the start point is a remote-tracking branch. Applying that decision
-    # here keeps branch.autoSetupMerge semantics after the start is pinned to a
-    # commit.
-    $remoteBranch = Get-TaskRemoteTrackingBranchName -Reference $StartRef
-    if (-not $remoteBranch) { return $null }
+    # Native `git worktree add -b <branch> <dest> <start>` sets an upstream from
+    # the start point according to branch.autoSetupMerge. Applying that decision
+    # here keeps native semantics after the start is pinned to a commit.
+    if ($StartRef -notlike 'refs/*') { return $null }
+    $startRef = Resolve-TaskSymbolicRef -RepositoryPath $RepositoryPath -Reference $StartRef
 
     $mode = Get-TaskBranchAutoSetupMerge -RepositoryPath $RepositoryPath
-    if ($mode -in @('true', '1', 'yes', 'on', 'always')) { return $StartRef }
+    if ($mode -ceq 'inherit') {
+        # Copy the start point's tracking configuration, as git itself does.
+        return Get-TaskRefUpstreamRef -RepositoryPath $RepositoryPath -Reference $startRef
+    }
+
+    $remoteBranch = Get-TaskRemoteTrackingBranchName -Reference $startRef
+    if ($mode -ceq 'always') { return $startRef }
+    if ($mode -in @('true', '1', 'yes', 'on')) { return $(if ($remoteBranch) { $startRef } else { $null }) }
     if ($mode -in @('false', '0', 'no', 'off')) { return $null }
     if ($mode -ceq 'simple') {
         # `simple` tracks only when the new branch name matches the tracked
         # remote branch name (origin/feature/x -> feature/x).
-        return $(if ($remoteBranch -ceq $Branch) { $StartRef } else { $null })
+        return $(if ($remoteBranch -ceq $Branch) { $startRef } else { $null })
     }
 
     # git itself rejects an unknown value for every command, so planning must
@@ -349,7 +427,10 @@ function New-TaskWorktreePlan {
         if (-not $localBaseSnapshot.Commit) {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseSnapshot.Commit; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        # `always` tracks a local start point and `inherit` copies its tracking
+        # configuration, so a local base is not always upstream-less.
+        $upstreamRef = Get-TaskNewBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch -StartRef $localBaseRef
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseSnapshot.Commit; UpstreamRef = $upstreamRef; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     $remoteBase = if ($Repository.BaseBranch -match '^[^/]+/.+') { $Repository.BaseBranch } else { "origin/$($Repository.BaseBranch)" }
@@ -573,7 +654,7 @@ function Invoke-TaskWorktreePlan {
         $process.WaitForExit()
         $gitText = $standardError.GetAwaiter().GetResult() + $standardOutput.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchCreated:$createsBranch
             $detail = Get-TaskGitDiagnostic -Text $gitText
             if ($detail) { throw "git worktree add failed for '$($Repository.Name)': $detail" }
             throw "git worktree add failed for '$($Repository.Name)'"
@@ -586,7 +667,7 @@ function Invoke-TaskWorktreePlan {
     if ($sourceCommit) {
         $headResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('rev-parse', 'HEAD^{commit}') -NoLazyFetch
         if ($headResult.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchCreated:$createsBranch
             $detail = Get-TaskGitDiagnostic -Text $headResult.Text
             if ($detail) { throw "cannot verify the new worktree HEAD for '$($Repository.Name)': $detail" }
             throw "cannot verify the new worktree HEAD for '$($Repository.Name)'"
@@ -595,6 +676,18 @@ function Invoke-TaskWorktreePlan {
         if ($head -cne $sourceCommit) {
             throw "worktree HEAD '$head' for '$($Repository.Name)' is not the reviewed commit '$sourceCommit'"
         }
+    }
+
+    # A commit match alone cannot prove the task branch is checked out: a hook
+    # can detach HEAD or switch to another branch at the same commit.
+    $headRefResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('symbolic-ref', '-q', 'HEAD') -NoLazyFetch
+    $expectedHeadRef = "refs/heads/$($Repository.Branch)"
+    if ($headRefResult.ExitCode -ne 0) {
+        throw "worktree for '$($Repository.Name)' has a detached HEAD instead of '$expectedHeadRef'"
+    }
+    $headRef = ([string](@($headRefResult.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+    if ($headRef -cne $expectedHeadRef) {
+        throw "worktree HEAD for '$($Repository.Name)' is on '$headRef' instead of '$expectedHeadRef'"
     }
 
     # A tracking plan always keeps its upstream on the full, unambiguous remote
@@ -608,14 +701,14 @@ function Invoke-TaskWorktreePlan {
     if ($upstreamRef) {
         $upstreamResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('branch', "--set-upstream-to=$upstreamRef", $Repository.Branch)
         if ($upstreamResult.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchCreated:$createsBranch
             $detail = Get-TaskGitDiagnostic -Text $upstreamResult.Text
             if ($detail) { throw "git branch --set-upstream-to failed for '$($Repository.Name)': $detail" }
             throw "git branch --set-upstream-to failed for '$($Repository.Name)'"
         }
         $upstreamReadBack = Invoke-TaskWorktreeGitCommand -RepositoryPath $Plan.Destination -Arguments @('for-each-ref', '--format=%(upstream)', "refs/heads/$($Repository.Branch)") -NoLazyFetch
         if ($upstreamReadBack.ExitCode -ne 0) {
-            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination
+            Clear-TaskWorktreeCreationMarkerIfNoWorktree -Path $markerPath -Destination $Plan.Destination -GitStarted -RepositoryPath $repositoryPath -Branch $Repository.Branch -BranchCreated:$createsBranch
             $detail = Get-TaskGitDiagnostic -Text $upstreamReadBack.Text
             if ($detail) { throw "cannot verify the upstream for '$($Repository.Name)': $detail" }
             throw "cannot verify the upstream for '$($Repository.Name)'"

@@ -405,6 +405,24 @@ Describe 'dotnet task plan' {
             $validResult.plan.worktreeOperations[0].source | Should -Be 'feature/FEATURE-123'
         }
 
+        It 'blocks reuse when the per-repository incomplete-creation marker exists' {
+            $repositoryPath = New-TestRepository -Name 'api-incomplete-marker'
+            $tasksRoot = Join-Path $TestDrive 'tasks-incomplete-marker'
+            & git -C $repositoryPath worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-incomplete-marker.json') -Request $request
+
+            $healthy = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'healthy reuse plan'
+            $healthy.plan.worktreeOperations[0].action | Should -Be 'reuse'
+
+            $markerPath = Join-Path $tasksRoot 'FEATURE-123/worktrees/.ai-task-scaffold-incomplete.api'
+            '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
+            $blocked = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'incomplete marker plan'
+            $blocked.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $blocked.plan.worktreeOperations[0].reason | Should -Be 'incomplete-worktree-creation'
+            Test-Path -LiteralPath $markerPath | Should -BeTrue
+        }
+
         It 'plans a tracking branch from the full remote ref when the start commit matches' {
             $repositoryPath = New-TestRepository -Name 'api-start-commit-remote'
             $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
