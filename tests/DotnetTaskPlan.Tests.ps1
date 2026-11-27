@@ -337,6 +337,51 @@ Describe 'dotnet task plan' {
             $observedReasons | Should -Be @('unsafe-worktree-path', 'unsafe-worktree-path', 'unsafe-worktree-path')
         }
     }
+    Context 'planning from an explicit start commit' {
+        It 'plans create-local from the start commit and changes the identity' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit'
+            $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+            & git -C $repositoryPath commit -am 'advance main' | Out-Null
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit'
+
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $request.repositories[0]['startCommit'] = $older
+            $olderPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-older.json') -Request $request
+            $olderPlan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $olderPath -TasksRoot $tasksRoot) -Case 'start commit plan'
+
+            $operation = $olderPlan.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'create-local'
+            $operation.source | Should -Be $older
+            $operation.branchMode | Should -Be 'new'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+            $headRequest = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $headRequest.repositories[0]['startCommit'] = $head
+            $headPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-head.json') -Request $headRequest
+            $headPlan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $headPath -TasksRoot $tasksRoot) -Case 'newer start commit plan'
+            $headPlan.planIdentity | Should -Not -Be $olderPlan.planIdentity
+
+            $noCommitRequest = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $noCommitPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-none.json') -Request $noCommitRequest
+            $noCommitPlan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $noCommitPath -TasksRoot $tasksRoot) -Case 'plan without start commit'
+            $noCommitPlan.planIdentity | Should -Not -Be $olderPlan.planIdentity
+        }
+
+        It 'blocks a start commit that is missing locally' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-missing'
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit-missing'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $request.repositories[0]['startCommit'] = ('a' * 40)
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-missing.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'missing start commit plan'
+
+            $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+        }
+    }
 }
 
 Describe 'dotnet task plan ctx roots' {

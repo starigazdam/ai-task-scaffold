@@ -337,6 +337,13 @@ function ConvertTo-TaskRequest {
         if (-not (Test-GitBranchName -Name ([string]$repository.branch))) {
             throw "invalid Git branch '$($repository.branch)'"
         }
+        $startCommitProperty = $repository.PSObject.Properties['startCommit']
+        if ($startCommitProperty -and $null -ne $startCommitProperty.Value) {
+            $startCommit = [string]$startCommitProperty.Value
+            if ($startCommit -cnotmatch '^([0-9a-f]{40}|[0-9a-f]{64})$') {
+                throw "invalid start commit '$startCommit' for repository '$($repository.name)': expected a full 40- or 64-character lowercase object ID"
+            }
+        }
     }
     $duplicate = $repositories | Group-Object name | Where-Object Count -gt 1 | Select-Object -First 1
     if ($duplicate) {
@@ -351,11 +358,17 @@ function ConvertTo-TaskRequest {
             PrdPath = $prdPath
         }
         Repositories = @($repositories | ForEach-Object {
+            $startCommit = $null
+            $startCommitProperty = $_.PSObject.Properties['startCommit']
+            if ($startCommitProperty -and $null -ne $startCommitProperty.Value) {
+                $startCommit = [string]$startCommitProperty.Value
+            }
             [pscustomobject]@{
                 Name = [string]$_.name
                 Path = [string]$_.path
                 BaseBranch = [string]$_.baseBranch
                 Branch = [string]$_.branch
+                StartCommit = $startCommit
             }
         })
         Profiles = $profiles

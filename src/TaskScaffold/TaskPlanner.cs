@@ -118,6 +118,8 @@ public sealed class CanonicalRepository
     public string BaseBranch { get; init; } = string.Empty;
 
     public string Branch { get; init; } = string.Empty;
+
+    public string? StartCommit { get; init; }
 }
 
 public sealed class CanonicalProfile
@@ -496,12 +498,57 @@ public static class TaskPlanner
         }
 
         var requestedLocal = $"refs/heads/{repository.Branch}";
+        var requestedRemote = $"refs/remotes/origin/{repository.Branch}";
+        if (repository.StartCommit is { } startCommit)
+        {
+            if (!string.Equals(ResolveCommit(repository.Path, startCommit), startCommit, StringComparison.Ordinal))
+            {
+                return Blocked(repository, destination, "start-commit-missing", commonDir, head);
+            }
+
+            if (RefExists(repository.Path, requestedLocal))
+            {
+                if (!string.Equals(ResolveCommit(repository.Path, requestedLocal), startCommit, StringComparison.Ordinal))
+                {
+                    return Blocked(repository, destination, "start-commit-mismatch", commonDir, head);
+                }
+
+                return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, commonDir, head);
+            }
+
+            if (RefExists(repository.Path, requestedRemote))
+            {
+                if (!string.Equals(ResolveCommit(repository.Path, requestedRemote), startCommit, StringComparison.Ordinal))
+                {
+                    return Blocked(repository, destination, "start-commit-mismatch", commonDir, head);
+                }
+
+                return new PlannedOperation
+                {
+                    Operation = new WorktreeOperation
+                    {
+                        Repository = repository.Name,
+                        Action = "create-remote",
+                        Source = $"origin/{repository.Branch}",
+                        BranchMode = "track",
+                        Destination = destination,
+                        Reason = null,
+                    },
+                    CommonDir = commonDir,
+                    Head = head,
+                    SourceRef = requestedRemote,
+                    SourceCommit = startCommit,
+                };
+            }
+
+            return CreateLocal(repository, destination, startCommit, "new", startCommit, commonDir, head);
+        }
+
         if (RefExists(repository.Path, requestedLocal))
         {
             return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, commonDir, head);
         }
 
-        var requestedRemote = $"refs/remotes/origin/{repository.Branch}";
         if (RefExists(repository.Path, requestedRemote))
         {
             return new PlannedOperation
@@ -569,6 +616,22 @@ public static class TaskPlanner
         };
     }
 
+    private static PlannedOperation Blocked(NormalizedRepository repository, string destination, string reason, string commonDir, string head)
+    {
+        return new PlannedOperation
+        {
+            Operation = new WorktreeOperation
+            {
+                Repository = repository.Name,
+                Action = "blocked",
+                Destination = destination,
+                Reason = reason,
+            },
+            CommonDir = commonDir,
+            Head = head,
+        };
+    }
+
     private static CanonicalPlanInput BuildCanonicalInput(NormalizedRequest request, string tasksRoot, List<NormalizedRepository> repositories, List<PlannedOperation> planned, TaskStatePlanned state, CtxRootOptions ctxRoots)
     {
         return new CanonicalPlanInput
@@ -584,6 +647,7 @@ public static class TaskPlanner
                 Path = r.Path,
                 BaseBranch = r.BaseBranch,
                 Branch = r.Branch,
+                StartCommit = r.StartCommit,
             }).ToList(),
             Profiles = request.Profiles.Select(p => new CanonicalProfile
             {

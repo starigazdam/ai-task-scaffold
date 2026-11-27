@@ -47,6 +47,8 @@ public sealed class NormalizedRepository
     public string BaseBranch { get; init; } = string.Empty;
 
     public string Branch { get; init; } = string.Empty;
+
+    public string? StartCommit { get; init; }
 }
 
 public sealed class NormalizedTaskFile
@@ -105,6 +107,8 @@ public sealed class ValidationResult
 public static class RequestValidator
 {
     private static readonly Regex NamePattern = new(@"\A[A-Za-z0-9][A-Za-z0-9._-]*\z", RegexOptions.CultureInvariant);
+
+    private static readonly Regex StartCommitPattern = new(@"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z", RegexOptions.CultureInvariant);
 
     private static readonly HashSet<string> ReservedProfileNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -210,7 +214,7 @@ public static class RequestValidator
             var repositoryNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var repositoryElement in repositoriesElement.EnumerateArray())
             {
-                var repository = ReadObject(repositoryElement, "repositories[]", "name", "path", "baseBranch", "branch");
+                var repository = ReadObject(repositoryElement, "repositories[]", "name", "path", "baseBranch", "branch", "startCommit");
                 var name = ReadString(Require(repository, "name", "repository"), "repository.name");
                 if (!NamePattern.IsMatch(name))
                 {
@@ -240,6 +244,20 @@ public static class RequestValidator
                     throw new InputException($"invalid Git branch '{branch}'");
                 }
 
+                string? startCommit = null;
+                if (repository.TryGetValue("startCommit", out var startCommitElement) && startCommitElement.ValueKind != JsonValueKind.Null)
+                {
+                    var rawStartCommit = startCommitElement.ValueKind == JsonValueKind.String
+                        ? startCommitElement.GetString() ?? string.Empty
+                        : startCommitElement.GetRawText();
+                    if (!StartCommitPattern.IsMatch(rawStartCommit))
+                    {
+                        throw new InputException($"invalid start commit '{rawStartCommit}' for repository '{name}': expected a full 40- or 64-character lowercase object ID");
+                    }
+
+                    startCommit = rawStartCommit;
+                }
+
                 var resolvedPath = ResolvePath(rawPath, requestDirectory);
                 repositories.Add(new RepositoryEntry
                 {
@@ -252,6 +270,7 @@ public static class RequestValidator
                     Path = resolvedPath,
                     BaseBranch = baseBranch,
                     Branch = branch,
+                    StartCommit = startCommit,
                 });
             }
 

@@ -326,3 +326,77 @@ Describe 'Invoke-TaskWorktreePlan' {
         (& git -C $repeatPlan.Destination branch --show-current) | Should -Be 'feature/FEATURE-123'
     }
 }
+
+Describe 'New-TaskWorktreePlan start commit' {
+    BeforeAll {
+        function New-StartCommitRepository {
+            param([string]$Path)
+
+            New-Item -ItemType Directory -Path $Path | Out-Null
+            & git -C $Path init -b main | Out-Null
+            & git -C $Path config user.name Test
+            & git -C $Path config user.email test@example.invalid
+            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'first'
+            & git -C $Path add README.md
+            & git -C $Path commit -m first | Out-Null
+            $older = (& git -C $Path rev-parse HEAD).Trim()
+            Set-Content -LiteralPath (Join-Path $Path 'README.md') -Value 'second'
+            & git -C $Path commit -am second | Out-Null
+            $head = (& git -C $Path rev-parse HEAD).Trim()
+
+            [pscustomobject]@{ Path = $Path; Older = $older; Head = $head }
+        }
+    }
+
+    It 'plans and applies a new branch from an explicit start commit' {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Older }
+        $tasksRoot = Join-Path $TestDrive 'workspace-start-commit'
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.Source | Should -Be $fixture.Older
+        $plan.BranchMode | Should -Be 'new'
+
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        Test-Path -LiteralPath $plan.Destination | Should -BeTrue
+        (& git -C $fixture.Path rev-parse 'feature/FEATURE-123').Trim() | Should -Be $fixture.Older
+        (& git -C $fixture.Path rev-parse 'main').Trim() | Should -Be $fixture.Head
+    }
+
+    It 'blocks a start commit that is missing locally' {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit-missing')
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = ('a' * 40) }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-start-commit-missing')
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'start-commit-missing'
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
+    }
+
+    It 'blocks an existing branch that points at another commit' {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit-mismatch')
+        & git -C $fixture.Path branch feature/FEATURE-123 | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Older }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-start-commit-mismatch')
+
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'start-commit-mismatch'
+    }
+
+    It 'reuses an existing branch that points at the start commit' {
+        $fixture = New-StartCommitRepository -Path (Join-Path $TestDrive 'api-start-commit-existing')
+        & git -C $fixture.Path branch feature/FEATURE-123 $fixture.Older | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Older }
+
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'workspace-start-commit-existing')
+
+        $plan.Action | Should -Be 'create-local'
+        $plan.Source | Should -Be 'feature/FEATURE-123'
+        $plan.BranchMode | Should -Be 'existing'
+    }
+}

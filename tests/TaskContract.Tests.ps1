@@ -131,6 +131,45 @@ Describe 'ConvertTo-TaskRequest' {
         }
     }
 
+    It 'validates an optional explicit start commit' {
+        $requestPath = Join-Path $TestDrive 'start-commit.json'
+        $validStartCommit = ('0123456789abcdef' * 3).Substring(0, 40)
+        $baseRepository = [ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123' }
+
+        $accepted = [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123'; startCommit = $validStartCommit })
+        }
+        $accepted | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        $request = ConvertTo-TaskRequest -Path $requestPath
+        $request.Repositories[0].StartCommit | Should -Be $validStartCommit
+
+        $absent = [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @($baseRepository)
+        }
+        $absent | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        (ConvertTo-TaskRequest -Path $requestPath).Repositories[0].StartCommit | Should -BeNullOrEmpty
+
+        $invalidValues = @(
+            $validStartCommit.Substring(0, 12)
+            $validStartCommit.ToUpperInvariant()
+            'main'
+            ''
+        )
+        foreach ($invalidValue in $invalidValues) {
+            $invalid = [ordered]@{
+                schemaVersion = 2
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+                repositories = @([ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123'; startCommit = $invalidValue })
+            }
+            $invalid | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw "*invalid start commit '$invalidValue' for repository 'api'*"
+        }
+    }
+
     It 'rejects duplicate repository names' {
         $requestPath = Join-Path $TestDrive 'duplicate-repository.json'
         @'

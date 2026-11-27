@@ -8,6 +8,14 @@ function Test-GitRef {
     return $LASTEXITCODE -eq 0
 }
 
+function Get-GitCommit {
+    param([string]$RepositoryPath, [string]$Reference)
+
+    $output = & git -C $RepositoryPath rev-parse --verify --quiet "$Reference^{commit}" 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return ([string]($output | Select-Object -First 1)).Trim()
+}
+
 function Get-GitCommonDir {
     param([string]$RepositoryPath)
 
@@ -118,6 +126,32 @@ function New-TaskWorktreePlan {
             return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; RepositoryCommonDir = $repositoryCommonDir; WorktreeGitDir = (Get-GitDir -RepositoryPath $destination); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
         return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'destination-exists'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+    }
+
+    $startCommit = if ($Repository.PSObject.Properties['StartCommit']) { $Repository.StartCommit } else { $null }
+    if ($startCommit) {
+        $resolvedStartCommit = Get-GitCommit -RepositoryPath $Repository.Path -Reference $startCommit
+        if ($resolvedStartCommit -cne $startCommit) {
+            return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
+
+        $localBranchRef = "refs/heads/$($Repository.Branch)"
+        if (Test-GitRef -RepositoryPath $Repository.Path -Reference $localBranchRef) {
+            if ((Get-GitCommit -RepositoryPath $Repository.Path -Reference $localBranchRef) -cne $startCommit) {
+                return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-mismatch'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+            }
+            return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
+
+        $remoteBranchRef = "refs/remotes/origin/$($Repository.Branch)"
+        if (Test-GitRef -RepositoryPath $Repository.Path -Reference $remoteBranchRef) {
+            if ((Get-GitCommit -RepositoryPath $Repository.Path -Reference $remoteBranchRef) -cne $startCommit) {
+                return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-mismatch'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+            }
+            return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = "origin/$($Repository.Branch)"; BranchMode = 'track'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        }
+
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $startCommit; BranchMode = 'new'; Repository = $Repository.Name; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     if (Test-GitRef -RepositoryPath $Repository.Path -Reference "refs/heads/$($Repository.Branch)") {

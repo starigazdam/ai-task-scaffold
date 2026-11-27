@@ -86,6 +86,7 @@ function Get-TaskRepositoryIdentity {
             CommonDir = Get-PlanGitCommonDir -RepositoryPath $repository.Path
             RequestedBranch = $repository.Branch
             BaseBranch = $repository.BaseBranch
+            StartCommit = if ($repository.PSObject.Properties['StartCommit']) { $repository.StartCommit } else { $null }
             LocalBranchCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/heads/$($repository.Branch)"
             RemoteBranchCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/remotes/origin/$($repository.Branch)"
             LocalBaseCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/heads/$($repository.BaseBranch)"
@@ -158,7 +159,8 @@ function Get-TaskScaffoldIdentityMaterial {
             PrdPath = $Request.Task.PrdPath
         }
         Repositories = @($Request.Repositories | ForEach-Object {
-            [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path); BaseBranch = $_.BaseBranch; Branch = $_.Branch }
+            $startCommit = if ($_.PSObject.Properties['StartCommit']) { $_.StartCommit } else { $null }
+            [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path); BaseBranch = $_.BaseBranch; Branch = $_.Branch; StartCommit = $startCommit }
         })
         Profiles = @($Request.Profiles | ForEach-Object {
             [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path) }

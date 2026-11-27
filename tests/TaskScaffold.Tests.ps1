@@ -54,6 +54,52 @@ Describe 'Invoke-TaskScaffold' {
         Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
     }
 
+    It 'plans from an explicit start commit and binds it into the plan identity' {
+        $repositoryPath = Join-Path $TestDrive 'api-explicit-start-commit'
+        New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath
+        $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+        & git -C $repositoryPath commit -am 'advance main' | Out-Null
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+        $tasksRoot = Join-Path $TestDrive 'start-commit-tasks'
+        function Write-StartCommitRequest {
+            param([string]$Path, [string]$StartCommit)
+
+            $repository = [ordered]@{ name = 'api'; path = $repositoryPath; baseBranch = 'main'; branch = 'task/FEATURE-123' }
+            if ($StartCommit) { $repository['startCommit'] = $StartCommit }
+            [ordered]@{
+                schemaVersion = 2
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+                repositories = @($repository)
+            } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -NoNewline
+        }
+
+        $olderPath = Join-Path $TestDrive 'start-commit-older.json'
+        Write-StartCommitRequest -Path $olderPath -StartCommit $older
+        $plan = & $script -RequestPath $olderPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+        $plan.WorktreeOperations[0].Action | Should -Be 'create-local'
+        $plan.WorktreeOperations[0].Source | Should -Be $older
+        $plan.WorktreeOperations[0].BranchMode | Should -Be 'new'
+        Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+        $repeat = & $script -RequestPath $olderPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $repeat.PlanIdentity | Should -Be $plan.PlanIdentity
+
+        $headPath = Join-Path $TestDrive 'start-commit-head.json'
+        Write-StartCommitRequest -Path $headPath -StartCommit $head
+        $headPlan = & $script -RequestPath $headPath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $headPlan.PlanIdentity | Should -Not -Be $plan.PlanIdentity
+
+        $nonePath = Join-Path $TestDrive 'start-commit-none.json'
+        Write-StartCommitRequest -Path $nonePath
+        $nonePlan = & $script -RequestPath $nonePath -TasksRoot $tasksRoot | ConvertFrom-Json
+        $nonePlan.PlanIdentity | Should -Not -Be $plan.PlanIdentity
+        $nonePlan.WorktreeOperations[0].Source | Should -Be 'main'
+    }
+
     It 'rejects apply without a reviewed plan identity before creating task state' {
         $repositoryPath = Join-Path $TestDrive 'api-missing-plan-identity'
         New-TaskScaffoldIdentityRepository -RepositoryPath $repositoryPath

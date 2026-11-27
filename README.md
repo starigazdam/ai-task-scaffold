@@ -100,6 +100,12 @@ $plan = ./scripts/Invoke-TaskScaffold.ps1 -RequestPath ./task-request.json -Task
 
 When a workspace file is supplied, the plan proposes `[AI] <name>` folders pointing to the original profile roots, alongside task worktrees. Workspace changes remain a separate add-only, hash-gated operation. The scaffold also plans `.ctx` from the ordered effective profiles, with exactly one existing-format `name:path` entry per profile. Dry-run reports the target and content without creating it; `-Apply` creates or reconciles the file. No `home:` directive is generated. Task-scaffold does not invoke `ctx` or activate CLI profiles; ctx consumes the persisted effective profile list later. The .NET CLI `task plan`/`task apply` accept optional `--ctx-config-root <dir>` and `--ctx-external-profiles-root <dir>`; when either is supplied the planned `.ctx` starts with `config-root:` and/or `external-profiles-root:` lines followed by the profile entries, all paths relative to the task folder where possible (absolute otherwise), and the roots are validated and bound into `PlanIdentity`. Without them the output is unchanged. `scripts/Invoke-TaskScaffold.ps1` accepts the same optional `-CtxConfigRoot <dir>` / `-CtxExternalProfilesRoot <dir>` parameters with identical validation, content, and `PlanIdentity` binding; it never infers a root from profile paths and never reads or mutates `AI_CTX_PROFILES_CONFIG_ROOT` / `AI_CTX_PROFILES_EXTERNAL_PROFILES_ROOT`.
 
+## Explicit start commit
+
+Each repository entry may include an optional `startCommit`. It must be a full lowercase Git object ID: exactly 40 or 64 hex characters. Abbreviated IDs, uppercase IDs, ref names such as `main` or `HEAD`, and empty strings are rejected as input errors. `baseBranch` stays required and is unchanged.
+
+When `startCommit` is set, the scaffold verifies the commit exists locally and does not fetch. A missing commit blocks the plan with `start-commit-missing`. An existing local or `origin` branch for the requested branch must point at that commit, otherwise the plan is blocked with `start-commit-mismatch`. Otherwise the branch is created from the commit. Reusing an existing matching worktree is unchanged.
+
 ## Reviewed Plan Identity
 
 Run `Invoke-TaskScaffold.ps1` without `-Apply` to receive the complete deterministic plan and its opaque `PlanIdentity` (a SHA-256 digest). To apply that exact reviewed plan, pass the identity back through the public script interface:

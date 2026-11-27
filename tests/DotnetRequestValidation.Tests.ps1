@@ -307,6 +307,45 @@ Describe 'dotnet request validate' {
         }
     }
 
+    Context 'when startCommit is supplied' {
+        It 'accepts a full lowercase object ID and rejects invalid values' {
+            $root = Join-Path $TestDrive 'start-commit'
+            $repository = New-Item -ItemType Directory -Path (Join-Path $root 'canons/api') -Force
+            $valid = ('0123456789abcdef' * 3).Substring(0, 40)
+
+            $accepted = New-BaseRequest -RepositoryPath $repository.FullName
+            $accepted.repositories[0]['startCommit'] = $valid
+            $acceptedPath = Write-Request -Path (Join-Path $root 'start-commit-valid.json') -Request $accepted
+            $result = Assert-SuccessJson -Run (Invoke-RequestValidation -RequestPath $acceptedPath) -Case 'valid startCommit'
+            $result.repositories[0].name | Should -Be 'api'
+            Assert-PropertySet -Object $result.repositories[0] -Expected @('name', 'path') -Case 'the repository entry'
+
+            $nullCommit = New-BaseRequest -RepositoryPath $repository.FullName
+            $nullCommit.repositories[0]['startCommit'] = $null
+            $nullPath = Write-Request -Path (Join-Path $root 'start-commit-null.json') -Request $nullCommit
+            [void](Assert-SuccessJson -Run (Invoke-RequestValidation -RequestPath $nullPath) -Case 'null startCommit')
+
+            $cases = [ordered]@{
+                'abbreviated start commit' = $valid.Substring(0, 12)
+                'uppercase start commit'   = $valid.ToUpperInvariant()
+                'ref name start commit'    = 'main'
+                'empty start commit'       = ''
+                'non-string start commit'  = 12
+            }
+
+            $index = 0
+            foreach ($name in $cases.Keys) {
+                $request = New-BaseRequest -RepositoryPath $repository.FullName
+                $request.repositories[0]['startCommit'] = $cases[$name]
+                $requestPath = Write-Request -Path (Join-Path $root "start-commit-$index.json") -Request $request
+                $run = Invoke-RequestValidation -RequestPath $requestPath
+                Assert-CommandFailure -Run $run -Case $name
+                $run.StdErr | Should -Match 'invalid start commit' -Because "$name should name the start commit"
+                $index++
+            }
+        }
+    }
+
     Context 'when required fields are malformed or invalid' {
         It 'rejects malformed JSON, missing or invalid fields, zero or duplicate repositories, and invalid branches' {
             $root = Join-Path $TestDrive 'invalid-core'
