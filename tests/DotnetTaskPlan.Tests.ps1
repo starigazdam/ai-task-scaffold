@@ -415,12 +415,33 @@ Describe 'dotnet task plan' {
             $healthy = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'healthy reuse plan'
             $healthy.plan.worktreeOperations[0].action | Should -Be 'reuse'
 
-            $markerPath = Join-Path $tasksRoot 'FEATURE-123/worktrees/.ai-task-scaffold-incomplete.api'
+            $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes('api'))).ToLowerInvariant()
+            $markerPath = Join-Path $tasksRoot "FEATURE-123/worktrees/$markerName"
             '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
             $blocked = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'incomplete marker plan'
             $blocked.plan.worktreeOperations[0].action | Should -Be 'blocked'
             $blocked.plan.worktreeOperations[0].reason | Should -Be 'incomplete-worktree-creation'
             Test-Path -LiteralPath $markerPath | Should -BeTrue
+        }
+
+        It 'finds the marker for a 250-character repository name' {
+            $name = 'a' * 250
+            $repositoryPath = New-TestRepository -Name 'api-long-marker'
+            $tasksRoot = Join-Path $TestDrive 'tasks-long-marker'
+            $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes($name))).ToLowerInvariant()
+            New-Item -ItemType Directory -Path (Join-Path $tasksRoot 'FEATURE-123/worktrees') -Force | Out-Null
+            $markerPath = Join-Path $tasksRoot "FEATURE-123/worktrees/$markerName"
+            '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = $name; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-long-marker.json') -Request $request
+
+            $blocked = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'long marker plan'
+
+            $blocked.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $blocked.plan.worktreeOperations[0].reason | Should -Be 'incomplete-worktree-creation'
+            [IO.Path]::GetFileName($markerPath).Length | Should -BeLessOrEqual 255
         }
 
         It 'plans a tracking branch from the full remote ref when the start commit matches' {
@@ -626,6 +647,35 @@ Describe 'dotnet task plan ref resolution and Git capability' {
         $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
         $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
         Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
+    }
+
+    It 'blocks a malformed loose branch ref instead of falling through to the base' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-malformed'
+        $refPath = Join-Path $repositoryPath '.git/refs/heads/feature/FEATURE-123'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $refPath) -Force | Out-Null
+        Set-Content -LiteralPath $refPath -Value 'this-is-not-an-object-id' -NoNewline
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-malformed.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-malformed')) -Case 'malformed task ref'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'blocks a cyclic symbolic branch ref instead of treating it as absent' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-cyclic'
+        $refPath = Join-Path $repositoryPath '.git/refs/heads/feature/FEATURE-123'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $refPath) -Force | Out-Null
+        try { New-Item -ItemType SymbolicLink -Path $refPath -Target 'FEATURE-123' | Out-Null }
+        catch { Set-ItResult -Skipped -Because 'this platform cannot create a cyclic symbolic ref'; return }
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-cyclic.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-cyclic')) -Case 'cyclic symbolic task ref'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
     }
 
     It 'blocks a start commit that only a replacement ref can resolve' {

@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -769,21 +770,11 @@ public static class TaskPlanner
         // Presence comes from exact name checks that never run revision DWIM:
         // show-ref --verify and symbolic-ref -q accept only the full name, so a
         // lookalike tag cannot stand in. for-each-ref supplies the raw object
-        // ID. A name that is present but whose tip cannot be read -- a dangling
-        // symbolic ref, which show-ref reports as absent and for-each-ref omits
-        // -- stays present so callers fail closed instead of falling through.
+        // ID. Absence needs every signal: show-ref exit 1, symbolic-ref exit 1,
+        // no listing row, and no for-each-ref warning. A malformed loose ref or
+        // a cyclic symref is present-but-unreadable, never absent.
         var presence = RunGit(repositoryPath, "show-ref", "--verify", "--quiet", reference);
-        var exists = presence.ExitCode == 0;
-        if (!exists && presence.ExitCode == 1)
-        {
-            var symbolic = RunGit(repositoryPath, "symbolic-ref", "-q", reference);
-            exists = symbolic.ExitCode == 0;
-        }
-        else if (!exists)
-        {
-            // Any other exit is an unreadable ref, never an absent one.
-            exists = true;
-        }
+        var symbolic = RunGit(repositoryPath, "symbolic-ref", "-q", reference);
 
         var result = RunGit(repositoryPath, "for-each-ref", "--format=%(refname) %(objectname)", reference);
         if (result.ExitCode != 0)
@@ -792,6 +783,7 @@ public static class TaskPlanner
         }
 
         string? objectId = null;
+        var listed = false;
         foreach (var rawLine in result.StdOut.Split('\n'))
         {
             var line = rawLine.TrimEnd('\r');
@@ -807,8 +799,25 @@ public static class TaskPlanner
                 objectId = candidate;
             }
 
-            exists = true;
+            listed = true;
             break;
+        }
+
+        var warned = !string.IsNullOrWhiteSpace(result.StdErr);
+        bool exists;
+        if (presence.ExitCode == 0 || symbolic.ExitCode == 0 || listed)
+        {
+            exists = true;
+        }
+        else if (presence.ExitCode == 1 && symbolic.ExitCode == 1 && !warned)
+        {
+            exists = false;
+        }
+        else
+        {
+            // Another exit code, or a warning with an omitted row: present but
+            // unreadable. Callers fail closed instead of falling through.
+            exists = true;
         }
 
         if (!exists)
@@ -851,9 +860,17 @@ public static class TaskPlanner
     private static bool WorktreeCreationMarkerExists(string tasksRoot, string taskKey, string repositoryName)
     {
         // The marker lives in the scaffold-owned worktrees container, whose
-        // safety the destination check above already established.
-        var markerPath = Path.Combine(tasksRoot, taskKey, "worktrees", ".ai-task-scaffold-incomplete." + repositoryName);
+        // safety the destination check above already established. Its name is
+        // a fixed prefix plus a hash of the repository name, because every name
+        // TaskContract accepts must still fit one filesystem component.
+        var markerPath = Path.Combine(tasksRoot, taskKey, "worktrees", WorktreeMarkerName(repositoryName));
         return TryGetAttributes(markerPath, out var attributes) && (attributes & FileAttributes.Directory) == 0;
+    }
+
+    private static string WorktreeMarkerName(string repositoryName)
+    {
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(repositoryName))).ToLowerInvariant();
+        return ".ai-task-scaffold-incomplete." + hash;
     }
 
     private static bool HasUnsafePathComponent(string tasksRoot, string taskKey, string repositoryName)

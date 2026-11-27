@@ -1703,18 +1703,26 @@ Describe 'Invoke-TaskScaffold worktree creation recovery' {
         }
 
         function Write-ScaffoldRecoveryRequest {
-            param([string]$Path, [string]$RepositoryPath)
+            param([string]$Path, [string]$RepositoryPath, [string]$Name = 'api')
 
             [ordered]@{
                 schemaVersion = 1
                 task = [ordered]@{ key = 'FEATURE-123'; title = 'Recovery' }
                 repositories = @([ordered]@{
-                    name = 'api'
+                    name = $Name
                     path = $RepositoryPath
                     baseBranch = 'main'
                     branch = 'feature/FEATURE-123'
                 })
             } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -NoNewline
+        }
+
+        function Get-ScaffoldMarkerPath {
+            param([string]$TasksRoot, [string]$RepositoryName)
+
+            $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+                [Text.Encoding]::UTF8.GetBytes($RepositoryName))).ToLowerInvariant()
+            return Join-Path $TasksRoot "FEATURE-123/worktrees/$markerName"
         }
     }
 
@@ -1734,7 +1742,7 @@ Describe 'Invoke-TaskScaffold worktree creation recovery' {
         $tasksRoot = Join-Path $root 'tasks'
         $worktreesPath = Join-Path $tasksRoot 'FEATURE-123/worktrees'
         New-Item -ItemType Directory -Path $worktreesPath -Force | Out-Null
-        $markerPath = Join-Path $worktreesPath '.ai-task-scaffold-incomplete.api'
+        $markerPath = Get-ScaffoldMarkerPath -TasksRoot $tasksRoot -RepositoryName 'api'
         '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
         $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
 
@@ -1768,11 +1776,40 @@ Describe 'Invoke-TaskScaffold worktree creation recovery' {
         $destination = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
         (& git -C $destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
         (& git -C $destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -Be 'refs/remotes/origin/main'
-        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/.ai-task-scaffold-incomplete.api') | Should -BeFalse
+        Test-Path -LiteralPath (Get-ScaffoldMarkerPath -TasksRoot $tasksRoot -RepositoryName 'api') | Should -BeFalse
 
         $reuse = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
         $reuse.WorktreeOperations[0].Action | Should -Be 'reuse'
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $reuse.PlanIdentity } | Should -Not -Throw
+    }
+
+    It 'plans and applies a 250-character repository name without exceeding the marker component limit' {
+        $root = New-ScaffoldCaseRoot
+        $repositoryPath = Join-Path $root 'repo'
+        New-Item -ItemType Directory -Path $repositoryPath -Force | Out-Null
+        & git -C $repositoryPath init -b main | Out-Null
+        & git -C $repositoryPath config user.name Test
+        & git -C $repositoryPath config user.email test@example.invalid
+        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'fixture'
+        & git -C $repositoryPath add README.md
+        & git -C $repositoryPath commit -m fixture | Out-Null
+        $name = 'a' * 250
+        $requestPath = Join-Path $root 'request.json'
+        Write-ScaffoldRecoveryRequest -Path $requestPath -RepositoryPath $repositoryPath -Name $name
+        $tasksRoot = Join-Path $root 'tasks'
+        $script = Join-Path $PSScriptRoot '../scripts/Invoke-TaskScaffold.ps1'
+
+        $plan = & $script -RequestPath $requestPath -TasksRoot $tasksRoot | ConvertFrom-Json
+
+        $plan.WorktreeOperations[0].Action | Should -Be 'create-local'
+        $markerPath = Get-ScaffoldMarkerPath -TasksRoot $tasksRoot -RepositoryName $name
+        [IO.Path]::GetFileName($markerPath).Length | Should -BeLessOrEqual 255
+        & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity | Out-Null
+
+        $destination = Join-Path $tasksRoot "FEATURE-123/worktrees/$name"
+        Test-Path -LiteralPath (Join-Path $destination '.git') | Should -BeTrue
+        (& git -C $destination branch --show-current) | Should -Be 'feature/FEATURE-123'
+        Test-Path -LiteralPath $markerPath | Should -BeFalse
     }
 
     It 'invalidates a reviewed plan when branch.autoSetupMerge changes' {

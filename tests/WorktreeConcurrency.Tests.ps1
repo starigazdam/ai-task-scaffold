@@ -313,6 +313,38 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         ($results | Where-Object Status -eq 'failed' | Select-Object -Last 1).Repository | Should -Be 'charlie'
     }
 
+    It 'does not strand the second of two names sharing one repository branch' {
+        $case = New-ConcurrencyCaseRoot
+        $repositoryPath = Join-Path $case 'repos/shared'
+        New-ConcurrencyFixtureRepository -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $case 'tasks'
+        $first = [pscustomobject]@{ Name = 'one'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/SHARED' }
+        $second = [pscustomobject]@{ Name = 'two'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/SHARED' }
+        $items = @(
+            [pscustomobject]@{ Index = 0; Repository = $first; Plan = (New-TaskWorktreePlan -Repository $first -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot) },
+            [pscustomobject]@{ Index = 1; Repository = $second; Plan = (New-TaskWorktreePlan -Repository $second -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot) }
+        )
+
+        # The chain serializes both names on one common directory; the second
+        # add finds the branch the first just created and fails.
+        $results = Invoke-TaskWorktreePlanBatch -WorkItems $items -Limit 2 -ModulePath $modulePath
+
+        $results.Index | Should -Be @(0, 1)
+        $results.Status | Should -Be @('created', 'failed')
+        $results[1].Message | Should -Match 'git worktree add failed'
+        $secondMarker = Get-TaskWorktreeCreationMarkerPath -TasksRoot $tasksRoot -TaskKey 'CONCURRENCY-1' -RepositoryName 'two'
+        Test-Path -LiteralPath $secondMarker | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'CONCURRENCY-1/worktrees/two') | Should -BeFalse
+
+        # The existing branch is exactly the reviewed commit, so a fresh plan
+        # must not be blocked by the marker. Git itself still refuses a second
+        # checkout of a branch already used by the first worktree.
+        $retry = New-TaskWorktreePlan -Repository $second -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
+        $retry.Action | Should -Be 'create-local'
+        $retry.BranchMode | Should -Be 'existing'
+        Test-Path -LiteralPath $secondMarker | Should -BeFalse
+    }
+
     It 'keeps the serial behavior and message when the limit is one' {
         $case = New-ConcurrencyCaseRoot
         $names = @('alpha', 'bravo')

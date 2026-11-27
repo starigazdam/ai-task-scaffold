@@ -353,7 +353,9 @@ exit "$status"
     }
 
     It 'blocks teardown while an incomplete worktree creation marker exists' {
-        $markerPath = Join-Path $script:taskPath 'worktrees/.ai-task-scaffold-incomplete.api'
+        $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes('api'))).ToLowerInvariant()
+        $markerPath = Join-Path $script:taskPath "worktrees/$markerName"
         '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
 
         $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
@@ -364,5 +366,29 @@ exit "$status"
         Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
         Test-Path -LiteralPath $markerPath | Should -BeTrue
         Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+    }
+
+    It 'recognizes a marker for a 250-character repository name without a component-length failure' {
+        $name = 'a' * 250
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $manifest.repositories = @($manifest.repositories) + [pscustomobject]@{
+            name = $name
+            path = $script:repositoryPath
+            baseBranch = 'main'
+            branch = 'feature/FEATURE-123'
+        }
+        $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -NoNewline
+        $markerName = '.ai-task-scaffold-incomplete.' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData(
+            [Text.Encoding]::UTF8.GetBytes($name))).ToLowerInvariant()
+        $markerPath = Join-Path $script:taskPath "worktrees/$markerName"
+        '{"markerVersion":1}' | Set-Content -LiteralPath $markerPath -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'incomplete-worktree-creation'
+        @($plan.WorktreeOperations | Where-Object { $_.Repository -eq $name -and $_.Reason -eq 'missing-worktree' }) |
+            Should -BeNullOrEmpty -Because 'the marker must suppress the missing-worktree reason for that name'
     }
 }
