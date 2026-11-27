@@ -285,35 +285,12 @@ function Get-TaskBranchUpstreamRef {
     param([string]$RepositoryPath, [string]$Branch)
 
     # The branch's actual upstream, canonicalized, or none. Never invented from a
-    # same-named remote ref: reuse verifies exactly what the branch tracks.
+    # same-named remote ref: reuse and attach verify exactly what the branch
+    # tracks. Callers pass the destination for reuse so a worktree-local
+    # upstream (extensions.worktreeConfig) is read from where apply reads it.
     $current = Get-TaskRefUpstreamRef -RepositoryPath $RepositoryPath -Reference "refs/heads/$Branch"
     if (-not $current) { return $null }
     return Resolve-TaskRefTarget -RepositoryPath $RepositoryPath -Reference $current
-}
-
-function Get-TaskExistingBranchUpstreamRef {
-    param([string]$RepositoryPath, [string]$Branch)
-
-    # A branch that already tracks something keeps that upstream: a same-named
-    # remote ref is not evidence that the existing configuration is wrong, and a
-    # nonempty upstream is never retargeted. Only a branch with no upstream may
-    # be expected to adopt the task's remote ref when it is attached to a new
-    # worktree (create, not reuse).
-    try {
-        $current = Get-TaskBranchUpstreamRef -RepositoryPath $RepositoryPath -Branch $Branch
-        if ($current) { return $current }
-    }
-    catch { }
-
-    $remoteRef = "refs/remotes/origin/$Branch"
-    try {
-        $remote = Get-TaskGitRefCommit -RepositoryPath $RepositoryPath -Reference $remoteRef
-        if ($remote.Exists -and $remote.Commit) {
-            return Resolve-TaskRefTarget -RepositoryPath $RepositoryPath -Reference $remoteRef
-        }
-    }
-    catch { }
-    return $null
 }
 
 function Enter-TaskMutationLock {
@@ -395,9 +372,12 @@ function New-TaskWorktreePlan {
         }
         # The plan binds the captured tip, the immediate HEAD target, the
         # canonical upstream (or its absence) and the selected ref's canonical
-        # target. Apply compares the live values against these, so a reviewed
-        # plan cannot silently accept a different checkout.
-        return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $reuseSnapshot.Commit; HeadRef = $reuseHeadRef; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference "refs/heads/$($Repository.Branch)"); RepositoryCommonDir = $repositoryCommonDir; WorktreeGitDir = (Get-GitDir -RepositoryPath $destination); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        # target. The upstream is read from the destination, not the repository:
+        # with extensions.worktreeConfig a worktree-local
+        # branch.<branch>.remote/merge is the upstream that apply will verify.
+        # Apply compares the live values against these, so a reviewed plan
+        # cannot silently accept a different checkout.
+        return [pscustomobject]@{ Action = 'reuse'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $reuseSnapshot.Commit; HeadRef = $reuseHeadRef; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $destination -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference "refs/heads/$($Repository.Branch)"); RepositoryCommonDir = $repositoryCommonDir; WorktreeGitDir = (Get-GitDir -RepositoryPath $destination); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     # Every create operation binds an immutable commit. Apply starts the branch
@@ -412,7 +392,10 @@ function New-TaskWorktreePlan {
             if (-not $localSnapshot.Commit -or $localSnapshot.Commit -cne $startCommit) {
                 return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-mismatch'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
             }
-            return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $startCommit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskExistingBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+            # Attach an existing task branch with its actual upstream, including
+            # none. A same-named origin/<branch> ref is not evidence that a
+            # tracking create was interrupted, so never infer one.
+            return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $startCommit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
 
         $remoteSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $remoteBranchRef
@@ -436,7 +419,9 @@ function New-TaskWorktreePlan {
         if (-not $localSnapshot.Commit) {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskExistingBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        # Attach an existing task branch with its actual upstream, including
+        # none; a matching origin/<branch> is never inferred as tracking.
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     # Resolve the remote branch only through its exact ref: the shorthand
@@ -688,13 +673,14 @@ function Assert-TaskWorktreeBranchState {
         throw "branch '$Branch' for '$RepositoryName' tracks '$actualCanonical' instead of the planned '$UpstreamRef'; replan and approve again (a nonempty upstream is never retargeted)"
     }
     if (-not $RepairUpstream) {
-        throw "branch '$Branch' for '$RepositoryName' is missing its required upstream '$UpstreamRef'; replan and repair it or recreate the worktree (reuse never writes an upstream)"
+        throw "branch '$Branch' for '$RepositoryName' is missing its required upstream '$UpstreamRef'; replan and repair it or recreate the worktree (attach and reuse never write an upstream)"
     }
 
     # Repair is limited to the one safe direction: a required upstream is absent.
-    # Re-read immediately before the write (under the caller's gate) so a
-    # concurrent writer that appeared after the first read is refused instead of
-    # being silently overwritten.
+    # The guard re-read is best effort, not a lock: it runs in a separate Git
+    # command, so an external writer can still land between the read and the
+    # write. The post-write verification below detects that outcome, but cannot
+    # prevent the overwrite.
     $guard = Get-TaskCanonicalBranchUpstream -RepositoryName $RepositoryName -WorktreePath $WorktreePath -HeadRef $expectedHeadRef
     if ($guard) {
         throw "branch '$Branch' for '$RepositoryName' acquired upstream '$guard' while apply was preparing to set '$UpstreamRef'; replan and approve again"
@@ -806,7 +792,9 @@ function Invoke-TaskWorktreePlan {
 
     # A create writes an upstream only from the value captured at plan time. The
     # plan already resolved branch.autoSetupMerge and canonicalized the target;
-    # apply never re-derives it from the live remote ref.
+    # apply never re-derives it from the live remote ref. Attaching an existing
+    # branch is not a create: it verifies that branch's actual upstream and
+    # never writes tracking.
     $upstreamRef =
         if ($Plan.PSObject.Properties['UpstreamRef'] -and $Plan.UpstreamRef) { [string]$Plan.UpstreamRef }
         else { $null }
@@ -819,12 +807,12 @@ function Invoke-TaskWorktreePlan {
     if ($Gate) {
         $Gate.Wait()
         try {
-            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream
+            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch
         }
         finally { [void]$Gate.Release() }
     }
     else {
-        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream
+        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch
     }
     return $true
 }

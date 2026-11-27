@@ -508,11 +508,20 @@ Describe 'Invoke-TaskWorktreePlan tracking start' {
         function Move-TrackingBranch {
             param([pscustomobject]$Fixture)
 
-            Set-Content -LiteralPath (Join-Path $Fixture.Path 'README.md') -Value 'third'
-            & git -C $Fixture.Path commit -am third | Out-Null
-            & git -C $Fixture.Path push origin "main:refs/heads/$($Fixture.Branch)" | Out-Null
+            # Move only the selected remote-tracking ref. commit-tree creates a
+            # new commit without moving any local branch, so main cannot advance
+            # and mask a plan that bound the wrong ref.
+            $old = (& git -C $Fixture.Path rev-parse "refs/remotes/origin/$($Fixture.Branch)").Trim()
+            $tree = (& git -C $Fixture.Path rev-parse 'HEAD^{tree}').Trim()
+            $commit = (& git -C $Fixture.Path commit-tree $tree -p $old -m 'move the remote task ref').Trim()
+            & git -C $Fixture.Path push origin "${commit}:refs/heads/$($Fixture.Branch)" | Out-Null
             & git -C $Fixture.Path fetch origin | Out-Null
-            return (& git -C $Fixture.Path rev-parse HEAD).Trim()
+            $new = (& git -C $Fixture.Path rev-parse "refs/remotes/origin/$($Fixture.Branch)").Trim()
+            [pscustomobject]@{
+                Old = $old
+                New = $new
+                Main = (& git -C $Fixture.Path rev-parse 'refs/heads/main').Trim()
+            }
         }
     }
 
@@ -524,16 +533,18 @@ Describe 'Invoke-TaskWorktreePlan tracking start' {
         $plan.Action | Should -Be 'create-remote'
         $plan.SourceCommit | Should -Be $fixture.Reviewed
 
-        $moved = Move-TrackingBranch -Fixture $fixture
-        $moved | Should -Not -Be $fixture.Reviewed
-        (& git -C $fixture.Path rev-parse "refs/remotes/origin/$($fixture.Branch)").Trim() | Should -Be $moved -Because 'the race fixture must really move the remote ref'
-        (& git -C $fixture.Remote rev-parse "refs/heads/$($fixture.Branch)").Trim() | Should -Be $moved
+        $move = Move-TrackingBranch -Fixture $fixture
+        $move.Old | Should -Be $fixture.Reviewed -Because 'only the selected remote-tracking ref may move'
+        $move.New | Should -Not -Be $move.Old
+        $move.Main | Should -Be $fixture.Reviewed -Because 'a main advance must not be able to mask which ref moved'
+        (& git -C $fixture.Path rev-parse "refs/remotes/origin/$($fixture.Branch)").Trim() | Should -Be $move.New -Because 'the race fixture must really move the selected remote ref'
+        (& git -C $fixture.Remote rev-parse "refs/heads/$($fixture.Branch)").Trim() | Should -Be $move.New
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
-        (& git -C $plan.Destination rev-parse "$($fixture.Branch)@{upstream}").Trim() | Should -Be $moved -Because 'the upstream stays on origin even though the branch starts at the reviewed commit'
+        (& git -C $plan.Destination rev-parse "$($fixture.Branch)@{upstream}").Trim() | Should -Be $move.New -Because 'the upstream stays on origin even though the branch starts at the reviewed commit'
     }
 
     It 'binds the remote commit without startCommit and still starts at it after the ref moves' {
@@ -545,9 +556,11 @@ Describe 'Invoke-TaskWorktreePlan tracking start' {
         $plan.Source | Should -Be "origin/$($fixture.Branch)"
         $plan.SourceCommit | Should -Be $fixture.Reviewed
 
-        $moved = Move-TrackingBranch -Fixture $fixture
-        $moved | Should -Not -Be $fixture.Reviewed
-        (& git -C $fixture.Path rev-parse "refs/remotes/origin/$($fixture.Branch)").Trim() | Should -Be $moved -Because 'the race fixture must really move the remote ref'
+        $move = Move-TrackingBranch -Fixture $fixture
+        $move.Old | Should -Be $fixture.Reviewed
+        $move.New | Should -Not -Be $move.Old
+        $move.Main | Should -Be $fixture.Reviewed -Because 'only the selected remote-tracking ref moved'
+        (& git -C $fixture.Path rev-parse "refs/remotes/origin/$($fixture.Branch)").Trim() | Should -Be $move.New -Because 'the race fixture must really move the selected remote ref'
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
 
@@ -761,7 +774,7 @@ Describe 'Worktree reuse verification and repair' {
         }
     }
 
-    It 'attaches the branch left by a failed tracking add and repairs its upstream' -Skip:(-not $IsLinux) {
+    It 'attaches the branch left by a failed tracking add without inventing an upstream' -Skip:(-not $IsLinux) {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'retry-branch-only') -RemotePath (Join-Path $TestDrive 'retry-branch-only.git')
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
         $tasksRoot = Join-Path $TestDrive 'retry-branch-only-tasks'
@@ -785,15 +798,19 @@ Describe 'Worktree reuse verification and repair' {
         Test-Path -LiteralPath $plan.Destination | Should -BeFalse
         (& git -C $fixture.Path rev-parse "refs/heads/$($fixture.Branch)").Trim() | Should -Be $fixture.Head -Because 'a failed attempt must preserve the branch, never delete it'
 
+        # The branch exists but tracks nothing. A readable origin/<branch> is not
+        # evidence that the tracking create was interrupted, so the retry binds
+        # no upstream and attaches without writing one. Recovering a lost
+        # upstream would need recorded request intent, which the request does not
+        # carry; recreate the worktree to restore tracking.
         $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $retry.Action | Should -Be 'create-local'
         $retry.BranchMode | Should -Be 'existing'
-        $retry.UpstreamRef | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+        $retry.UpstreamRef | Should -BeNullOrEmpty -Because 'attach binds the branch actual upstream, including none'
         Invoke-TaskWorktreePlan -Repository $repository -Plan $retry
 
         (& git -C $retry.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
-        (& git -C $retry.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
-        (& git -C $retry.Destination rev-parse "$($fixture.Branch)@{upstream}").Trim() | Should -Be $fixture.Head
+        (& git -C $retry.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -BeNullOrEmpty -Because 'attach never invents tracking'
     }
 
     It 'refuses an upstream that a concurrent writer set before the write' -Skip:(-not $IsLinux) {
@@ -805,6 +822,9 @@ Describe 'Worktree reuse verification and repair' {
 
         # On the guard re-read (the second upstream read), an external writer has
         # already set origin/main. Apply must refuse instead of overwriting it.
+        # The window is best effort: the guard read and the write are separate
+        # Git commands, so a writer that lands after the guard can still be
+        # overwritten; the post-write verification is what catches that.
         $countPath = Join-Path $TestDrive 'upstream-writer-race-count'
         $shimDir = Join-Path $TestDrive 'upstream-writer-race-shim'
         New-UpstreamRaceShim -Directory $shimDir -RepositoryPath $fixture.Path -Branch $fixture.Branch -Mode 'upstream' -CountPath $countPath | Out-Null
@@ -842,7 +862,7 @@ Describe 'Worktree reuse verification and repair' {
         (& git -C $fixture.Path rev-parse "refs/heads/$($fixture.Branch)").Trim() | Should -Be $other -Because 'the failed write must not reset the branch'
     }
 
-    It 'reuses a pinned worktree after its branch advances and binds the new tip' {
+    It 'reuses a pinned worktree after its branch advances and keeps the historical pin' {
         $fixture = New-ReuseRepository -Path (Join-Path $TestDrive 'reuse-pinned-advanced')
         & git -C $fixture.Path branch feature/FEATURE-123 $fixture.Head | Out-Null
         $tasksRoot = Join-Path $TestDrive 'reuse-pinned-advanced-tasks'
@@ -856,12 +876,16 @@ Describe 'Worktree reuse verification and repair' {
         $advanced = (& git -C $plan.Destination rev-parse HEAD).Trim()
         $advanced | Should -Not -Be $fixture.Head
 
-        $replanned = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $advanced }
+        # The reviewed StartCommit stays the historical pin. Reuse does not
+        # re-pin to the advanced tip and still verifies it through apply: the
+        # historical pin and the live branch tip legitimately differ.
+        $replanned = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/FEATURE-123'; StartCommit = $fixture.Head }
         $reuse = New-TaskWorktreePlan -Repository $replanned -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $reuse.Action | Should -Be 'reuse'
         $reuse.SourceCommit | Should -Be $advanced
         $reuse.UpstreamRef | Should -BeNullOrEmpty
         { Invoke-TaskWorktreePlan -Repository $replanned -Plan $reuse } | Should -Not -Throw
+        (& git -C $reuse.Destination rev-parse HEAD).Trim() | Should -Be $advanced
     }
 
     It 'reuses an untouched worktree whose branch has no upstream and writes nothing' {
@@ -903,6 +927,38 @@ Describe 'Worktree reuse verification and repair' {
         $reuse.UpstreamRef | Should -BeNullOrEmpty -Because 'a readable origin/<task> ref is not evidence the branch tracks it'
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse } | Should -Not -Throw
         (& git -C $reuse.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -BeNullOrEmpty
+    }
+
+    It 'reads a worktree-local upstream under extensions.worktreeConfig from the destination' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'reuse-worktree-config') -RemotePath (Join-Path $TestDrive 'reuse-worktree-config.git')
+        $tasksRoot = Join-Path $TestDrive 'reuse-worktree-config-tasks'
+        $destination = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        & git -C $fixture.Path worktree add $destination $fixture.Branch | Out-Null
+        & git -C $fixture.Path config extensions.worktreeConfig true
+
+        # The upstream exists only in the destination worktree config. The shared
+        # repository view has none, so reading the wrong place binds no upstream
+        # and then fails to match what apply reads from the destination.
+        & git -C $destination config --worktree "branch.$($fixture.Branch).remote" origin
+        & git -C $destination config --worktree "branch.$($fixture.Branch).merge" refs/heads/main
+        (& git -C $fixture.Path for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -BeNullOrEmpty -Because 'the worktree config is not the shared repository config'
+        (& git -C $destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'reuse'
+        $plan.UpstreamRef | Should -Be 'refs/remotes/origin/main' -Because 'the plan reads the upstream from the destination, not the repository'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+
+        # A fresh plan still finds the same destination-local upstream, and reuse
+        # verifies it without writing anything.
+        $fresh = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $fresh.Action | Should -Be 'reuse'
+        $fresh.UpstreamRef | Should -Be 'refs/remotes/origin/main'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $fresh } | Should -Not -Throw
+        (& git -C $destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
+        (& git -C $fixture.Path for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -BeNullOrEmpty -Because 'reuse never writes the shared upstream'
     }
 
     It 'refuses a reuse when the planned upstream ref became symbolic after planning' {

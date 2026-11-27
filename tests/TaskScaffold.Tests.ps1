@@ -242,12 +242,18 @@ $plan.WorktreeOperations[0].Action
         $plan.WorktreeOperations[0].Source | Should -Be 'origin/feature/FEATURE-123'
         @($plan.WorktreeOperations[0].PSObject.Properties.Name | Sort-Object) |
             Should -Be @('Action', 'BranchMode', 'Destination', 'Repository', 'Source', 'TaskKey', 'TasksRoot' | Sort-Object) -Because 'a tracking plan must keep the documented public shape without the internal source commit'
+        $reviewed = (& git -C $repositoryPath rev-parse 'refs/remotes/origin/feature/FEATURE-123').Trim()
 
-        Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'moved'
-        & git -C $repositoryPath commit -am moved | Out-Null
-        & git -C $repositoryPath push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
+        # Move only the selected remote-tracking ref: commit-tree creates the new
+        # commit without moving any local branch, so a main advance cannot mask
+        # which ref the plan bound.
+        $tree = (& git -C $repositoryPath rev-parse 'HEAD^{tree}').Trim()
+        $moved = (& git -C $repositoryPath commit-tree $tree -p $reviewed -m 'moved').Trim()
+        & git -C $repositoryPath push origin "${moved}:refs/heads/feature/FEATURE-123" | Out-Null
         & git -C $repositoryPath fetch origin | Out-Null
-        $moved = (& git -C $repositoryPath rev-parse 'refs/remotes/origin/feature/FEATURE-123').Trim()
+        $reviewed | Should -Not -Be $moved
+        (& git -C $repositoryPath rev-parse 'refs/remotes/origin/feature/FEATURE-123').Trim() | Should -Be $moved
+        (& git -C $repositoryPath rev-parse 'refs/heads/main').Trim() | Should -Be $reviewed -Because 'main must not advance and mask which ref moved'
 
         { & $script -RequestPath $requestPath -TasksRoot $tasksRoot -Apply -ExpectedPlanIdentity $plan.PlanIdentity } | Should -Throw '*plan identity changed*'
         Test-Path -LiteralPath $plan.WorktreeOperations[0].Destination | Should -BeFalse
