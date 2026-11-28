@@ -4,7 +4,8 @@ $ErrorActionPreference = 'Stop'
 function Get-PlanGitCommonDir {
     param([string]$RepositoryPath)
 
-    $output = & git -C $RepositoryPath rev-parse --path-format=absolute --git-common-dir 2>$null
+    $resolvedPath = Resolve-TaskRepositoryPath -Path $RepositoryPath
+    $output = & git -C $resolvedPath rev-parse --path-format=absolute --git-common-dir 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
     return ([string]($output | Select-Object -First 1)).Trim()
 }
@@ -12,7 +13,8 @@ function Get-PlanGitCommonDir {
 function Get-PlanGitDir {
     param([string]$RepositoryPath)
 
-    $output = & git -C $RepositoryPath rev-parse --path-format=absolute --git-dir 2>$null
+    $resolvedPath = Resolve-TaskRepositoryPath -Path $RepositoryPath
+    $output = & git -C $resolvedPath rev-parse --path-format=absolute --git-dir 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
     return ([string]($output | Select-Object -First 1)).Trim()
 }
@@ -56,9 +58,12 @@ function Get-TaskProfileIdentity {
 function Get-TaskGitCommit {
     param([string]$RepositoryPath, [string]$Reference)
 
-    $result = & git -C $RepositoryPath rev-parse --verify --quiet "$Reference^{commit}" 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return ([string]($result | Select-Object -First 1)).Trim()
+    # Identity lookups are read-only planning reads: never let them lazily fetch,
+    # and resolve full ref names exactly so a lookalike tag cannot stand in.
+    if ($Reference -clike 'refs/*') {
+        return (Get-TaskGitRefCommit -RepositoryPath $RepositoryPath -Reference $Reference).Commit
+    }
+    return Get-GitCommitWithoutLazyFetch -RepositoryPath $RepositoryPath -Reference $Reference
 }
 
 function Get-TaskRepositoryIdentity {
@@ -70,28 +75,40 @@ function Get-TaskRepositoryIdentity {
         $remoteBase = if ($repository.BaseBranch -match '^[^/]+/.+') { $repository.BaseBranch } else { "origin/$($repository.BaseBranch)" }
         $worktree = $null
         if ($operation -and (Test-Path -LiteralPath $operation.Destination -PathType Container)) {
-            $head = & git -C $operation.Destination rev-parse --verify --quiet 'HEAD^{commit}' 2>$null
-            $headExitCode = $LASTEXITCODE
-            $branch = & git -C $operation.Destination branch --show-current 2>$null
+            # Read-only: a partial clone must not fetch just to answer this lookup.
+            $headResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $operation.Destination -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD^{commit}') -NoLazyFetch
+            $head = if ($headResult.ExitCode -eq 0) { ([string](@($headResult.Output -split "`r?`n") | Select-Object -First 1)).Trim() } else { $null }
+            # HEAD's immediate target, not a recursive alias resolution.
+            $branch = Get-TaskImmediateHeadRef -RepositoryPath $operation.Destination
             $worktree = [ordered]@{
                 CommonDir = Get-PlanGitCommonDir -RepositoryPath $operation.Destination
                 GitDir = Get-PlanGitDir -RepositoryPath $operation.Destination
-                Head = if ($headExitCode -eq 0) { ([string]($head | Select-Object -First 1)).Trim() } else { $null }
+                Head = $head
                 Branch = ([string]($branch | Select-Object -First 1)).Trim()
             }
         }
         [ordered]@{
             Name = $repository.Name
-            Path = [IO.Path]::GetFullPath($repository.Path)
+            Path = Resolve-TaskRepositoryPath -Path $repository.Path
             CommonDir = Get-PlanGitCommonDir -RepositoryPath $repository.Path
             RequestedBranch = $repository.Branch
             BaseBranch = $repository.BaseBranch
+            StartCommit = if ($repository.PSObject.Properties['StartCommit']) { $repository.StartCommit } else { $null }
             LocalBranchCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/heads/$($repository.Branch)"
             RemoteBranchCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/remotes/origin/$($repository.Branch)"
             LocalBaseCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/heads/$($repository.BaseBranch)"
             RemoteBaseCommit = Get-TaskGitCommit -RepositoryPath $repository.Path -Reference "refs/remotes/$remoteBase"
-            SelectedSource = if ($operation) { $operation.Source } else { $null }
-            SelectedSourceCommit = if ($operation -and $operation.Source) { Get-TaskGitCommit -RepositoryPath $repository.Path -Reference $operation.Source } else { $null }
+            SelectedSource = if ($operation -and $operation.PSObject.Properties['Source']) { $operation.Source } else { $null }
+            # Bind the commit selected at plan time. Re-resolving a ref here would
+            # let a moved remote ref, or a local branch named like the shorthand,
+            # change the reviewed identity and the applied start point.
+            SelectedSourceCommit = if ($operation -and $operation.PSObject.Properties['SourceCommit'] -and $operation.SourceCommit) {
+                [string]$operation.SourceCommit
+            }
+            elseif ($operation -and $operation.PSObject.Properties['Source'] -and $operation.Source) {
+                Get-TaskGitCommit -RepositoryPath $repository.Path -Reference $operation.Source
+            }
+            else { $null }
             Operation = $operation
             Worktree = $worktree
         }
@@ -158,7 +175,8 @@ function Get-TaskScaffoldIdentityMaterial {
             PrdPath = $Request.Task.PrdPath
         }
         Repositories = @($Request.Repositories | ForEach-Object {
-            [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path); BaseBranch = $_.BaseBranch; Branch = $_.Branch }
+            $startCommit = if ($_.PSObject.Properties['StartCommit']) { $_.StartCommit } else { $null }
+            [ordered]@{ Name = $_.Name; Path = Resolve-TaskRepositoryPath -Path $_.Path; BaseBranch = $_.BaseBranch; Branch = $_.Branch; StartCommit = $startCommit }
         })
         Profiles = @($Request.Profiles | ForEach-Object {
             [ordered]@{ Name = $_.Name; Path = [IO.Path]::GetFullPath($_.Path) }

@@ -131,6 +131,71 @@ Describe 'ConvertTo-TaskRequest' {
         }
     }
 
+    It 'validates an optional explicit start commit' {
+        $requestPath = Join-Path $TestDrive 'start-commit.json'
+        $validStartCommit = ('0123456789abcdef' * 3).Substring(0, 40)
+        $baseRepository = [ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123' }
+
+        $accepted = [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123'; startCommit = $validStartCommit })
+        }
+        $accepted | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        $request = ConvertTo-TaskRequest -Path $requestPath
+        $request.Repositories[0].StartCommit | Should -Be $validStartCommit
+
+        $absent = [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @($baseRepository)
+        }
+        $absent | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        (ConvertTo-TaskRequest -Path $requestPath).Repositories[0].StartCommit | Should -BeNullOrEmpty
+
+        $explicitNull = [ordered]@{
+            schemaVersion = 2
+            task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+            repositories = @([ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123'; startCommit = $null })
+        }
+        $explicitNull | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+        (ConvertTo-TaskRequest -Path $requestPath).Repositories[0].StartCommit | Should -BeNullOrEmpty -Because 'explicit null means the same as omission'
+
+        $invalidValues = @(
+            $validStartCommit.Substring(0, 12)
+            $validStartCommit.ToUpperInvariant()
+            'main'
+            ''
+        )
+        foreach ($invalidValue in $invalidValues) {
+            $invalid = [ordered]@{
+                schemaVersion = 2
+                task = [ordered]@{ key = 'FEATURE-123'; title = 'Add endpoint' }
+                repositories = @([ordered]@{ name = 'api'; path = 'C:/work/canons/api'; baseBranch = 'main'; branch = 'feature/FEATURE-123'; startCommit = $invalidValue })
+            }
+            $invalid | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $requestPath -NoNewline
+            { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw "*invalid start commit '$invalidValue' for repository 'api'*"
+        }
+    }
+
+    It 'refuses a start commit with a trailing newline or a non-string value' {
+        $requestPath = Join-Path $TestDrive 'start-commit-shape.json'
+        $validStartCommit = ('0123456789abcdef' * 3).Substring(0, 40)
+        $prefix = '{"schemaVersion":2,"task":{"key":"FEATURE-123","title":"Add endpoint"},"repositories":[{"name":"api","path":"C:/work/canons/api","baseBranch":"main","branch":"feature/FEATURE-123","startCommit":'
+
+        $newlineRequest = $prefix + '"' + $validStartCommit + '\n"}]}'
+        $newlineRequest | Set-Content -LiteralPath $requestPath -NoNewline
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid start commit*'
+
+        $numberRequest = $prefix + '12}]}'
+        $numberRequest | Set-Content -LiteralPath $requestPath -NoNewline
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid start commit*'
+
+        $booleanRequest = $prefix + 'true}]}'
+        $booleanRequest | Set-Content -LiteralPath $requestPath -NoNewline
+        { ConvertTo-TaskRequest -Path $requestPath } | Should -Throw '*invalid start commit*'
+    }
+
     It 'rejects duplicate repository names' {
         $requestPath = Join-Path $TestDrive 'duplicate-repository.json'
         @'

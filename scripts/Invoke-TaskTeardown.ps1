@@ -174,6 +174,7 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                     $actualCommonDir = $null
                     $actualGitDir = $null
                     $actualBranch = $null
+                    $registration = @()
                     if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
                         $reason = 'symlink-worktree-entry'
                     }
@@ -194,11 +195,15 @@ elseif (Test-Path -LiteralPath $taskPath -PathType Container) {
                                 $expectedCommonDir = Get-GitCommonDir -RepositoryPath ([string]$registration[0].path)
                                 $actualCommonDir = Get-GitCommonDir -RepositoryPath $entry.FullName
                                 $actualGitDir = Get-GitDir -RepositoryPath $entry.FullName
-                                $actualBranch = (& git -C $entry.FullName branch --show-current 2>$null | Select-Object -First 1)
+                                # Compare HEAD's immediate target: an alias branch is
+                                # accepted only when it is the registered branch
+                                # itself, never when it merely resolves to it.
+                                $actualHeadRef = Get-TaskImmediateHeadRef -RepositoryPath $entry.FullName
+                                $actualBranch = if ($actualHeadRef -clike 'refs/heads/*') { $actualHeadRef.Substring('refs/heads/'.Length) } else { $actualHeadRef }
                                 if (-not $expectedCommonDir -or $expectedCommonDir -cne $actualCommonDir) {
                                     $reason = 'repository-mismatch'
                                 }
-                                elseif ([string]$registration[0].branch -cne [string]$actualBranch) {
+                                elseif ($actualHeadRef -cne "refs/heads/$([string]$registration[0].branch)") {
                                     $reason = 'branch-mismatch'
                                 }
                                 else {

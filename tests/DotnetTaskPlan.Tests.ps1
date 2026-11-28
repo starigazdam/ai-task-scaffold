@@ -337,6 +337,644 @@ Describe 'dotnet task plan' {
             $observedReasons | Should -Be @('unsafe-worktree-path', 'unsafe-worktree-path', 'unsafe-worktree-path')
         }
     }
+    Context 'planning from an explicit start commit' {
+        It 'plans create-local from the start commit and changes the identity' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit'
+            $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+            & git -C $repositoryPath commit -am 'advance main' | Out-Null
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit'
+
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $request.repositories[0]['startCommit'] = $older
+            $olderPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-older.json') -Request $request
+            $olderPlan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $olderPath -TasksRoot $tasksRoot) -Case 'start commit plan'
+
+            $operation = $olderPlan.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'create-local'
+            $operation.source | Should -Be $older
+            $operation.branchMode | Should -Be 'new'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+
+            $headRequest = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $headRequest.repositories[0]['startCommit'] = $head
+            $headPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-head.json') -Request $headRequest
+            $headPlan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $headPath -TasksRoot $tasksRoot) -Case 'newer start commit plan'
+            $headPlan.planIdentity | Should -Not -Be $olderPlan.planIdentity
+
+            $noCommitRequest = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $noCommitPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-none.json') -Request $noCommitRequest
+            $noCommitPlan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $noCommitPath -TasksRoot $tasksRoot) -Case 'plan without start commit'
+            $noCommitPlan.planIdentity | Should -Not -Be $olderPlan.planIdentity
+        }
+
+        It 'blocks a start commit that is missing locally' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-missing'
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit-missing'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $request.repositories[0]['startCommit'] = ('a' * 40)
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-missing.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'missing start commit plan'
+
+            $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+        }
+
+        It 'blocks a missing start commit before reusing an existing worktree and reuses a valid one' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-reuse'
+            $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+            & git -C $repositoryPath commit -am 'advance main' | Out-Null
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit-reuse'
+            & git -C $repositoryPath worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+
+            $missing = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $missing.repositories[0]['startCommit'] = ('a' * 40)
+            $missingPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-missing.json') -Request $missing
+            $missingResult = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $missingPath -TasksRoot $tasksRoot) -Case 'missing start commit with an existing worktree'
+            $missingResult.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $missingResult.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+
+            $valid = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $valid.repositories[0]['startCommit'] = $older
+            $validPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-valid.json') -Request $valid
+            $validResult = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $validPath -TasksRoot $tasksRoot) -Case 'valid start commit with an existing worktree'
+            $validResult.plan.worktreeOperations[0].action | Should -Be 'reuse'
+            $validResult.plan.worktreeOperations[0].source | Should -Be 'feature/FEATURE-123'
+        }
+
+        It 'blocks reuse when the branch tip cannot be read locally' {
+            $repositoryPath = New-TestRepository -Name 'api-reuse-unreadable'
+            $tasksRoot = Join-Path $TestDrive 'tasks-reuse-unreadable'
+            & git -C $repositoryPath worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-unreadable.json') -Request $request
+
+            $healthy = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'healthy reuse plan'
+            $healthy.plan.worktreeOperations[0].action | Should -Be 'reuse'
+
+            $refPath = Join-Path $repositoryPath '.git/refs/heads/feature/FEATURE-123'
+            Set-Content -LiteralPath $refPath -Value ('1' * 40) -NoNewline
+            $blocked = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'unreadable reuse tip plan'
+
+            $blocked.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $blocked.plan.worktreeOperations[0].reason | Should -Be 'reuse-unreadable'
+        }
+
+        It 'does not reuse a worktree whose HEAD only indirectly resolves to the requested branch' {
+            $repositoryPath = New-TestRepository -Name 'api-reuse-indirect-alias'
+            $tasksRoot = Join-Path $TestDrive 'tasks-reuse-indirect-alias'
+            $destination = Join-Path $tasksRoot 'FEATURE-123/worktrees/api'
+            & git -C $repositoryPath branch feature/REAL | Out-Null
+            & git -C $repositoryPath symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+            & git -C $repositoryPath worktree add $destination feature/REAL | Out-Null
+            & git -C $destination symbolic-ref HEAD refs/heads/feature/ALIAS
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath }) -Branch 'feature/REAL'
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-reuse-indirect-alias.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'indirect alias reuse plan'
+
+            $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+            $result.plan.worktreeOperations[0].reason | Should -Be 'destination-exists' -Because 'HEAD targets the alias, not the requested branch'
+        }
+
+        It 'plans a tracking branch from the full remote ref when the start commit matches' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-remote'
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $remotePath = Join-Path $TestDrive 'api-start-commit-remote.git'
+            & git init --bare $remotePath | Out-Null
+            & git -C $repositoryPath remote add origin $remotePath
+            & git -C $repositoryPath push origin 'main:refs/heads/feature/FEATURE-123' | Out-Null
+            & git -C $repositoryPath fetch origin | Out-Null
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $request.repositories[0]['startCommit'] = $head
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-start-commit-remote.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'tasks-start-commit-remote')) -Case 'remote start commit plan'
+
+            $result.plan.worktreeOperations[0].action | Should -Be 'create-remote'
+            $result.plan.worktreeOperations[0].source | Should -Be 'refs/remotes/origin/feature/FEATURE-123'
+            $result.plan.worktreeOperations[0].branchMode | Should -Be 'track'
+        }
+
+        It 'changes the identity when a symbolic remote task ref is retargeted at an equal commit' {
+            $repositoryPath = New-TestRepository -Name 'api-symbolic-retarget'
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $remotePath = Join-Path $TestDrive 'api-symbolic-retarget.git'
+            & git init --bare $remotePath | Out-Null
+            & git -C $repositoryPath remote add origin $remotePath
+            & git -C $repositoryPath push origin 'main:refs/heads/main' 'main:refs/heads/release' | Out-Null
+            & git -C $repositoryPath fetch origin | Out-Null
+            & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/feature/FEATURE-123' 'refs/remotes/origin/main'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-symbolic-retarget.json') -Request $request
+            $tasksRoot = Join-Path $TestDrive 'tasks-symbolic-retarget'
+
+            $before = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'symbolic remote task ref plan'
+            $before.plan.worktreeOperations[0].action | Should -Be 'create-remote'
+            # The canonical source target stays internal, so the public shape is
+            # unchanged.
+            Assert-PropertySet -Object $before.plan.worktreeOperations[0] -Expected @('repository', 'action', 'source', 'branchMode', 'destination', 'reason') -Case 'the tracking worktree operation'
+
+            # Both targets point at the same commit, so only the canonical source
+            # target changes. The plan identity must still change.
+            & git -C $repositoryPath symbolic-ref 'refs/remotes/origin/feature/FEATURE-123' 'refs/remotes/origin/release'
+            (& git -C $repositoryPath rev-parse 'refs/remotes/origin/main').Trim() | Should -Be $head
+            (& git -C $repositoryPath rev-parse 'refs/remotes/origin/release').Trim() | Should -Be $head
+            $after = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'retargeted symbolic remote task ref plan'
+
+            $after.plan.worktreeOperations[0].action | Should -Be 'create-remote'
+            $after.planIdentity | Should -Not -Be $before.planIdentity
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse
+        }
+
+        It 'keeps a reuse plan at one start commit distinct from the same plan at another' {
+            $repositoryPath = New-TestRepository -Name 'api-start-commit-identity'
+            $older = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            Set-Content -LiteralPath (Join-Path $repositoryPath 'README.md') -Value 'newer'
+            & git -C $repositoryPath commit -am 'advance main' | Out-Null
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            $tasksRoot = Join-Path $TestDrive 'tasks-start-commit-identity'
+            & git -C $repositoryPath worktree add -b feature/FEATURE-123 (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') main | Out-Null
+
+            $plans = @()
+            foreach ($commit in @($older, $head)) {
+                $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+                $request.repositories[0]['startCommit'] = $commit
+                $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive "task-request-identity-$commit.json") -Request $request
+                $plans += (Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case "reuse plan at $commit")
+            }
+
+            $plans[0].plan.worktreeOperations[0].action | Should -Be 'reuse'
+            $plans[1].plan.worktreeOperations[0].action | Should -Be 'reuse'
+            $plans[1].planIdentity | Should -Not -Be $plans[0].planIdentity
+        }
+    }
+
+    Context 'worktree config includes' {
+        It 'plans an attach from a valid UTF-8 path that contains U+FFFD' {
+            $repositoryPath = New-TestRepository -Name "api-fffd-$([char]0xFFFD)-path"
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            $tasksRoot = Join-Path $TestDrive 'tasks-fffd'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-fffd.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'U+FFFD path attach plan'
+            $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        }
+
+        It 'refuses to plan an attach when the worktree config path is not UTF-8' -Skip:(-not $IsLinux) {
+            $raw = Join-Path $TestDrive 'raw-parent'
+            New-Item -ItemType Directory -Path $raw -Force | Out-Null
+            & bash -c 'cd "$1" && mkdir "$(printf "x\377y")" && ln -s "$(printf "x\377y")" valid-link' _ $raw
+            try {
+                $repositoryPath = New-TestRepository -Name 'api' -Root (Join-Path $raw 'valid-link')
+                & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+                $tasksRoot = Join-Path $TestDrive 'tasks-raw'
+                $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+                $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-raw.json') -Request $request
+
+                $run = Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot
+                $run.ExitCode | Should -Not -Be 0
+                $run.StdErr | Should -Match 'not valid UTF-8'
+            }
+            finally {
+                # Pester cannot delete a TestDrive entry whose name is not UTF-8.
+                & bash -c 'rm -rf "$1"' _ $raw
+            }
+        }
+
+        It 'blocks an attach plan whose includeIf condition has a byte invalid in the locale' -Skip:(-not $IsLinux) {
+            $repositoryPath = New-TestRepository -Name 'api-raw-condition'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            $worktreeConfig = (& git -C $repositoryPath rev-parse --path-format=absolute --git-path config.worktree).Trim()
+            & bash -c 'printf "[includeIf \"onbranch:[\377x]\"]\n\tpath = ./plan-extra.cfg\n" > "$1"' _ $worktreeConfig
+            $tasksRoot = Join-Path $TestDrive 'tasks-raw-condition'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-raw-condition.json') -Request $request
+            $saved = $env:LC_ALL
+            $env:LC_ALL = 'C.UTF-8'
+            try {
+                $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'raw condition attach plan'
+            }
+            finally { $env:LC_ALL = $saved }
+            $result.plan.worktreeOperations[0].reason | Should -Be 'worktree-config-include'
+        }
+
+        It 'plans a symbolic base that resolves to an annotated tag at the peeled commit' {
+            $repositoryPath = New-TestRepository -Name 'api-annotated-base'
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            & git -C $repositoryPath tag -a annotated -m annotated $head
+            & git -C $repositoryPath symbolic-ref refs/heads/base refs/tags/annotated
+            $request = New-TaskPlanRequest -BaseBranch 'base' -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-annotated-base.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'tasks-annotated-base')) -Case 'annotated tag base plan'
+            $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        }
+
+        It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
+            $repositoryPath = New-TestRepository -Name "api-newline`npath"
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            & git -C $repositoryPath config --worktree include.path ./plan-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-newline'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-newline.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'newline path attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'blocked'
+            $operation.reason | Should -Be 'worktree-config-include'
+        }
+
+        It 'blocks an attach plan whose source worktree config includes a relative file' {
+            $repositoryPath = New-TestRepository -Name 'api-relative-include'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            # `git worktree add` copies the worktree config text but not the file
+            # its relative include.path points at, so the destination would
+            # resolve a different or no upstream.
+            $worktreeConfig = (& git -C $repositoryPath rev-parse --path-format=absolute --git-path config.worktree).Trim()
+            Set-Content -LiteralPath (Join-Path (Split-Path -Parent $worktreeConfig) 'plan-extra.cfg') -Value "[branch `"feature/FEATURE-123`"]`n`tremote = origin`n`tmerge = refs/heads/main"
+            & git -C $repositoryPath config --worktree include.path ./plan-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-relative-include'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-relative-include.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'relative include attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'blocked'
+            $operation.reason | Should -Be 'worktree-config-include'
+            $operation.message | Should -Match ([regex]::Escape($worktreeConfig)) -Because 'the diagnostic must name the worktree config file'
+            $operation.message | Should -Match 'shared repository config' -Because 'the diagnostic must name the fix'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse -Because 'planning stays read-only'
+        }
+
+        It 'blocks an attach plan whose source worktree config conditionally includes a relative file' {
+            $repositoryPath = New-TestRepository -Name 'api-relative-includeif'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            & git -C $repositoryPath config --worktree 'includeIf.onbranch:no such/x.path' ./plan-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-relative-includeif'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-relative-includeif.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'relative includeIf attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'blocked'
+            $operation.reason | Should -Be 'worktree-config-include'
+            $operation.message | Should -Match ([regex]::Escape('includeif.onbranch:no such/x.path'))
+        }
+
+        It 'blocks an attach plan whose source worktree config includes an absolute file' {
+            $repositoryPath = New-TestRepository -Name 'api-absolute-include'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config --file (& git -C $repositoryPath rev-parse --path-format=absolute --git-path config.worktree).Trim() include.path (Join-Path $TestDrive 'plan-absolute-extra.cfg')
+            $tasksRoot = Join-Path $TestDrive 'tasks-absolute-include'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-absolute-include.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'absolute include attach plan'
+            $result.plan.worktreeOperations[0].reason | Should -Be 'worktree-config-include'
+        }
+
+        It 'plans an attach when the include is in the shared config' {
+            $repositoryPath = New-TestRepository -Name 'api-shared-include'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            & git -C $repositoryPath config include.path ./shared-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-shared-include'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-shared-include.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'shared include attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'create-local'
+            $operation.branchMode | Should -Be 'existing'
+            @($operation.PSObject.Properties.Name) | Should -Not -Contain 'message' -Because 'a planned operation keeps the documented shape'
+        }
+    }
+}
+
+Describe 'dotnet task plan ref resolution and Git capability' {
+    BeforeAll {
+        function New-OldGitShimDirectory {
+            param([string]$Path)
+
+            New-Item -ItemType Directory -Path $Path -Force | Out-Null
+            $shimPath = Join-Path $Path 'git'
+            $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+            @(
+                '#!/bin/sh'
+                "REAL_GIT='$realGit'"
+                'if [ "$1" = "--no-lazy-fetch" ]; then'
+                '  echo "error: unknown option: --no-lazy-fetch" >&2'
+                '  exit 129'
+                'fi'
+                'exec "$REAL_GIT" "$@"'
+            ) | Set-Content -LiteralPath $shimPath
+            & chmod +x $shimPath
+            return $Path
+        }
+
+        function New-PartialCloneRepository {
+            param([string]$SourcePath, [string]$ClonePath)
+
+            New-Item -ItemType Directory -Path $SourcePath -Force | Out-Null
+            & git -C $SourcePath init -b main | Out-Null
+            & git -C $SourcePath config user.name Test
+            & git -C $SourcePath config user.email test@example.invalid
+            & git -C $SourcePath config uploadpack.allowFilter true
+            Set-Content -LiteralPath (Join-Path $SourcePath 'README.md') -Value 'first'
+            & git -C $SourcePath add README.md
+            & git -C $SourcePath commit -m first | Out-Null
+            Set-Content -LiteralPath (Join-Path $SourcePath 'README.md') -Value 'second'
+            & git -C $SourcePath commit -am second | Out-Null
+            & git clone --filter=blob:none --no-local "file://$SourcePath" $ClonePath 2>&1 | Out-Null
+            return $ClonePath
+        }
+
+        function Set-UnreadableLooseRef {
+            param([string]$RepositoryPath, [string]$Reference)
+
+            $refPath = Join-Path $RepositoryPath ".git/$Reference"
+            New-Item -ItemType Directory -Path (Split-Path -Parent $refPath) -Force | Out-Null
+            Set-Content -LiteralPath $refPath -Value ('1' * 40) -NoNewline
+        }
+    }
+
+    It 'fails closed on a partial clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-PartialCloneRepository -SourcePath (Join-Path $TestDrive 'cli-partial-source-old') -ClonePath (Join-Path $TestDrive 'cli-partial-old')
+        (& git -C $repositoryPath config --get remote.origin.promisor) | Should -Be 'true'
+        $shimDir = New-OldGitShimDirectory -Path (Join-Path $TestDrive 'cli-shim-old')
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-partial-old.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $run = Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-partial-old')
+        }
+        finally { $env:PATH = $savedPath }
+
+        $run.ExitCode | Should -Be 1
+        $run.StdErr | Should -Match 'partial clone'
+        $run.StdErr | Should -Match '--no-lazy-fetch'
+    }
+
+    It 'fails closed on a promisor remote whose name is invalid in the locale when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-TestRepository -Name 'cli-raw-promisor'
+        & bash -c 'printf "[remote \"o\377x\"]\n\tpromisor = true\n" >> "$1/.git/config"' _ $repositoryPath
+        $shimDir = New-OldGitShimDirectory -Path (Join-Path $TestDrive 'cli-shim-raw-promisor')
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-raw-promisor.json') -Request $request
+
+        $savedPath = $env:PATH
+        $savedLocale = $env:LC_ALL
+        $env:PATH = "$($shimDir):$savedPath"
+        $env:LC_ALL = 'C.UTF-8'
+        try {
+            $run = Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-raw-promisor')
+        }
+        finally { $env:PATH = $savedPath; $env:LC_ALL = $savedLocale }
+
+        $run.ExitCode | Should -Be 1
+        $run.StdErr | Should -Match 'partial clone'
+    }
+
+    It 'still plans a full clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-TestRepository -Name 'cli-full-old'
+        $shimDir = New-OldGitShimDirectory -Path (Join-Path $TestDrive 'cli-shim-full')
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-full-old.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-full-old')) -Case 'full clone with old git'
+        }
+        finally { $env:PATH = $savedPath }
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].branchMode | Should -Be 'new'
+    }
+
+    It 'plans a real partial clone with a Git that supports --no-lazy-fetch' {
+        # Capability of the local Git, not the OS.
+        & git --no-lazy-fetch --version *> $null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'this Git does not support --no-lazy-fetch'; return }
+
+        $repositoryPath = New-PartialCloneRepository -SourcePath (Join-Path $TestDrive 'cli-partial-source-modern') -ClonePath (Join-Path $TestDrive 'cli-partial-modern')
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-partial-modern.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-partial-modern')) -Case 'partial clone with modern git'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].source | Should -Be 'main'
+    }
+
+    It 'does not let a lookalike tag stand in for the remote task ref' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-tag-lookalike'
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        & git -C $repositoryPath tag 'refs/remotes/origin/feature/FEATURE-123' $head
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-tag.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-tag')) -Case 'lookalike tag without pin'
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].source | Should -Be 'main'
+        $result.plan.worktreeOperations[0].branchMode | Should -Be 'new'
+
+        $pinned = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $pinned.repositories[0]['startCommit'] = $head
+        $pinnedPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-tag-pinned.json') -Request $pinned
+        $pinnedResult = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $pinnedPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-tag-pinned')) -Case 'lookalike tag with pin'
+        $pinnedResult.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $pinnedResult.plan.worktreeOperations[0].branchMode | Should -Be 'new'
+        $pinnedResult.plan.worktreeOperations[0].source | Should -Be $head
+    }
+
+    It 'blocks a present local task ref whose tip cannot be verified against the pin' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-unverified'
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        Set-UnreadableLooseRef -RepositoryPath $repositoryPath -Reference 'refs/heads/feature/FEATURE-123'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request.repositories[0]['startCommit'] = $head
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-unverified.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-unverified')) -Case 'unverified ref with pin'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-mismatch'
+    }
+
+    It 'blocks a no-pin local task ref whose tip is missing locally' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-unverified-no-pin'
+        Set-UnreadableLooseRef -RepositoryPath $repositoryPath -Reference 'refs/heads/feature/FEATURE-123'
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-unverified-no-pin.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-unverified-no-pin')) -Case 'unverified ref without pin'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'blocks a dangling symbolic branch ref instead of creating one' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-dangling'
+        # Present but unreadable: for-each-ref omits a symbolic ref whose target
+        # is missing, so absence must not be inferred from that listing.
+        & git -C $repositoryPath symbolic-ref refs/heads/feature/FEATURE-123 refs/heads/missing
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-dangling.json') -Request $request
+        $tasksRoot = Join-Path $TestDrive 'cli-tasks-ref-dangling'
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'dangling symbolic task ref'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/worktrees/api') | Should -BeFalse
+    }
+
+    It 'blocks a malformed loose branch ref instead of falling through to the base' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-malformed'
+        $refPath = Join-Path $repositoryPath '.git/refs/heads/feature/FEATURE-123'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $refPath) -Force | Out-Null
+        Set-Content -LiteralPath $refPath -Value 'this-is-not-an-object-id' -NoNewline
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-malformed.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-malformed')) -Case 'malformed task ref'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'blocks a cyclic symbolic branch ref instead of treating it as absent' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-cyclic'
+        $refPath = Join-Path $repositoryPath '.git/refs/heads/feature/FEATURE-123'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $refPath) -Force | Out-Null
+        try { New-Item -ItemType SymbolicLink -Path $refPath -Target 'FEATURE-123' | Out-Null }
+        catch { Set-ItResult -Skipped -Because 'this platform cannot create a cyclic symbolic ref'; return }
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-cyclic.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-cyclic')) -Case 'cyclic symbolic task ref'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'blocks a start commit that only a replacement ref can resolve' {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-replacement'
+        & git -C $repositoryPath replace -l *> $null
+        if ($LASTEXITCODE -ne 0) { Set-ItResult -Skipped -Because 'git replace is unavailable'; return }
+
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        $missing = '36478499d1d27f636b8ea3604772d3aa7cd5e8d3'
+        & git -C $repositoryPath update-ref "refs/replace/$missing" $head
+        (& git -C $repositoryPath rev-parse --verify --quiet "$missing^{commit}") | Should -Be $missing
+
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request.repositories[0]['startCommit'] = $missing
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-replacement.json') -Request $request
+
+        $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-replacement')) -Case 'replacement-only start commit'
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'blocked'
+        $result.plan.worktreeOperations[0].reason | Should -Be 'start-commit-missing'
+    }
+
+    It 'rechecks a new promisor remote between the initial and locked plan' -Skip:(-not $IsLinux) {
+        # The shim behaves like Git without --no-lazy-fetch and turns the full
+        # clone into a partial one once apply holds the mutation lock, so only a
+        # config re-read can refuse the locked re-plan.
+        $repositoryPath = New-TestRepository -Name 'cli-promisor-later'
+        $tasksRoot = Join-Path $TestDrive 'cli-tasks-promisor-later'
+        $shimDir = Join-Path $TestDrive 'cli-shim-promisor-later'
+        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+        $shimPath = Join-Path $shimDir 'git'
+        @(
+            '#!/bin/sh'
+            "REAL_GIT='$realGit'"
+            "LOCK='$(Join-Path $tasksRoot '.ai-task-scaffold.lock')'"
+            "FLAG='$(Join-Path $TestDrive 'cli-promisor-later.flag')'"
+            "REPO='$repositoryPath'"
+            'if [ "$1" = "--no-lazy-fetch" ]; then'
+            '  echo "error: unknown option: --no-lazy-fetch" >&2'
+            '  exit 129'
+            'fi'
+            'case " $* " in'
+            '  *" config "*extensions.partialClone*)'
+            '    if [ -e "$LOCK" ] && [ ! -e "$FLAG" ]; then'
+            '      "$REAL_GIT" -C "$REPO" config remote.origin.promisor true'
+            '      : > "$FLAG"'
+            '    fi ;;'
+            'esac'
+            'exec "$REAL_GIT" "$@"'
+        ) | Set-Content -LiteralPath $shimPath
+        & chmod +x $shimPath
+
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-promisor-later.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $plan = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'full clone before the promisor remote appears'
+            $run = Invoke-TaskPlanRaw -Arguments @('task', 'apply', '--request', $requestPath, '--tasks-root', $tasksRoot, '--expected-plan-identity', $plan.planIdentity)
+        }
+        finally { $env:PATH = $savedPath }
+
+        $run.ExitCode | Should -Be 1
+        $run.StdErr | Should -Match 'partial clone'
+        (& git -C $repositoryPath config --get remote.origin.promisor) | Should -Be 'true'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'FEATURE-123/task.json') | Should -BeFalse
+    }
+
+    It 'binds the validated pin without re-reading the mutable task ref' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-TestRepository -Name 'cli-ref-single-read'
+        $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+        & git -C $repositoryPath branch feature/FEATURE-123 $head
+        $logPath = Join-Path $TestDrive 'cli-ref-single-read.log'
+        $shimDir = Join-Path $TestDrive 'cli-shim-single-read'
+        New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+        $shimPath = Join-Path $shimDir 'git'
+        $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+        @(
+            '#!/bin/sh'
+            "REAL_GIT='$realGit'"
+            "LOG='$logPath'"
+            'printf ''%s\n'' "$*" >> "$LOG"'
+            'exec "$REAL_GIT" "$@"'
+        ) | Set-Content -LiteralPath $shimPath
+        & chmod +x $shimPath
+
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $request.repositories[0]['startCommit'] = $head
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-ref-single-read.json') -Request $request
+
+        $savedPath = $env:PATH
+        $env:PATH = "$($shimDir):$savedPath"
+        try {
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-ref-single-read')) -Case 'single read pin plan'
+        }
+        finally { $env:PATH = $savedPath }
+
+        $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        $result.plan.worktreeOperations[0].branchMode | Should -Be 'existing'
+        $log = @(Get-Content -LiteralPath $logPath)
+        @($log | Where-Object { $_ -match 'rev-parse.*refs/heads/feature/FEATURE-123' }) |
+            Should -BeNullOrEmpty -Because 'the pin path must not resolve the mutable ref a second time'
+        @($log | Where-Object { $_ -match 'for-each-ref.*refs/heads/feature/FEATURE-123' }) |
+            Should -Not -BeNullOrEmpty -Because 'the exact ref snapshot is the one verified read'
+    }
 }
 
 Describe 'dotnet task plan ctx roots' {

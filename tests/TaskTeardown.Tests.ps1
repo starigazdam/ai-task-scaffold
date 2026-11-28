@@ -351,4 +351,40 @@ exit "$status"
         { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*unexpected-task-entry*'
         Test-Path -LiteralPath (Join-Path $script:taskPath 'agents.md') | Should -BeTrue
     }
+
+    It 'accepts a registered branch that is itself a symbolic alias' {
+        & git -C $script:repositoryPath branch feature/REAL | Out-Null
+        & git -C $script:repositoryPath symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+        & git -C $script:repositoryPath worktree remove --force $script:worktreePath
+        & git -C $script:repositoryPath worktree add $script:worktreePath feature/ALIAS | Out-Null
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $manifest.repositories[0].branch = 'feature/ALIAS'
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'remove'
+        & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply | Out-Null
+        Test-Path -LiteralPath $script:taskPath | Should -BeFalse
+    }
+
+    It 'refuses a worktree whose HEAD only indirectly resolves to the registered branch' {
+        & git -C $script:repositoryPath branch feature/REAL | Out-Null
+        & git -C $script:repositoryPath symbolic-ref refs/heads/feature/ALIAS refs/heads/feature/REAL
+        & git -C $script:worktreePath symbolic-ref HEAD refs/heads/feature/ALIAS
+        $manifestPath = Join-Path $script:taskPath 'task.json'
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $manifest.repositories[0].branch = 'feature/REAL'
+        $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -NoNewline
+
+        $plan = & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey | ConvertFrom-Json
+
+        $plan.TaskOperation | Should -Be 'blocked'
+        $plan.TaskReason | Should -Be 'blocked-worktree'
+        $plan.WorktreeOperations[0].Reason | Should -Be 'branch-mismatch' -Because 'the immediate target is feature/ALIAS, not the registered feature/REAL'
+        { & $script:scriptPath -TasksRoot $script:tasksRoot -TaskKey $script:taskKey -Apply } | Should -Throw '*branch-mismatch*'
+        Test-Path -LiteralPath $script:worktreePath | Should -BeTrue
+        Test-Path -LiteralPath $script:taskPath | Should -BeTrue
+    }
 }

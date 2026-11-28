@@ -27,6 +27,12 @@ public sealed class WorktreeOperation
 
     [JsonPropertyName("reason")]
     public string? Reason { get; init; }
+
+    // Only blocked plans carry an actionable detail; a null message keeps the
+    // documented plan shape for every planned operation unchanged.
+    [JsonPropertyName("message")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Message { get; init; }
 }
 
 public sealed class TaskPlan
@@ -118,6 +124,8 @@ public sealed class CanonicalRepository
     public string BaseBranch { get; init; } = string.Empty;
 
     public string Branch { get; init; } = string.Empty;
+
+    public string? StartCommit { get; init; }
 }
 
 public sealed class CanonicalProfile
@@ -148,6 +156,8 @@ public sealed class CanonicalOperation
     public string? SourceRef { get; init; }
 
     public string? SourceCommit { get; init; }
+
+    public string? SourceTarget { get; init; }
 
     public string? DestinationIdentity { get; init; }
 }
@@ -321,6 +331,8 @@ public static class TaskPlanner
 {
     private static readonly Regex RemoteQualifiedPattern = new(@"^[^/]+/.+", RegexOptions.CultureInvariant);
 
+    private static readonly Regex ObjectIdPattern = new(@"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z", RegexOptions.CultureInvariant);
+
     public static TaskPlanResult Plan(NormalizedRequest request, string tasksRoot, CtxRootOptions ctxRoots)
     {
         string fullTasksRoot;
@@ -457,11 +469,36 @@ public static class TaskPlanner
             };
         }
 
+        var startCommit = repository.StartCommit;
+        if (startCommit is not null &&
+            !string.Equals(ResolveCommit(repository.Path, startCommit), startCommit, StringComparison.Ordinal))
+        {
+            return Blocked(repository, destination, "start-commit-missing", commonDir, head);
+        }
+
         if (TryGetAttributes(destination, out var destinationAttributes))
         {
             if ((destinationAttributes & FileAttributes.Directory) != 0 && IsMatchingWorktree(repository.Path, destination, repository.Branch, commonDir))
             {
+                // Reuse is proved at reuse time: the destination is this
+                // repository's worktree, on the requested branch, with a readable
+                // branch tip. An unreadable tip blocks instead of reusing blind.
                 var reuseRef = $"refs/heads/{repository.Branch}";
+                var reuseTip = (Exists: false, Commit: (string?)null);
+                try
+                {
+                    reuseTip = ReadRefTip(repository.Path, reuseRef);
+                }
+                catch (OperationalException)
+                {
+                    return Blocked(repository, destination, "reuse-unreadable", commonDir, head);
+                }
+
+                if (!reuseTip.Exists || reuseTip.Commit is null)
+                {
+                    return Blocked(repository, destination, "reuse-unreadable", commonDir, head);
+                }
+
                 return new PlannedOperation
                 {
                     Operation = new WorktreeOperation
@@ -476,7 +513,8 @@ public static class TaskPlanner
                     CommonDir = commonDir,
                     Head = head,
                     SourceRef = reuseRef,
-                    SourceCommit = ResolveCommit(repository.Path, reuseRef),
+                    SourceCommit = reuseTip.Commit,
+                    SourceTarget = ResolveRefTarget(repository.Path, reuseRef),
                     DestinationIdentity = GetGitDir(destination),
                 };
             }
@@ -496,14 +534,70 @@ public static class TaskPlanner
         }
 
         var requestedLocal = $"refs/heads/{repository.Branch}";
-        if (RefExists(repository.Path, requestedLocal))
+        var requestedRemote = $"refs/remotes/origin/{repository.Branch}";
+        if (startCommit is not null)
         {
-            return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, commonDir, head);
+            var localTip = ReadRefTip(repository.Path, requestedLocal);
+            if (localTip.Exists)
+            {
+                if (localTip.Commit is null || !string.Equals(localTip.Commit, startCommit, StringComparison.Ordinal))
+                {
+                    return Blocked(repository, destination, "start-commit-mismatch", commonDir, head);
+                }
+
+                // Bind the SHA that was just validated.
+                return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, startCommit, ResolveRefTarget(repository.Path, requestedLocal), commonDir, head);
+            }
+
+            var remoteTip = ReadRefTip(repository.Path, requestedRemote);
+            if (remoteTip.Exists)
+            {
+                if (remoteTip.Commit is null || !string.Equals(remoteTip.Commit, startCommit, StringComparison.Ordinal))
+                {
+                    return Blocked(repository, destination, "start-commit-mismatch", commonDir, head);
+                }
+
+                return new PlannedOperation
+                {
+                    Operation = new WorktreeOperation
+                    {
+                        Repository = repository.Name,
+                        Action = "create-remote",
+                        Source = requestedRemote,
+                        BranchMode = "track",
+                        Destination = destination,
+                        Reason = null,
+                    },
+                    CommonDir = commonDir,
+                    Head = head,
+                    SourceRef = requestedRemote,
+                    SourceCommit = startCommit,
+                    SourceTarget = ResolveRefTarget(repository.Path, requestedRemote),
+                };
+            }
+
+            return CreateLocal(repository, destination, startCommit, "new", startCommit, startCommit, null, commonDir, head);
         }
 
-        var requestedRemote = $"refs/remotes/origin/{repository.Branch}";
-        if (RefExists(repository.Path, requestedRemote))
+        var localBranchTip = ReadRefTip(repository.Path, requestedLocal);
+        if (localBranchTip.Exists)
         {
+            if (localBranchTip.Commit is null)
+            {
+                return Blocked(repository, destination, "start-commit-missing", commonDir, head);
+            }
+
+            return CreateLocal(repository, destination, repository.Branch, "existing", requestedLocal, localBranchTip.Commit, ResolveRefTarget(repository.Path, requestedLocal), commonDir, head);
+        }
+
+        var remoteBranchTip = ReadRefTip(repository.Path, requestedRemote);
+        if (remoteBranchTip.Exists)
+        {
+            if (remoteBranchTip.Commit is null)
+            {
+                return Blocked(repository, destination, "start-commit-missing", commonDir, head);
+            }
+
             return new PlannedOperation
             {
                 Operation = new WorktreeOperation
@@ -518,21 +612,34 @@ public static class TaskPlanner
                 CommonDir = commonDir,
                 Head = head,
                 SourceRef = requestedRemote,
-                SourceCommit = ResolveCommit(repository.Path, requestedRemote),
+                SourceCommit = remoteBranchTip.Commit,
+                SourceTarget = ResolveRefTarget(repository.Path, requestedRemote),
             };
         }
 
         var localBase = $"refs/heads/{repository.BaseBranch}";
-        if (RefExists(repository.Path, localBase))
+        var localBaseTip = ReadRefTip(repository.Path, localBase, peel: true);
+        if (localBaseTip.Exists)
         {
-            return CreateLocal(repository, destination, repository.BaseBranch, "new", localBase, commonDir, head);
+            if (localBaseTip.Commit is null)
+            {
+                return Blocked(repository, destination, "base-branch-missing", commonDir, head);
+            }
+
+            return CreateLocal(repository, destination, repository.BaseBranch, "new", localBase, localBaseTip.Commit, ResolveRefTarget(repository.Path, localBase), commonDir, head);
         }
 
         var remoteBase = RemoteQualifiedPattern.IsMatch(repository.BaseBranch) ? repository.BaseBranch : $"origin/{repository.BaseBranch}";
         var remoteBaseRef = $"refs/remotes/{remoteBase}";
-        if (RefExists(repository.Path, remoteBaseRef))
+        var remoteBaseTip = ReadRefTip(repository.Path, remoteBaseRef, peel: true);
+        if (remoteBaseTip.Exists)
         {
-            return CreateLocal(repository, destination, remoteBase, "new", remoteBaseRef, commonDir, head);
+            if (remoteBaseTip.Commit is null)
+            {
+                return Blocked(repository, destination, "base-branch-missing", commonDir, head);
+            }
+
+            return CreateLocal(repository, destination, remoteBase, "new", remoteBaseRef, remoteBaseTip.Commit, ResolveRefTarget(repository.Path, remoteBaseRef), commonDir, head);
         }
 
         return new PlannedOperation
@@ -549,8 +656,22 @@ public static class TaskPlanner
         };
     }
 
-    private static PlannedOperation CreateLocal(NormalizedRepository repository, string destination, string source, string branchMode, string sourceRef, string commonDir, string head)
+    private static PlannedOperation CreateLocal(NormalizedRepository repository, string destination, string source, string branchMode, string sourceRef, string sourceCommit, string? sourceTarget, string commonDir, string head)
     {
+        if (string.Equals(branchMode, "existing", StringComparison.Ordinal))
+        {
+            // Attach verifies the upstream the new worktree inherits, and Git
+            // copies the source worktree config into it. An include in that
+            // file can resolve differently at the destination, so block
+            // before any worktree exists.
+            var include = GetWorktreeConfigInclude(repository.Path);
+            if (include is { } found)
+            {
+                var message = $"the worktree config '{found.Path}' has '{found.Key}'; git worktree add copies that file into the new worktree, where the include can resolve differently, so the inherited upstream cannot be verified before attach; move it to the shared repository config as an unconditional include, or remove it";
+                return Blocked(repository, destination, "worktree-config-include", commonDir, head, message);
+            }
+        }
+
         return new PlannedOperation
         {
             Operation = new WorktreeOperation
@@ -565,7 +686,25 @@ public static class TaskPlanner
             CommonDir = commonDir,
             Head = head,
             SourceRef = sourceRef,
-            SourceCommit = ResolveCommit(repository.Path, sourceRef),
+            SourceCommit = sourceCommit,
+            SourceTarget = sourceTarget,
+        };
+    }
+
+    private static PlannedOperation Blocked(NormalizedRepository repository, string destination, string reason, string commonDir, string head, string? message = null)
+    {
+        return new PlannedOperation
+        {
+            Operation = new WorktreeOperation
+            {
+                Repository = repository.Name,
+                Action = "blocked",
+                Destination = destination,
+                Reason = reason,
+                Message = message,
+            },
+            CommonDir = commonDir,
+            Head = head,
         };
     }
 
@@ -584,6 +723,7 @@ public static class TaskPlanner
                 Path = r.Path,
                 BaseBranch = r.BaseBranch,
                 Branch = r.Branch,
+                StartCommit = r.StartCommit,
             }).ToList(),
             Profiles = request.Profiles.Select(p => new CanonicalProfile
             {
@@ -603,6 +743,7 @@ public static class TaskPlanner
                 Head = p.Head,
                 SourceRef = p.SourceRef,
                 SourceCommit = p.SourceCommit,
+                SourceTarget = p.SourceTarget,
                 DestinationIdentity = p.DestinationIdentity,
             }).ToList(),
             TaskExists = state.TaskExists,
@@ -642,28 +783,101 @@ public static class TaskPlanner
         return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
     }
 
+    private static string? GetWorktreeConfigPath(string repositoryPath)
+    {
+        // Decode strictly: a path byte that is not UTF-8 would otherwise become
+        // U+FFFD and name a different file, so fail closed. A literal U+FFFD
+        // in a valid UTF-8 path stays valid.
+        (int ExitCode, string StdOut, string StdErr) result;
+        try
+        {
+            result = RunGitProcess(repositoryPath, false, new System.Text.UTF8Encoding(false, true), "rev-parse", "--path-format=absolute", "--git-path", "config.worktree");
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            throw new OperationalException($"cannot read the worktree config path for '{repositoryPath}': Git returned a path that is not valid UTF-8");
+        }
+
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
+        // Remove only Git's final line terminator: a path can contain a newline.
+        var path = result.StdOut;
+        if (path.EndsWith('\n'))
+        {
+            path = path[..^1];
+        }
+
+        if (path.EndsWith('\r'))
+        {
+            path = path[..^1];
+        }
+
+        return path;
+    }
+
+    private static (string Path, string Key)? GetWorktreeConfigInclude(string repositoryPath)
+    {
+        // `git worktree add` copies the source worktree's config.worktree into
+        // the new worktree. Any include in that file can resolve differently
+        // there: a relative path resolves against the new file, and an
+        // includeIf condition sees the new worktree. Do not emulate Git's
+        // include resolution: scan the file Git copies and report the first
+        // include key. A stale file blocks too, whatever
+        // extensions.worktreeConfig says; that is a conservative refusal.
+        var path = GetWorktreeConfigPath(repositoryPath)
+            ?? throw new OperationalException($"cannot resolve the worktree config path for '{repositoryPath}'");
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+
+        // List every key and match in code: --get-regexp is locale-sensitive,
+        // and a condition byte that is not valid in the locale hides the key.
+        // Git lowercases the section and variable names.
+        var includes = RunGit(repositoryPath, "config", "--file", path, "--no-includes", "--null", "--name-only", "--list");
+        if (includes.ExitCode == 1)
+        {
+            return null;
+        }
+
+        if (includes.ExitCode != 0)
+        {
+            throw new OperationalException($"cannot read the worktree config includes in '{path}': {FirstLine(includes.StdErr)}");
+        }
+
+        var key = includes.StdOut.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(name =>
+            name == "include.path" || (name.StartsWith("includeif.", StringComparison.Ordinal) && name.EndsWith(".path", StringComparison.Ordinal)));
+        return key is null ? null : (path, key);
+    }
+
     private static string? GetHead(string repositoryPath)
     {
         var result = RunGit(repositoryPath, "rev-parse", "HEAD");
         return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
     }
 
-    private static string? GetBranch(string repositoryPath)
+    private static string? GetImmediateHeadRef(string repositoryPath)
     {
-        var result = RunGit(repositoryPath, "branch", "--show-current");
-        return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
-    }
+        // HEAD's immediate target, never a recursive alias resolution: a task
+        // branch may itself be a symbolic alias, and an indirect alias that only
+        // resolves to the requested branch is not that branch.
+        var result = RunGit(repositoryPath, "symbolic-ref", "-q", "--no-recurse", "HEAD");
+        if (result.ExitCode == 0)
+        {
+            return FirstLine(result.StdOut);
+        }
 
-    private static bool RefExists(string repositoryPath, string reference)
-    {
-        var result = RunGit(repositoryPath, "rev-parse", "--verify", "--quiet", $"{reference}^{{commit}}");
-        return result.ExitCode == 0;
-    }
+        if (result.StdErr.Contains("unknown option", StringComparison.Ordinal) ||
+            result.StdErr.Contains("unrecognized option", StringComparison.Ordinal))
+        {
+            throw new OperationalException(
+                $"cannot read the immediate HEAD target in '{repositoryPath}': this Git does not support 'symbolic-ref --no-recurse'; refusing to resolve HEAD recursively (Git 2.46 or later is required)");
+        }
 
-    private static string? ResolveCommit(string repositoryPath, string reference)
-    {
-        var result = RunGit(repositoryPath, "rev-parse", "--verify", "--quiet", $"{reference}^{{commit}}");
-        return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
+        return null;
     }
 
     private static bool IsMatchingWorktree(string repositoryPath, string destination, string branch, string commonDir)
@@ -679,8 +893,126 @@ public static class TaskPlanner
             return false;
         }
 
-        var destinationBranch = GetBranch(destination);
-        return string.Equals(destinationBranch, branch, StringComparison.Ordinal);
+        var destinationHeadRef = GetImmediateHeadRef(destination);
+        return string.Equals(destinationHeadRef, $"refs/heads/{branch}", StringComparison.Ordinal);
+    }
+
+    private static string? ResolveCommit(string repositoryPath, string reference)
+    {
+        // No replacement objects: a replace ref can map a missing pinned commit
+        // to a local one, which would validate an object that is not here.
+        var result = RunGit(repositoryPath, "--no-replace-objects", "rev-parse", "--verify", "--quiet", $"{reference}^{{commit}}");
+        return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
+    }
+
+    private static string? ResolveRefTarget(string repositoryPath, string reference)
+    {
+        // The canonical target of a symbolic ref, or the ref itself when it is
+        // not symbolic. Bound into the identity so retargeting a symref at an
+        // equal commit still changes the reviewed plan, whether or not a
+        // separate upstream will be written.
+        var current = reference;
+        for (var depth = 0; depth < 8; depth++)
+        {
+            var result = RunGit(repositoryPath, "symbolic-ref", "-q", current);
+            if (result.ExitCode != 0)
+            {
+                break;
+            }
+
+            var target = FirstLine(result.StdOut);
+            if (!target.StartsWith("refs/", StringComparison.Ordinal) || string.Equals(target, current, StringComparison.Ordinal))
+            {
+                break;
+            }
+
+            current = target;
+        }
+
+        return current;
+    }
+
+    private static (bool Exists, string? Commit) ReadRefTip(string repositoryPath, string reference, bool peel = false)
+    {
+        // Presence comes from exact name checks that never run revision DWIM:
+        // show-ref --verify and symbolic-ref -q accept only the full name, so a
+        // lookalike tag cannot stand in. for-each-ref supplies the raw object
+        // ID. Absence needs every signal: show-ref exit 1, symbolic-ref exit 1,
+        // no listing row, and no for-each-ref warning. A malformed loose ref or
+        // a cyclic symref is present-but-unreadable, never absent.
+        var presence = RunGit(repositoryPath, "show-ref", "--verify", "--quiet", reference);
+        var symbolic = RunGit(repositoryPath, "symbolic-ref", "-q", reference);
+
+        var result = RunGit(repositoryPath, "for-each-ref", "--format=%(refname) %(objectname)", reference);
+        if (result.ExitCode != 0)
+        {
+            throw new OperationalException($"cannot read ref '{reference}' in '{repositoryPath}'");
+        }
+
+        string? objectId = null;
+        var listed = false;
+        foreach (var rawLine in result.StdOut.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r');
+            if (!line.StartsWith(reference + " ", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            // Fixed-width parse: the remainder is exactly one raw object ID.
+            var candidate = line[(reference.Length + 1)..];
+            if (ObjectIdPattern.IsMatch(candidate))
+            {
+                objectId = candidate;
+            }
+
+            listed = true;
+            break;
+        }
+
+        var warned = !string.IsNullOrWhiteSpace(result.StdErr);
+        bool exists;
+        if (presence.ExitCode == 0 || symbolic.ExitCode == 0 || listed)
+        {
+            exists = true;
+        }
+        else if (presence.ExitCode == 1 && symbolic.ExitCode == 1 && !warned)
+        {
+            exists = false;
+        }
+        else
+        {
+            // Another exit code, or a warning with an omitted row: present but
+            // unreadable. Callers fail closed instead of falling through.
+            exists = true;
+        }
+
+        if (!exists)
+        {
+            return (false, null);
+        }
+
+        if (objectId is null)
+        {
+            return (true, null);
+        }
+
+        var verify = RunGit(repositoryPath, "--no-replace-objects", "rev-parse", "--verify", "--quiet", $"{objectId}^{{commit}}");
+        if (verify.ExitCode != 0)
+        {
+            return (true, null);
+        }
+
+        var commit = FirstLine(verify.StdOut);
+        // A base ref may name an annotated tag (for example through a symbolic
+        // alias); native Git starts at the peeled commit. Other refs must name
+        // the commit itself.
+        if (string.Equals(commit, objectId, StringComparison.Ordinal) || (peel && ObjectIdPattern.IsMatch(commit)))
+        {
+            return (true, commit);
+        }
+
+        return (true, null);
     }
 
     private static bool HasUnsafePathComponent(string tasksRoot, string taskKey, string repositoryName)
@@ -728,7 +1060,112 @@ public static class TaskPlanner
         }
     }
 
+    private static readonly Dictionary<string, bool> NoLazyFetchSupportByPath = new(StringComparer.Ordinal);
+
+    private static readonly object GitCapabilityLock = new();
+
     private static (int ExitCode, string StdOut, string StdErr) RunGit(string repositoryPath, params string[] arguments)
+    {
+        EnsureNoLazyFetchAllowed(repositoryPath);
+        return RunGitProcess(repositoryPath, true, arguments);
+    }
+
+    private static void EnsureNoLazyFetchAllowed(string repositoryPath)
+    {
+        if (SupportsNoLazyFetch())
+        {
+            // The per-child GIT_NO_LAZY_FETCH guard below still applies.
+            return;
+        }
+
+        if (!IsPartialClone(repositoryPath))
+        {
+            // Old Git is safe for a full clone: there is no promisor remote.
+            return;
+        }
+
+        throw new OperationalException(
+            $"repository '{repositoryPath}' is a partial clone, but this Git does not support --no-lazy-fetch (Git 2.45 or later is required); refusing a read-only planning lookup that could fetch a missing object. Upgrade Git or use a full clone.");
+    }
+
+    private static bool SupportsNoLazyFetch()
+    {
+        // Key by PATH so a test shim that shadows git is not masked by a result
+        // cached for the real executable.
+        var key = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        lock (GitCapabilityLock)
+        {
+            if (NoLazyFetchSupportByPath.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+        }
+
+        var result = RunGitProcess(null, false, "--no-lazy-fetch", "--version");
+        var supported = result.ExitCode == 0;
+        lock (GitCapabilityLock)
+        {
+            NoLazyFetchSupportByPath[key] = supported;
+        }
+
+        return supported;
+    }
+
+    private static bool IsPartialClone(string repositoryPath)
+    {
+        // Never cached: extensions.partialClone and remote.<name>.promisor are
+        // mutable repository config, and the initial plan and the locked
+        // re-plan must both see a promisor remote added in between. Old Git is
+        // only safe while the repository is a full clone.
+        var partial = false;
+        var extensions = RunGitProcess(repositoryPath, false, "config", "--get", "extensions.partialClone");
+        if (extensions.ExitCode == 0 && !string.IsNullOrWhiteSpace(extensions.StdOut))
+        {
+            partial = true;
+        }
+        else
+        {
+            // List every key and match in code: --get-regexp is locale-sensitive,
+            // and a remote name byte that is not valid in the locale hides the
+            // key. Each record is "key<LF>value<NUL>"; a key without a value is
+            // true.
+            var promisors = RunGitProcess(repositoryPath, false, "config", "--null", "--list");
+            if (promisors.ExitCode == 0)
+            {
+                foreach (var record in promisors.StdOut.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var separator = record.IndexOf('\n');
+                    var key = separator < 0 ? record : record[..separator];
+                    if (!key.StartsWith("remote.", StringComparison.Ordinal) || !key.EndsWith(".promisor", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    if (separator < 0 || IsGitBoolTrue(record[(separator + 1)..]))
+                    {
+                        partial = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return partial;
+    }
+
+    private static bool IsGitBoolTrue(string value)
+    {
+        // Git's boolean true spellings, case-insensitive, and any nonzero integer.
+        var text = value.Trim().ToLowerInvariant();
+        return text is "true" or "yes" or "on" || (long.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var number) && number != 0);
+    }
+
+    private static (int ExitCode, string StdOut, string StdErr) RunGitProcess(string? repositoryPath, bool guardNoLazyFetch, params string[] arguments)
+    {
+        return RunGitProcess(repositoryPath, guardNoLazyFetch, null, arguments);
+    }
+
+    private static (int ExitCode, string StdOut, string StdErr) RunGitProcess(string? repositoryPath, bool guardNoLazyFetch, System.Text.Encoding? stdoutEncoding, params string[] arguments)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -737,12 +1174,24 @@ public static class TaskPlanner
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = stdoutEncoding,
         };
-        startInfo.ArgumentList.Add("-C");
-        startInfo.ArgumentList.Add(repositoryPath);
+        if (repositoryPath is not null)
+        {
+            startInfo.ArgumentList.Add("-C");
+            startInfo.ArgumentList.Add(repositoryPath);
+        }
+
         foreach (var argument in arguments)
         {
             startInfo.ArgumentList.Add(argument);
+        }
+
+        // Planner git calls are read-only. A partial clone would otherwise
+        // lazily fetch a missing object just to answer rev-parse.
+        if (guardNoLazyFetch)
+        {
+            startInfo.Environment["GIT_NO_LAZY_FETCH"] = "1";
         }
 
         try
@@ -782,6 +1231,8 @@ public static class TaskPlanner
         public string? SourceRef { get; init; }
 
         public string? SourceCommit { get; init; }
+
+        public string? SourceTarget { get; init; }
 
         public string? DestinationIdentity { get; init; }
     }

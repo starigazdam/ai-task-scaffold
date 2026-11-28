@@ -145,6 +145,48 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         }
     }
 
+    It 'creates a tracking branch at the planned commit through the batch runner' {
+        $case = New-ConcurrencyCaseRoot
+        $trackPath = Join-Path $case 'repos/track'
+        New-ConcurrencyFixtureRepository -RepositoryPath $trackPath
+        $reviewed = (& git -C $trackPath rev-parse HEAD).Trim()
+        $remotePath = Join-Path $case 'track.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $trackPath remote add origin $remotePath
+        & git -C $trackPath push origin 'main:refs/heads/feature/TRACK' | Out-Null
+        & git -C $trackPath fetch origin | Out-Null
+        $trackRepository = [pscustomobject]@{ Name = 'track'; Path = $trackPath; BaseBranch = 'main'; Branch = 'feature/TRACK' }
+        $trackPlan = New-TaskWorktreePlan -Repository $trackRepository -TaskKey 'CONCURRENCY-1' -TasksRoot (Join-Path $case 'tasks')
+
+        # Move only the selected remote-tracking ref. commit-tree creates a new
+        # commit without moving any local branch, so main cannot advance and
+        # mask a plan that bound the wrong ref.
+        $trackBranch = 'feature/TRACK'
+        $old = (& git -C $trackPath rev-parse "refs/remotes/origin/$trackBranch").Trim()
+        $tree = (& git -C $trackPath rev-parse 'HEAD^{tree}').Trim()
+        $moved = (& git -C $trackPath commit-tree $tree -p $old -m 'move the remote task ref').Trim()
+        & git -C $trackPath push origin "${moved}:refs/heads/$trackBranch" | Out-Null
+        & git -C $trackPath fetch origin | Out-Null
+        $new = (& git -C $trackPath rev-parse "refs/remotes/origin/$trackBranch").Trim()
+        $old | Should -Be $reviewed -Because 'the reviewed commit is the old remote tip'
+        $new | Should -Not -Be $old
+        (& git -C $trackPath rev-parse "refs/remotes/origin/$trackBranch").Trim() | Should -Be $new -Because 'the race fixture must really move the selected remote ref'
+        (& git -C $trackPath rev-parse 'refs/heads/main').Trim() | Should -Be $reviewed -Because 'only the selected remote-tracking ref may move, never main'
+
+        New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case 'repos/plain')
+        $items = @(
+            [pscustomobject]@{ Index = 0; Plan = $trackPlan; Repository = $trackRepository },
+            (New-WorkItem -CaseRoot $case -Name 'plain' -Index 1)
+        )
+
+        $results = Invoke-TaskWorktreePlanBatch -WorkItems $items -Limit 2 -ModulePath $modulePath
+
+        $results.Index | Should -Be @(0, 1)
+        $results.Status | Should -Be @('created', 'created')
+        (& git -C $trackPlan.Destination rev-parse HEAD).Trim() | Should -Be $reviewed
+        (& git -C $trackPlan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/TRACK').Trim() | Should -Be 'refs/remotes/origin/feature/TRACK'
+    }
+
     It 'runs independent repositories in parallel' -Skip:(-not $IsLinux) {
         $case = New-ConcurrencyCaseRoot
         $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'parallel.log')
@@ -249,9 +291,10 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         foreach ($name in $names) { New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case "repos/$name") }
         $items = @(for ($index = 0; $index -lt $names.Count; $index++) { New-WorkItem -CaseRoot $case -Name $names[$index] -Index $index })
 
-        # charlie (index 2) fails at once because its base branch is gone; alpha
-        # (index 0) fails after 0.6 s through the shim; bravo succeeds at 0.2 s.
-        & git -C (Join-Path $case 'repos/charlie') branch -m main main-renamed
+        # charlie (index 2) fails at once because its planned branch already
+        # exists; alpha (index 0) fails after 0.6 s through the shim; bravo
+        # succeeds at 0.2 s.
+        & git -C (Join-Path $case 'repos/charlie') branch 'feature/CONCURRENCY-2' | Out-Null
         $shim = New-TimingGitShim -ShimRoot $case -LogPath (Join-Path $case 'order.log')
         $savedPath = $env:PATH
         $env:PATH = "$($shim.Directory):$savedPath"
@@ -280,6 +323,37 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         ($results | Where-Object Status -eq 'failed' | Select-Object -Last 1).Repository | Should -Be 'charlie'
     }
 
+    It 'does not strand the second of two names sharing one repository branch' {
+        $case = New-ConcurrencyCaseRoot
+        $repositoryPath = Join-Path $case 'repos/shared'
+        New-ConcurrencyFixtureRepository -RepositoryPath $repositoryPath
+        $tasksRoot = Join-Path $case 'tasks'
+        $first = [pscustomobject]@{ Name = 'one'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/SHARED' }
+        $second = [pscustomobject]@{ Name = 'two'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/SHARED' }
+        $items = @(
+            [pscustomobject]@{ Index = 0; Repository = $first; Plan = (New-TaskWorktreePlan -Repository $first -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot) },
+            [pscustomobject]@{ Index = 1; Repository = $second; Plan = (New-TaskWorktreePlan -Repository $second -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot) }
+        )
+
+        # The chain serializes both names on one common directory; the second
+        # add finds the branch the first just created and fails.
+        $results = Invoke-TaskWorktreePlanBatch -WorkItems $items -Limit 2 -ModulePath $modulePath
+
+        $results.Index | Should -Be @(0, 1)
+        $results.Status | Should -Be @('created', 'failed')
+        $results[1].Message | Should -Match 'git worktree add failed'
+        Test-Path -LiteralPath (Join-Path $tasksRoot 'CONCURRENCY-1/worktrees/two') | Should -BeFalse
+        @(Get-ChildItem -LiteralPath (Join-Path $tasksRoot 'CONCURRENCY-1/worktrees') -Force).Count |
+            Should -Be 1 -Because 'a failed add must not leave scaffold state behind'
+
+        # The existing branch is exactly the reviewed commit, so a fresh plan
+        # attaches it. Git itself still refuses a second checkout of a branch
+        # already used by the first worktree.
+        $retry = New-TaskWorktreePlan -Repository $second -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
+        $retry.Action | Should -Be 'create-local'
+        $retry.BranchMode | Should -Be 'existing'
+    }
+
     It 'keeps the serial behavior and message when the limit is one' {
         $case = New-ConcurrencyCaseRoot
         $names = @('alpha', 'bravo')
@@ -298,6 +372,37 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
 }
 
 Describe 'Worktree start gate' {
+    It 'does not run a queued reuse after a failure is published' {
+        $case = New-ConcurrencyCaseRoot
+        $repositoryPath = Join-Path $case 'repos/reuse-gated'
+        New-ConcurrencyFixtureRepository -RepositoryPath $repositoryPath
+        $remotePath = Join-Path $case 'reuse-gated.git'
+        & git init --bare $remotePath | Out-Null
+        & git -C $repositoryPath remote add origin $remotePath
+        & git -C $repositoryPath push origin 'main:refs/heads/feature/CONCURRENCY-9' | Out-Null
+        & git -C $repositoryPath fetch origin | Out-Null
+        $repository = [pscustomobject]@{ Name = 'reuse-gated'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/CONCURRENCY-9' }
+        $tasksRoot = Join-Path $case 'tasks'
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-remote'
+        Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
+
+        # The reuse plan binds the branch's actual upstream, which is now absent.
+        & git -C $plan.Destination branch --unset-upstream
+        $reuse = New-TaskWorktreePlan -Repository $repository -TaskKey 'CONCURRENCY-1' -TasksRoot $tasksRoot
+        $reuse.Action | Should -Be 'reuse'
+        $reuse.UpstreamRef | Should -BeNullOrEmpty
+
+        $state = [hashtable]::Synchronized(@{ Failed = $false; FirstFailedIndex = -1 })
+        $gate = [System.Threading.SemaphoreSlim]::new(1, 1)
+        Set-TaskWorktreeFailure -State $state -Gate $gate -Index 0
+
+        $started = Invoke-TaskWorktreePlan -Repository $repository -Plan $reuse -State $state -Gate $gate
+
+        $started | Should -BeFalse
+        (& git -C $reuse.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/CONCURRENCY-9').Trim() | Should -BeNullOrEmpty
+    }
+
     It 'starts no git process once a failure is published' {
         $case = New-ConcurrencyCaseRoot
         New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case 'repos/alpha')

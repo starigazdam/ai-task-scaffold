@@ -353,7 +353,8 @@ if ($Apply) {
     }
     $blockedOperation = $worktreeOperations | Where-Object Action -eq 'blocked' | Select-Object -First 1
     if ($blockedOperation) {
-        throw "cannot apply blocked worktree plan for '$($blockedOperation.Repository)': $($blockedOperation.Reason)"
+        $blockedDetail = if ($blockedOperation.PSObject.Properties['Message'] -and $blockedOperation.Message) { " ($($blockedOperation.Message))" } else { '' }
+        throw "cannot apply blocked worktree plan for '$($blockedOperation.Repository)': $($blockedOperation.Reason)$blockedDetail"
     }
     $customConflict = $customFileOperations | Where-Object Action -eq 'conflict' | Select-Object -First 1
     if ($customConflict) {
@@ -547,5 +548,19 @@ phases:
     }
 }
 
+# The reviewed identity binds each resolved source commit, immediate HEAD ref and
+# the upstream decision derived from branch.autoSetupMerge internally, and apply
+# uses them. The public plan keeps its documented shape: strip those internal
+# properties from a copy so a consumer sees no new field, for dry run and apply
+# alike.
+$internalWorktreeProperties = @('SourceCommit', 'HeadRef', 'UpstreamRef', 'UpstreamConfig', 'UpstreamRebase', 'SourceTarget')
+$publicWorktreeOperations = @($plan['WorktreeOperations'] | ForEach-Object {
+    $properties = [ordered]@{}
+    foreach ($property in $_.PSObject.Properties) {
+        if ($property.Name -cnotin $internalWorktreeProperties) { $properties[$property.Name] = $property.Value }
+    }
+    [pscustomobject]$properties
+})
+$plan['WorktreeOperations'] = $publicWorktreeOperations
 $plan['PlanIdentity'] = $planIdentity
 $plan | ConvertTo-Json -Depth 8
