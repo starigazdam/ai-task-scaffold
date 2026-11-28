@@ -333,7 +333,8 @@ function Get-TaskWorktreeConfigInclude {
     # says, so a stale file blocks too; that is a conservative refusal.
     $path = Get-TaskWorktreeConfigPath -RepositoryPath $RepositoryPath
     if (-not $path) { throw "cannot resolve the worktree config path for '$RepositoryPath'" }
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    # A native check: Test-Path treats a backslash in a Linux path as a separator.
+    if (-not [IO.File]::Exists($path)) { return $null }
     $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--file', $path, '--null', '--name-only', '--get-regexp', '^include(if\..*)?\.path$')
     if ($result.ExitCode -eq 1) { return $null }
     if ($result.ExitCode -ne 0) {
@@ -744,7 +745,8 @@ function Assert-TaskWorktreeBranchState {
         [string]$ExpectedCommit,
         [string]$UpstreamRef,
         [string]$ExpectedHeadRef,
-        [switch]$RepairUpstream
+        [switch]$RepairUpstream,
+        [switch]$UpstreamMustExist
     )
 
     $expectedHeadRef = if ($ExpectedHeadRef) { $ExpectedHeadRef } else { "refs/heads/$Branch" }
@@ -779,8 +781,12 @@ function Assert-TaskWorktreeBranchState {
     # tag spelled like the full remote ref makes it ambiguous. Check the exact
     # ref, then write branch.<name>.remote/merge directly under the default
     # fetch mapping; the post-write verification proves the mapping (#29).
-    $exists = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('show-ref', '--verify', '--quiet', $UpstreamRef)
-    if ($exists.ExitCode -ne 0) {
+    # The existence check applies when the upstream is the start ref itself:
+    # the plan read that ref, so its absence means it was pruned after the
+    # plan. An inherit upstream is copied configuration, and native Git copies
+    # it even when the ref is already gone.
+    $exists = if ($UpstreamMustExist) { Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('show-ref', '--verify', '--quiet', $UpstreamRef) } else { $null }
+    if ($exists -and $exists.ExitCode -ne 0) {
         throw "cannot set upstream for '$RepositoryName': the planned upstream '$UpstreamRef' does not exist; replan and approve again"
     }
     if ($UpstreamRef.StartsWith('refs/heads/', [StringComparison]::Ordinal)) {
@@ -920,18 +926,20 @@ function Invoke-TaskWorktreePlan {
     $headRef =
         if ($Plan.PSObject.Properties['HeadRef'] -and $Plan.HeadRef) { [string]$Plan.HeadRef }
         else { "refs/heads/$($Repository.Branch)" }
+    $sourceTarget = if ($Plan.PSObject.Properties['SourceTarget']) { [string]$Plan.SourceTarget } else { $null }
+    $upstreamMustExist = [bool]($upstreamRef -and $upstreamRef -ceq $sourceTarget)
     # This operation already started (its git add was admitted), so it finishes
     # its upstream write even if another chain published a failure meanwhile. The
     # gate still excludes a concurrent publication from interleaving with it.
     if ($Gate) {
         $Gate.Wait()
         try {
-            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch
+            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist
         }
         finally { [void]$Gate.Release() }
     }
     else {
-        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch
+        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist
     }
     return $true
 }

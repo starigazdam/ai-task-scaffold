@@ -950,6 +950,31 @@ Describe 'Worktree reuse verification and repair' {
         }
     }
 
+    It 'blocks pinned and no-pin attach plans when the Git directory path has a backslash' -Skip:(-not $IsLinux) {
+        $raw = Join-Path $TestDrive 'backslash-parent'
+        New-Item -ItemType Directory -Path $raw -Force | Out-Null
+        # PowerShell on Linux reads a backslash as a separator, so create the
+        # directory natively and reach it through a plain symlink.
+        & bash -c 'cd "$1" && mkdir "x\\y" && ln -s "x\\y" plain-link' _ $raw
+        try {
+            $fixture = New-TrackingRepository -Path (Join-Path $raw 'plain-link/api') -RemotePath (Join-Path $TestDrive 'backslash-api.git')
+            & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+            & git -C $fixture.Path config extensions.worktreeConfig true
+            & git -C $fixture.Path config --worktree include.path ./extra.cfg
+            (& git -C $fixture.Path rev-parse --path-format=absolute --git-path config.worktree) | Should -BeLike '*x\y*' -Because 'Git must report the real path with the backslash'
+
+            foreach ($pin in @($null, $fixture.Head)) {
+                $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch; StartCommit = $pin }
+                $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'backslash-tasks')
+                $plan.Action | Should -Be 'blocked' -Because "pin '$pin'"
+                $plan.Reason | Should -Be 'worktree-config-include'
+            }
+        }
+        finally {
+            & bash -c 'rm -rf "$1"' _ $raw
+        }
+    }
+
     It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive "attach-newline`npath") -RemotePath (Join-Path $TestDrive 'attach-newline.git')
         $tasksRoot = Join-Path $TestDrive 'attach-newline-tasks'
@@ -1686,6 +1711,31 @@ Describe 'branch.autoSetupMerge upstream preservation' {
 
         Invoke-TaskWorktreePlan -Repository $repository -Plan $plan
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -Be $nativeUpstream
+    }
+
+    It 'inherits a local base upstream that is already gone, as native Git does' {
+        $caseRoot = New-AutoSetupCaseRoot
+        $fixture = New-AutoSetupFixture -Root $caseRoot
+        & git -C $fixture.Path branch base $fixture.Reviewed
+        & git -C $fixture.Path update-ref refs/remotes/origin/pruned $fixture.Reviewed
+        & git -C $fixture.Path branch --set-upstream-to=origin/pruned base | Out-Null
+        & git -C $fixture.Path update-ref -d refs/remotes/origin/pruned
+        & git -C $fixture.Path config branch.autoSetupMerge inherit
+
+        $nativeDestination = Join-Path $caseRoot 'native'
+        & git -C $fixture.Path worktree add -q -b feature/FEATURE-123 $nativeDestination refs/heads/base | Out-Null
+        $nativeUpstream = ([string](@(& git -C $nativeDestination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123') | Select-Object -First 1)).Trim()
+        & git -C $fixture.Path worktree remove $nativeDestination | Out-Null
+        & git -C $fixture.Path branch -D feature/FEATURE-123 | Out-Null
+        $nativeUpstream | Should -Be 'refs/remotes/origin/pruned'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'base'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
+        $plan.Action | Should -Be 'create-local'
+        $plan.UpstreamRef | Should -Be $nativeUpstream
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' 'refs/heads/feature/FEATURE-123').Trim() | Should -Be $nativeUpstream
     }
 
