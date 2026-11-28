@@ -158,10 +158,20 @@ Describe 'Invoke-TaskWorktreePlanBatch' {
         $trackRepository = [pscustomobject]@{ Name = 'track'; Path = $trackPath; BaseBranch = 'main'; Branch = 'feature/TRACK' }
         $trackPlan = New-TaskWorktreePlan -Repository $trackRepository -TaskKey 'CONCURRENCY-1' -TasksRoot (Join-Path $case 'tasks')
 
-        Set-Content -LiteralPath (Join-Path $trackPath 'README.md') -Value 'moved'
-        & git -C $trackPath commit -am moved | Out-Null
-        & git -C $trackPath push origin 'main:refs/heads/feature/TRACK' | Out-Null
+        # Move only the selected remote-tracking ref. commit-tree creates a new
+        # commit without moving any local branch, so main cannot advance and
+        # mask a plan that bound the wrong ref.
+        $trackBranch = 'feature/TRACK'
+        $old = (& git -C $trackPath rev-parse "refs/remotes/origin/$trackBranch").Trim()
+        $tree = (& git -C $trackPath rev-parse 'HEAD^{tree}').Trim()
+        $moved = (& git -C $trackPath commit-tree $tree -p $old -m 'move the remote task ref').Trim()
+        & git -C $trackPath push origin "${moved}:refs/heads/$trackBranch" | Out-Null
         & git -C $trackPath fetch origin | Out-Null
+        $new = (& git -C $trackPath rev-parse "refs/remotes/origin/$trackBranch").Trim()
+        $old | Should -Be $reviewed -Because 'the reviewed commit is the old remote tip'
+        $new | Should -Not -Be $old
+        (& git -C $trackPath rev-parse "refs/remotes/origin/$trackBranch").Trim() | Should -Be $new -Because 'the race fixture must really move the selected remote ref'
+        (& git -C $trackPath rev-parse 'refs/heads/main').Trim() | Should -Be $reviewed -Because 'only the selected remote-tracking ref may move, never main'
 
         New-ConcurrencyFixtureRepository -RepositoryPath (Join-Path $case 'repos/plain')
         $items = @(

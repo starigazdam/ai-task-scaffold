@@ -802,7 +802,8 @@ Describe 'Worktree reuse verification and repair' {
         # evidence that the tracking create was interrupted, so the retry binds
         # no upstream and attaches without writing one. Recovering a lost
         # upstream would need recorded request intent, which the request does not
-        # carry; recreate the worktree to restore tracking.
+        # carry; set the upstream by hand, or leave the branch untracked. A
+        # recreated worktree would not restore tracking either.
         $retry = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $retry.Action | Should -Be 'create-local'
         $retry.BranchMode | Should -Be 'existing'
@@ -811,6 +812,56 @@ Describe 'Worktree reuse verification and repair' {
 
         (& git -C $retry.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
         (& git -C $retry.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -BeNullOrEmpty -Because 'attach never invents tracking'
+    }
+
+    It 'binds the upstream an attached worktree inherits from a worktree-local source config' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-worktree-config') -RemotePath (Join-Path $TestDrive 'attach-worktree-config.git')
+        $tasksRoot = Join-Path $TestDrive 'attach-worktree-config-tasks'
+        # The local task branch exists and the shared config tracks nothing.
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        & git -C $fixture.Path config extensions.worktreeConfig true
+        # Only the source worktree tracks a branch, through worktree-local
+        # config. Git copies that config to a new worktree on add, so the plan
+        # must bind the inherited upstream or apply would fail on an unchanged
+        # branch.
+        & git -C $fixture.Path config --worktree "branch.$($fixture.Branch).remote" origin
+        & git -C $fixture.Path config --worktree "branch.$($fixture.Branch).merge" refs/heads/main
+        (& git -C $fixture.Path for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main' -Because 'the fixture must really set a source worktree-local upstream'
+        (& git -C $fixture.Path config --local --get "branch.$($fixture.Branch).remote" 2>$null) | Out-Null
+        $LASTEXITCODE | Should -Be 1 -Because 'the shared config must have no upstream for the branch'
+        $sourceWorktreeConfig = [IO.File]::ReadAllText((& git -C $fixture.Path rev-parse --path-format=absolute --git-path config.worktree).Trim())
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'existing'
+        $plan.UpstreamRef | Should -Be 'refs/remotes/origin/main' -Because 'the destination inherits the copied source worktree config'
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main' -Because 'the unchanged branch keeps exactly the upstream it inherited'
+        # Attach never writes tracking: the shared config stays empty, and the
+        # destination's worktree config is the copy Git made, not a repair.
+        (& git -C $plan.Destination config --local --get "branch.$($fixture.Branch).remote" 2>$null) | Out-Null
+        $LASTEXITCODE | Should -Be 1 -Because 'attach must not write an upstream into the shared config'
+        [IO.File]::ReadAllText((& git -C $plan.Destination rev-parse --path-format=absolute --git-path config.worktree).Trim()) | Should -Be $sourceWorktreeConfig -Because 'a repair would have rewritten the destination worktree config'
+    }
+
+    It 'binds and verifies a shared-config upstream when attaching an existing branch' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-shared-upstream') -RemotePath (Join-Path $TestDrive 'attach-shared-upstream.git')
+        $tasksRoot = Join-Path $TestDrive 'attach-shared-upstream-tasks'
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        & git -C $fixture.Path config "branch.$($fixture.Branch).remote" origin
+        & git -C $fixture.Path config "branch.$($fixture.Branch).merge" refs/heads/main
+        (& git -C $fixture.Path for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'existing'
+        $plan.UpstreamRef | Should -Be 'refs/remotes/origin/main' -Because 'attach binds the upstream the new worktree inherits'
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
     }
 
     It 'refuses an upstream that a concurrent writer set before the write' -Skip:(-not $IsLinux) {

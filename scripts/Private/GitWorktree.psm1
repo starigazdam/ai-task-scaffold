@@ -286,8 +286,11 @@ function Get-TaskBranchUpstreamRef {
 
     # The branch's actual upstream, canonicalized, or none. Never invented from a
     # same-named remote ref: reuse and attach verify exactly what the branch
-    # tracks. Callers pass the destination for reuse so a worktree-local
-    # upstream (extensions.worktreeConfig) is read from where apply reads it.
+    # tracks. Reuse passes the destination so a worktree-local upstream
+    # (extensions.worktreeConfig) is read from where apply reads it. Attach
+    # passes the source because `git worktree add` copies the source
+    # worktree's config.worktree into the new worktree, so both read the same
+    # effective config.
     $current = Get-TaskRefUpstreamRef -RepositoryPath $RepositoryPath -Reference "refs/heads/$Branch"
     if (-not $current) { return $null }
     return Resolve-TaskRefTarget -RepositoryPath $RepositoryPath -Reference $current
@@ -392,9 +395,15 @@ function New-TaskWorktreePlan {
             if (-not $localSnapshot.Commit -or $localSnapshot.Commit -cne $startCommit) {
                 return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-mismatch'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
             }
-            # Attach an existing task branch with its actual upstream, including
-            # none. A same-named origin/<branch> ref is not evidence that a
-            # tracking create was interrupted, so never infer one.
+            # Attach an existing task branch with the upstream the new destination
+            # actually inherits, including none. `git worktree add` copies the
+            # source worktree's config.worktree into the new worktree (see
+            # copy_filtered_worktree_config in Git's builtin/worktree.c), so the
+            # effective upstream at the source is what apply will read at the
+            # destination; the shared config alone would be wrong when the source
+            # has a worktree-local override. A same-named origin/<branch> ref is
+            # not evidence that a tracking create was interrupted, so never infer
+            # one.
             return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $startCommit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
 
@@ -419,8 +428,10 @@ function New-TaskWorktreePlan {
         if (-not $localSnapshot.Commit) {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'start-commit-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
-        # Attach an existing task branch with its actual upstream, including
-        # none; a matching origin/<branch> is never inferred as tracking.
+        # Attach an existing task branch with the upstream the new destination
+        # inherits, including none. Git copies the source worktree's
+        # config.worktree on add, so the source's effective upstream is the
+        # destination's; a matching origin/<branch> is never inferred as tracking.
         return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
@@ -673,14 +684,15 @@ function Assert-TaskWorktreeBranchState {
         throw "branch '$Branch' for '$RepositoryName' tracks '$actualCanonical' instead of the planned '$UpstreamRef'; replan and approve again (a nonempty upstream is never retargeted)"
     }
     if (-not $RepairUpstream) {
-        throw "branch '$Branch' for '$RepositoryName' is missing its required upstream '$UpstreamRef'; replan and repair it or recreate the worktree (attach and reuse never write an upstream)"
+        throw "branch '$Branch' for '$RepositoryName' is missing its required upstream '$UpstreamRef'; set the upstream by hand and replan, or replan to accept no upstream (attach and reuse never write an upstream)"
     }
 
     # Repair is limited to the one safe direction: a required upstream is absent.
     # The guard re-read is best effort, not a lock: it runs in a separate Git
     # command, so an external writer can still land between the read and the
-    # write. The post-write verification below detects that outcome, but cannot
-    # prevent the overwrite.
+    # write. The post-write verification below detects a mismatch that remains
+    # visible after the write; it cannot detect an external overwrite that
+    # replaced the upstream with exactly the planned value.
     $guard = Get-TaskCanonicalBranchUpstream -RepositoryName $RepositoryName -WorktreePath $WorktreePath -HeadRef $expectedHeadRef
     if ($guard) {
         throw "branch '$Branch' for '$RepositoryName' acquired upstream '$guard' while apply was preparing to set '$UpstreamRef'; replan and approve again"
@@ -793,8 +805,9 @@ function Invoke-TaskWorktreePlan {
     # A create writes an upstream only from the value captured at plan time. The
     # plan already resolved branch.autoSetupMerge and canonicalized the target;
     # apply never re-derives it from the live remote ref. Attaching an existing
-    # branch is not a create: it verifies that branch's actual upstream and
-    # never writes tracking.
+    # branch is not a create: it verifies the upstream the new worktree inherits
+    # (the source worktree's effective config, which Git copies on add) and never
+    # writes tracking.
     $upstreamRef =
         if ($Plan.PSObject.Properties['UpstreamRef'] -and $Plan.UpstreamRef) { [string]$Plan.UpstreamRef }
         else { $null }
