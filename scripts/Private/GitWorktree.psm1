@@ -578,7 +578,10 @@ function New-TaskWorktreePlan {
         # branch.autoSetupMerge and bound into the identity, because apply starts
         # from a bare commit.
         $upstreamRef = Get-TaskNewBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch -StartRef $remoteBaseRef
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $remoteBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        # A remote base alias can resolve to a local branch, whose raw inherit
+        # configuration is copied the same way as for a local base.
+        $upstreamConfig = if ($upstreamRef) { Get-TaskInheritedUpstreamConfig -RepositoryPath $repositoryPath -StartRef $remoteBaseRef } else { $null }
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; UpstreamConfig = $upstreamConfig; SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $remoteBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
