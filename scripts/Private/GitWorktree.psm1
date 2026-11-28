@@ -281,6 +281,29 @@ function Get-TaskNewBranchUpstreamRef {
     return Resolve-TaskRefTarget -RepositoryPath $RepositoryPath -Reference $upstream
 }
 
+function Get-TaskInheritedUpstreamConfig {
+    param([string]$RepositoryPath, [string]$StartRef)
+
+    # Native `inherit` copies the start branch's branch.<name>.remote and
+    # branch.<name>.merge values as written. A symbolic upstream such as
+    # origin/alias stays symbolic, so rebuilding the values from the canonical
+    # target would change what the branch follows. Only a local start branch
+    # has this configuration; several merge values stay a #29 limit.
+    if ((Get-TaskBranchAutoSetupMerge -RepositoryPath $RepositoryPath) -cne 'inherit') { return $null }
+    if (-not $StartRef.StartsWith('refs/heads/', [StringComparison]::Ordinal)) { return $null }
+    $name = $StartRef.Substring('refs/heads/'.Length)
+    $values = @{}
+    foreach ($key in @('remote', 'merge')) {
+        $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--get', "branch.$name.$key")
+        if ($result.ExitCode -eq 1) { return $null }
+        if ($result.ExitCode -ne 0) {
+            throw "cannot read branch.$name.$key for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
+        }
+        $values[$key] = ([string]$result.Output) -replace '\r?\n\z', ''
+    }
+    return [pscustomobject]@{ Remote = $values['remote']; Merge = $values['merge'] }
+}
+
 function Get-TaskBranchUpstreamRef {
     param([string]$RepositoryPath, [string]$Branch)
 
@@ -536,7 +559,8 @@ function New-TaskWorktreePlan {
         # `always` tracks a local start point and `inherit` copies its tracking
         # configuration, so a local base is not always upstream-less.
         $upstreamRef = Get-TaskNewBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch -StartRef $localBaseRef
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        $upstreamConfig = if ($upstreamRef) { Get-TaskInheritedUpstreamConfig -RepositoryPath $repositoryPath -StartRef $localBaseRef } else { $null }
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; UpstreamConfig = $upstreamConfig; SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     $remoteBase = if ($Repository.BaseBranch -match '^[^/]+/.+') { $Repository.BaseBranch } else { "origin/$($Repository.BaseBranch)" }
@@ -746,7 +770,8 @@ function Assert-TaskWorktreeBranchState {
         [string]$UpstreamRef,
         [string]$ExpectedHeadRef,
         [switch]$RepairUpstream,
-        [switch]$UpstreamMustExist
+        [switch]$UpstreamMustExist,
+        [psobject]$UpstreamConfig
     )
 
     $expectedHeadRef = if ($ExpectedHeadRef) { $ExpectedHeadRef } else { "refs/heads/$Branch" }
@@ -789,7 +814,12 @@ function Assert-TaskWorktreeBranchState {
     if ($exists -and $exists.ExitCode -ne 0) {
         throw "cannot set upstream for '$RepositoryName': the planned upstream '$UpstreamRef' does not exist; replan and approve again"
     }
-    if ($UpstreamRef.StartsWith('refs/heads/', [StringComparison]::Ordinal)) {
+    if ($UpstreamConfig) {
+        # An inherited upstream is written exactly as the start branch has it.
+        $remote = [string]$UpstreamConfig.Remote
+        $merge = [string]$UpstreamConfig.Merge
+    }
+    elseif ($UpstreamRef.StartsWith('refs/heads/', [StringComparison]::Ordinal)) {
         $remote = '.'
         $merge = $UpstreamRef
     }
@@ -928,18 +958,19 @@ function Invoke-TaskWorktreePlan {
         else { "refs/heads/$($Repository.Branch)" }
     $sourceTarget = if ($Plan.PSObject.Properties['SourceTarget']) { [string]$Plan.SourceTarget } else { $null }
     $upstreamMustExist = [bool]($upstreamRef -and $upstreamRef -ceq $sourceTarget)
+    $upstreamConfig = if ($Plan.PSObject.Properties['UpstreamConfig']) { $Plan.UpstreamConfig } else { $null }
     # This operation already started (its git add was admitted), so it finishes
     # its upstream write even if another chain published a failure meanwhile. The
     # gate still excludes a concurrent publication from interleaving with it.
     if ($Gate) {
         $Gate.Wait()
         try {
-            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist
+            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist -UpstreamConfig $upstreamConfig
         }
         finally { [void]$Gate.Release() }
     }
     else {
-        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist
+        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist -UpstreamConfig $upstreamConfig
     }
     return $true
 }
