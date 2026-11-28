@@ -1764,6 +1764,33 @@ Describe 'branch.autoSetupMerge upstream preservation' {
         (& git -C $fixture.Path config --get branch.feature/FEATURE-123.remote) | Should -Be $nativeRemote
     }
 
+    It 'reads the inherited upstream from the target of a symbolic base, as native Git does' {
+        $caseRoot = New-AutoSetupCaseRoot
+        $fixture = New-AutoSetupFixture -Root $caseRoot
+        & git -C $fixture.Path branch real $fixture.Reviewed
+        & git -C $fixture.Path symbolic-ref refs/heads/base refs/heads/real
+        & git -C $fixture.Path symbolic-ref refs/remotes/origin/alias refs/remotes/origin/main
+        & git -C $fixture.Path config branch.real.remote origin
+        & git -C $fixture.Path config branch.real.merge refs/heads/alias
+        # The alias has its own, different tracking configuration.
+        & git -C $fixture.Path config branch.base.remote origin
+        & git -C $fixture.Path config branch.base.merge refs/heads/main
+        & git -C $fixture.Path config branch.autoSetupMerge inherit
+
+        $nativeDestination = Join-Path $caseRoot 'native'
+        & git -C $fixture.Path worktree add -q -b feature/NATIVE $nativeDestination refs/heads/base | Out-Null
+        $nativeMerge = (& git -C $fixture.Path config --get branch.feature/NATIVE.merge)
+        $nativeMerge | Should -Be 'refs/heads/alias' -Because 'native inherit reads the target branch'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'base'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
+        $plan.Action | Should -Be 'create-local'
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $fixture.Path config --get branch.feature/FEATURE-123.merge) | Should -Be $nativeMerge
+        (& git -C $fixture.Path config --get branch.feature/FEATURE-123.remote) | Should -Be 'origin'
+    }
+
     It 'copies a local base upstream when branch.autoSetupMerge is inherit' {
         $caseRoot = New-AutoSetupCaseRoot
         $fixture = New-AutoSetupFixture -Root $caseRoot

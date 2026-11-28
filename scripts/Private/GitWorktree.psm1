@@ -290,8 +290,11 @@ function Get-TaskInheritedUpstreamConfig {
     # target would change what the branch follows. Only a local start branch
     # has this configuration; several merge values stay a #29 limit.
     if ((Get-TaskBranchAutoSetupMerge -RepositoryPath $RepositoryPath) -cne 'inherit') { return $null }
-    if (-not $StartRef.StartsWith('refs/heads/', [StringComparison]::Ordinal)) { return $null }
-    $name = $StartRef.Substring('refs/heads/'.Length)
+    # Read the branch that Get-TaskNewBranchUpstreamRef reads: the canonical
+    # start, not a symbolic alias with its own configuration.
+    $startRef = Resolve-TaskRefTarget -RepositoryPath $RepositoryPath -Reference $StartRef
+    if (-not $startRef.StartsWith('refs/heads/', [StringComparison]::Ordinal)) { return $null }
+    $name = $startRef.Substring('refs/heads/'.Length)
     $values = @{}
     foreach ($key in @('remote', 'merge')) {
         $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--get', "branch.$name.$key")
