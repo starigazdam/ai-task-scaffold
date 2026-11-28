@@ -296,6 +296,75 @@ function Get-TaskBranchUpstreamRef {
     return Resolve-TaskRefTarget -RepositoryPath $RepositoryPath -Reference $current
 }
 
+function Get-TaskWorktreeConfigPath {
+    param([string]$RepositoryPath)
+
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--path-format=absolute', '--git-path', 'config.worktree')
+    if ($result.ExitCode -ne 0) { return $null }
+    return ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+}
+
+function Get-TaskWorktreeConfigRelativeInclude {
+    param([string]$RepositoryPath)
+
+    # `git worktree add` copies the source worktree's config.worktree into the
+    # new worktree as text but not the files its relative include.path entries
+    # point at, so the destination can resolve a different or no upstream. Only
+    # direct include.path entries in that file are inspected: includes are not
+    # resolved. Without extensions.worktreeConfig Git copies no worktree config
+    # and the file is ignored, so only an enabled extension is inspected.
+    $enabled = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--type=bool', '--get', 'extensions.worktreeConfig')
+    if ($enabled.ExitCode -eq 1) { return $null }
+    if ($enabled.ExitCode -ne 0) {
+        throw "cannot read extensions.worktreeConfig for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $enabled.Text)"
+    }
+    if ((([string](@($enabled.Output -split "`r?`n") | Select-Object -First 1)).Trim()).ToLowerInvariant() -cne 'true') { return $null }
+
+    # include.path and includeIf.<condition>.path both resolve a relative path
+    # against the including file. --null keeps a condition with spaces intact:
+    # each record is "key<LF>value<NUL>".
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--worktree', '--null', '--get-regexp', '^include(if\..+)?\.path$')
+    if ($result.ExitCode -eq 1) { return $null }
+    if ($result.ExitCode -ne 0) {
+        throw "cannot read the worktree config includes for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
+    }
+    foreach ($record in @($result.Output -split "`0")) {
+        $separator = $record.IndexOf("`n")
+        if ($separator -lt 0) { continue }
+        $value = $record.Substring($separator + 1).Trim()
+        if (-not $value) { continue }
+        # Git expands ~ against the home directory independently of the config
+        # file's location, so such an include keeps the same target.
+        if ($value -ceq '~' -or $value -cmatch '^~[\\/]') { continue }
+        if (-not [IO.Path]::IsPathFullyQualified($value)) { return $value }
+    }
+    return $null
+}
+
+function New-TaskWorktreeAttachBlock {
+    param(
+        [Parameter(Mandatory)][psobject]$Repository,
+        [Parameter(Mandatory)][string]$RepositoryPath,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$TaskKey,
+        [Parameter(Mandatory)][string]$TasksRoot
+    )
+
+    $relativeInclude = Get-TaskWorktreeConfigRelativeInclude -RepositoryPath $RepositoryPath
+    if (-not $relativeInclude) { return $null }
+    $worktreeConfig = Get-TaskWorktreeConfigPath -RepositoryPath $RepositoryPath
+    return [pscustomobject]@{
+        Action = 'blocked'
+        Destination = $Destination
+        Reason = 'worktree-config-relative-include'
+        Repository = $Repository.Name
+        SourceCommit = $null
+        TaskKey = $TaskKey
+        TasksRoot = $TasksRoot
+        Message = "the worktree config '$worktreeConfig' includes '$relativeInclude' by a relative path; git worktree add copies that file into the new worktree without the included file, so the destination may resolve a different or no upstream; make the include path absolute, or remove it"
+    }
+}
+
 function Enter-TaskMutationLock {
     param([string]$TasksRoot)
 
@@ -403,7 +472,10 @@ function New-TaskWorktreePlan {
             # destination; the shared config alone would be wrong when the source
             # has a worktree-local override. A same-named origin/<branch> ref is
             # not evidence that a tracking create was interrupted, so never infer
-            # one.
+            # one. A relative include.path cannot survive that copy, so it blocks
+            # before any worktree is created instead of leaving apply to fail.
+            $attachBlock = New-TaskWorktreeAttachBlock -Repository $Repository -RepositoryPath $repositoryPath -Destination $destination -TaskKey $TaskKey -TasksRoot $TasksRoot
+            if ($attachBlock) { return $attachBlock }
             return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $startCommit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
 
@@ -432,6 +504,10 @@ function New-TaskWorktreePlan {
         # inherits, including none. Git copies the source worktree's
         # config.worktree on add, so the source's effective upstream is the
         # destination's; a matching origin/<branch> is never inferred as tracking.
+        # A relative include.path cannot survive that copy, so it blocks before
+        # any worktree is created instead of leaving apply to fail.
+        $attachBlock = New-TaskWorktreeAttachBlock -Repository $Repository -RepositoryPath $repositoryPath -Destination $destination -TaskKey $TaskKey -TasksRoot $TasksRoot
+        if ($attachBlock) { return $attachBlock }
         return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.Branch; BranchMode = 'existing'; Repository = $Repository.Name; SourceCommit = $localSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = (Get-TaskBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBranchRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 

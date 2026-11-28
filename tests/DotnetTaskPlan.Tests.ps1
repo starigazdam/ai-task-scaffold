@@ -512,6 +512,65 @@ Describe 'dotnet task plan' {
             $plans[1].planIdentity | Should -Not -Be $plans[0].planIdentity
         }
     }
+
+    Context 'worktree config includes' {
+        It 'blocks an attach plan whose source worktree config includes a relative file' {
+            $repositoryPath = New-TestRepository -Name 'api-relative-include'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            # `git worktree add` copies the worktree config text but not the file
+            # its relative include.path points at, so the destination would
+            # resolve a different or no upstream.
+            $worktreeConfig = (& git -C $repositoryPath rev-parse --path-format=absolute --git-path config.worktree).Trim()
+            Set-Content -LiteralPath (Join-Path (Split-Path -Parent $worktreeConfig) 'plan-extra.cfg') -Value "[branch `"feature/FEATURE-123`"]`n`tremote = origin`n`tmerge = refs/heads/main"
+            & git -C $repositoryPath config --worktree include.path ./plan-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-relative-include'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-relative-include.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'relative include attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'blocked'
+            $operation.reason | Should -Be 'worktree-config-relative-include'
+            $operation.message | Should -Match ([regex]::Escape($worktreeConfig)) -Because 'the diagnostic must name the worktree config file'
+            $operation.message | Should -Match 'absolute' -Because 'the diagnostic must name the fix'
+            Test-Path -LiteralPath $tasksRoot | Should -BeFalse -Because 'planning stays read-only'
+        }
+
+        It 'blocks an attach plan whose source worktree config conditionally includes a relative file' {
+            $repositoryPath = New-TestRepository -Name 'api-relative-includeif'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            & git -C $repositoryPath config --worktree 'includeIf.onbranch:no such/x.path' ./plan-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-relative-includeif'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-relative-includeif.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'relative includeIf attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'blocked'
+            $operation.reason | Should -Be 'worktree-config-relative-include'
+            $operation.message | Should -Match ([regex]::Escape('./plan-extra.cfg'))
+        }
+
+        It 'plans an attach when the source worktree config includes an absolute file' {
+            $repositoryPath = New-TestRepository -Name 'api-absolute-include'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            $includedPath = Join-Path $TestDrive 'plan-absolute-extra.cfg'
+            Set-Content -LiteralPath $includedPath -Value "[branch `"feature/FEATURE-123`"]`n`tremote = origin`n`tmerge = refs/heads/main"
+            & git -C $repositoryPath config --worktree include.path $includedPath
+            $tasksRoot = Join-Path $TestDrive 'tasks-absolute-include'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-absolute-include.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'absolute include attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'create-local'
+            $operation.branchMode | Should -Be 'existing'
+            @($operation.PSObject.Properties.Name) | Should -Not -Contain 'message' -Because 'a planned operation keeps the documented shape'
+        }
+    }
 }
 
 Describe 'dotnet task plan ref resolution and Git capability' {

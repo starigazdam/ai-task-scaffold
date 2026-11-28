@@ -27,6 +27,12 @@ public sealed class WorktreeOperation
 
     [JsonPropertyName("reason")]
     public string? Reason { get; init; }
+
+    // Only blocked plans carry an actionable detail; a null message keeps the
+    // documented plan shape for every planned operation unchanged.
+    [JsonPropertyName("message")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Message { get; init; }
 }
 
 public sealed class TaskPlan
@@ -652,6 +658,21 @@ public static class TaskPlanner
 
     private static PlannedOperation CreateLocal(NormalizedRepository repository, string destination, string source, string branchMode, string sourceRef, string sourceCommit, string? sourceTarget, string commonDir, string head)
     {
+        if (string.Equals(branchMode, "existing", StringComparison.Ordinal))
+        {
+            // Attach verifies the upstream the new worktree inherits, and Git
+            // copies the source worktree config as text only. A relative
+            // include.path therefore resolves elsewhere (or nowhere) at the
+            // destination, so block before any worktree exists.
+            var relativeInclude = GetWorktreeConfigRelativeInclude(repository.Path);
+            if (relativeInclude is not null)
+            {
+                var worktreeConfig = GetWorktreeConfigPath(repository.Path);
+                var message = $"the worktree config '{worktreeConfig}' includes '{relativeInclude}' by a relative path; git worktree add copies that file into the new worktree without the included file, so the destination may resolve a different or no upstream; make the include path absolute, or remove it";
+                return Blocked(repository, destination, "worktree-config-relative-include", commonDir, head, message);
+            }
+        }
+
         return new PlannedOperation
         {
             Operation = new WorktreeOperation
@@ -671,7 +692,7 @@ public static class TaskPlanner
         };
     }
 
-    private static PlannedOperation Blocked(NormalizedRepository repository, string destination, string reason, string commonDir, string head)
+    private static PlannedOperation Blocked(NormalizedRepository repository, string destination, string reason, string commonDir, string head, string? message = null)
     {
         return new PlannedOperation
         {
@@ -681,6 +702,7 @@ public static class TaskPlanner
                 Action = "blocked",
                 Destination = destination,
                 Reason = reason,
+                Message = message,
             },
             CommonDir = commonDir,
             Head = head,
@@ -760,6 +782,85 @@ public static class TaskPlanner
     {
         var result = RunGit(repositoryPath, "rev-parse", "--path-format=absolute", "--git-dir");
         return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
+    }
+
+    private static string? GetWorktreeConfigPath(string repositoryPath)
+    {
+        var result = RunGit(repositoryPath, "rev-parse", "--path-format=absolute", "--git-path", "config.worktree");
+        return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
+    }
+
+    private static string? GetWorktreeConfigRelativeInclude(string repositoryPath)
+    {
+        // `git worktree add` copies the source worktree's config.worktree as
+        // text but not the files its relative include.path entries point at, so
+        // the destination can resolve a different or no upstream. Only direct
+        // include.path entries in that file are inspected: includes are not
+        // resolved. Without extensions.worktreeConfig Git copies no worktree
+        // config and the file is ignored.
+        var enabled = RunGit(repositoryPath, "config", "--type=bool", "--get", "extensions.worktreeConfig");
+        if (enabled.ExitCode == 1)
+        {
+            return null;
+        }
+
+        if (enabled.ExitCode != 0)
+        {
+            throw new OperationalException($"cannot read extensions.worktreeConfig for '{repositoryPath}': {FirstLine(enabled.StdErr)}");
+        }
+
+        if (!FirstLine(enabled.StdOut).Equals("true", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        // include.path and includeIf.<condition>.path both resolve a relative
+        // path against the including file. --null keeps a condition with spaces
+        // intact: each record is "key<LF>value<NUL>".
+        var includes = RunGit(repositoryPath, "config", "--worktree", "--null", "--get-regexp", @"^include(if\..+)?\.path$");
+        if (includes.ExitCode == 1)
+        {
+            return null;
+        }
+
+        if (includes.ExitCode != 0)
+        {
+            throw new OperationalException($"cannot read the worktree config includes for '{repositoryPath}': {FirstLine(includes.StdErr)}");
+        }
+
+        foreach (var record in includes.StdOut.Split('\0'))
+        {
+            var separator = record.IndexOf('\n');
+            if (separator < 0)
+            {
+                continue;
+            }
+
+            var value = record[(separator + 1)..].Trim();
+            if (value.Length == 0)
+            {
+                continue;
+            }
+
+            if (IsRelativeIncludePath(value))
+            {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsRelativeIncludePath(string value)
+    {
+        // Git expands ~ against the home directory independently of the config
+        // file's location, so such an include keeps the same target.
+        if (value == "~" || value.StartsWith("~/", StringComparison.Ordinal) || value.StartsWith("~\\", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return !Path.IsPathFullyQualified(value);
     }
 
     private static string? GetHead(string repositoryPath)

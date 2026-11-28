@@ -864,6 +864,68 @@ Describe 'Worktree reuse verification and repair' {
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
     }
 
+    It 'blocks an attach plan whose source worktree config includes a relative file' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-relative-include') -RemotePath (Join-Path $TestDrive 'attach-relative-include.git')
+        $tasksRoot = Join-Path $TestDrive 'attach-relative-include-tasks'
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        & git -C $fixture.Path config extensions.worktreeConfig true
+        # The only source of the upstream is a file reached through a relative
+        # include.path. `git worktree add` copies the include line but not the
+        # file, so the destination would resolve no upstream and apply would
+        # fail on an unchanged branch.
+        $worktreeConfig = (& git -C $fixture.Path rev-parse --path-format=absolute --git-path config.worktree).Trim()
+        Set-Content -LiteralPath (Join-Path (Split-Path -Parent $worktreeConfig) 'attach-extra.cfg') -Value "[branch `"$($fixture.Branch)`"]`n`tremote = origin`n`tmerge = refs/heads/main"
+        & git -C $fixture.Path config --worktree include.path ./attach-extra.cfg
+        (& git -C $fixture.Path for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main' -Because 'the fixture must really take its upstream from the included file'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'worktree-config-relative-include'
+        $plan.Destination | Should -Be (Join-Path $tasksRoot (Join-Path 'FEATURE-123/worktrees' 'api'))
+        $plan.Message | Should -Match ([regex]::Escape($worktreeConfig)) -Because 'the diagnostic must name the worktree config file'
+        $plan.Message | Should -Match 'absolute' -Because 'the diagnostic must name the fix'
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw "*$($plan.Reason)*"
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse -Because 'a blocked plan must create no worktree'
+    }
+
+    It 'blocks an attach plan whose source worktree config conditionally includes a relative file' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-relative-includeif') -RemotePath (Join-Path $TestDrive 'attach-relative-includeif.git')
+        $tasksRoot = Join-Path $TestDrive 'attach-relative-includeif-tasks'
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        & git -C $fixture.Path config extensions.worktreeConfig true
+        # includeIf.<condition>.path also resolves against the including file.
+        & git -C $fixture.Path config --worktree 'includeIf.onbranch:no such/x.path' ./attach-extra.cfg
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'worktree-config-relative-include'
+        $plan.Message | Should -Match ([regex]::Escape('./attach-extra.cfg'))
+    }
+
+    It 'plans and attaches when the source worktree config includes an absolute file' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-absolute-include') -RemotePath (Join-Path $TestDrive 'attach-absolute-include.git')
+        $tasksRoot = Join-Path $TestDrive 'attach-absolute-include-tasks'
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        & git -C $fixture.Path config extensions.worktreeConfig true
+        # An absolute include keeps the same target in the copied worktree config.
+        $includedPath = Join-Path $TestDrive 'attach-absolute-extra.cfg'
+        Set-Content -LiteralPath $includedPath -Value "[branch `"$($fixture.Branch)`"]`n`tremote = origin`n`tmerge = refs/heads/main"
+        & git -C $fixture.Path config --worktree include.path $includedPath
+        (& git -C $fixture.Path for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'existing'
+        $plan.UpstreamRef | Should -Be 'refs/remotes/origin/main'
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
+    }
+
     It 'refuses an upstream that a concurrent writer set before the write' -Skip:(-not $IsLinux) {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'upstream-writer-race') -RemotePath (Join-Path $TestDrive 'upstream-writer-race.git')
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
@@ -875,7 +937,9 @@ Describe 'Worktree reuse verification and repair' {
         # already set origin/main. Apply must refuse instead of overwriting it.
         # The window is best effort: the guard read and the write are separate
         # Git commands, so a writer that lands after the guard can still be
-        # overwritten; the post-write verification is what catches that.
+        # overwritten. Post-write verification detects a mismatch that stays
+        # visible after the write; it cannot detect an overwrite that another
+        # writer replaced with exactly the planned value.
         $countPath = Join-Path $TestDrive 'upstream-writer-race-count'
         $shimDir = Join-Path $TestDrive 'upstream-writer-race-shim'
         New-UpstreamRaceShim -Directory $shimDir -RepositoryPath $fixture.Path -Branch $fixture.Branch -Mode 'upstream' -CountPath $countPath | Out-Null

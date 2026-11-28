@@ -353,7 +353,8 @@ if ($Apply) {
     }
     $blockedOperation = $worktreeOperations | Where-Object Action -eq 'blocked' | Select-Object -First 1
     if ($blockedOperation) {
-        throw "cannot apply blocked worktree plan for '$($blockedOperation.Repository)': $($blockedOperation.Reason)"
+        $blockedDetail = if ($blockedOperation.PSObject.Properties['Message'] -and $blockedOperation.Message) { " ($($blockedOperation.Message))" } else { '' }
+        throw "cannot apply blocked worktree plan for '$($blockedOperation.Repository)': $($blockedOperation.Reason)$blockedDetail"
     }
     $customConflict = $customFileOperations | Where-Object Action -eq 'conflict' | Select-Object -First 1
     if ($customConflict) {
