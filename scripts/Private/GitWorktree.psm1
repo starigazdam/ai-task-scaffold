@@ -299,17 +299,26 @@ function Get-TaskBranchUpstreamRef {
 function Get-TaskWorktreeConfigPath {
     param([string]$RepositoryPath)
 
-    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--path-format=absolute', '--git-path', 'config.worktree')
-    if ($result.ExitCode -ne 0) { return $null }
-    # Remove only Git's final line terminator: a path can contain a newline.
-    $path = ([string]$result.Output) -replace '\r?\n\z', ''
-    # Output is decoded as UTF-8. A path byte that is not UTF-8 decodes to
-    # U+FFFD and cannot be opened again, so fail closed instead of reading it
-    # as absent.
-    if ($path.Contains([char]0xFFFD)) {
-        throw "cannot read the worktree config path for '$RepositoryPath': Git returned a path that is not valid UTF-8"
+    # Decode strictly: a path byte that is not UTF-8 would otherwise become
+    # U+FFFD and name a different file, so fail closed. A literal U+FFFD in a
+    # valid UTF-8 path stays valid.
+    $startInfo = New-TaskGitStartInfo -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--path-format=absolute', '--git-path', 'config.worktree')
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        $standardError = $process.StandardError.ReadToEndAsync()
+        $standardOutput = $process.StandardOutput.ReadToEndAsync()
+        $process.WaitForExit()
+        [void]$standardError.GetAwaiter().GetResult()
+        try { $output = $standardOutput.GetAwaiter().GetResult() }
+        catch [System.Text.DecoderFallbackException] {
+            throw "cannot read the worktree config path for '$RepositoryPath': Git returned a path that is not valid UTF-8"
+        }
+        if ($process.ExitCode -ne 0) { return $null }
     }
-    return $path
+    finally { $process.Dispose() }
+    # Remove only Git's final line terminator: a path can contain a newline.
+    return ([string]$output) -replace '\r?\n\z', ''
 }
 
 function Get-TaskWorktreeConfigInclude {
@@ -325,7 +334,7 @@ function Get-TaskWorktreeConfigInclude {
     $path = Get-TaskWorktreeConfigPath -RepositoryPath $RepositoryPath
     if (-not $path) { throw "cannot resolve the worktree config path for '$RepositoryPath'" }
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--file', $path, '--null', '--name-only', '--get-regexp', '^include(if\..+)?\.path$')
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--file', $path, '--null', '--name-only', '--get-regexp', '^include(if\..*)?\.path$')
     if ($result.ExitCode -eq 1) { return $null }
     if ($result.ExitCode -ne 0) {
         throw "cannot read the worktree config includes in '$path': $(Get-TaskGitDiagnostic -Text $result.Text)"
@@ -788,7 +797,9 @@ function Assert-TaskWorktreeBranchState {
         $merge = 'refs/heads/' + $UpstreamRef.Substring("refs/remotes/$remote/".Length)
     }
     foreach ($entry in @(@('remote', $remote), @('merge', $merge))) {
-        $setResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('config', "branch.$Branch.$($entry[0])", $entry[1])
+        # --replace-all: an absent upstream can still leave several values of
+        # one key, and plain `git config` refuses to overwrite them.
+        $setResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('config', '--replace-all', "branch.$Branch.$($entry[0])", $entry[1])
         if ($setResult.ExitCode -ne 0) {
             $detail = Get-TaskGitDiagnostic -Text $setResult.Text
             throw "cannot set upstream for '$RepositoryName': git config branch.$Branch.$($entry[0]) failed: $detail"

@@ -785,7 +785,19 @@ public static class TaskPlanner
 
     private static string? GetWorktreeConfigPath(string repositoryPath)
     {
-        var result = RunGit(repositoryPath, "rev-parse", "--path-format=absolute", "--git-path", "config.worktree");
+        // Decode strictly: a path byte that is not UTF-8 would otherwise become
+        // U+FFFD and name a different file, so fail closed. A literal U+FFFD
+        // in a valid UTF-8 path stays valid.
+        (int ExitCode, string StdOut, string StdErr) result;
+        try
+        {
+            result = RunGitProcess(repositoryPath, false, new System.Text.UTF8Encoding(false, true), "rev-parse", "--path-format=absolute", "--git-path", "config.worktree");
+        }
+        catch (System.Text.DecoderFallbackException)
+        {
+            throw new OperationalException($"cannot read the worktree config path for '{repositoryPath}': Git returned a path that is not valid UTF-8");
+        }
+
         if (result.ExitCode != 0)
         {
             return null;
@@ -801,14 +813,6 @@ public static class TaskPlanner
         if (path.EndsWith('\r'))
         {
             path = path[..^1];
-        }
-
-        // Output is decoded as UTF-8. A path byte that is not UTF-8 decodes to
-        // U+FFFD and cannot be opened again, so fail closed instead of reading
-        // it as absent.
-        if (path.Contains('\uFFFD'))
-        {
-            throw new OperationalException($"cannot read the worktree config path for '{repositoryPath}': Git returned a path that is not valid UTF-8");
         }
 
         return path;
@@ -830,7 +834,7 @@ public static class TaskPlanner
             return null;
         }
 
-        var includes = RunGit(repositoryPath, "config", "--file", path, "--null", "--name-only", "--get-regexp", @"^include(if\..+)?\.path$");
+        var includes = RunGit(repositoryPath, "config", "--file", path, "--null", "--name-only", "--get-regexp", @"^include(if\..*)?\.path$");
         if (includes.ExitCode == 1)
         {
             return null;
@@ -1140,6 +1144,11 @@ public static class TaskPlanner
 
     private static (int ExitCode, string StdOut, string StdErr) RunGitProcess(string? repositoryPath, bool guardNoLazyFetch, params string[] arguments)
     {
+        return RunGitProcess(repositoryPath, guardNoLazyFetch, null, arguments);
+    }
+
+    private static (int ExitCode, string StdOut, string StdErr) RunGitProcess(string? repositoryPath, bool guardNoLazyFetch, System.Text.Encoding? stdoutEncoding, params string[] arguments)
+    {
         var startInfo = new ProcessStartInfo
         {
             FileName = "git",
@@ -1147,6 +1156,7 @@ public static class TaskPlanner
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = stdoutEncoding,
         };
         if (repositoryPath is not null)
         {

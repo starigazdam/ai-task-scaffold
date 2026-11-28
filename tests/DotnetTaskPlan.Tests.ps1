@@ -514,6 +514,17 @@ Describe 'dotnet task plan' {
     }
 
     Context 'worktree config includes' {
+        It 'plans an attach from a valid UTF-8 path that contains U+FFFD' {
+            $repositoryPath = New-TestRepository -Name "api-fffd-$([char]0xFFFD)-path"
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            $tasksRoot = Join-Path $TestDrive 'tasks-fffd'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-fffd.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'U+FFFD path attach plan'
+            $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        }
+
         It 'refuses to plan an attach when the worktree config path is not UTF-8' -Skip:(-not $IsLinux) {
             $raw = Join-Path $TestDrive 'raw-parent'
             New-Item -ItemType Directory -Path $raw -Force | Out-Null

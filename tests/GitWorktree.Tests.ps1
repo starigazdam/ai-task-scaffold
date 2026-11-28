@@ -759,7 +759,7 @@ Describe 'Worktree reuse verification and repair' {
                 '        ;;'
                 '    esac'
                 '    ;;'
-                '  *" config branch."*)'
+                '  *" config --replace-all branch."*)'
                 '    "$REAL_GIT" "$@"; CODE=$?'
                 '    if [ "$MODE" = "tip" ]; then'
                 '      "$REAL_GIT" -C "$REPO" update-ref "refs/heads/$BRANCH" "$OTHER"'
@@ -894,6 +894,43 @@ Describe 'Worktree reuse verification and repair' {
 
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+    }
+
+    It 'sets the planned upstream over several stale remote values' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'multi-remote-upstream') -RemotePath (Join-Path $TestDrive 'multi-remote-upstream.git')
+        $tasksRoot = Join-Path $TestDrive 'multi-remote-upstream-tasks'
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-remote'
+        # Two remote values and no merge value: no upstream, but plain
+        # `git config` refuses to overwrite the key.
+        & git -C $fixture.Path config --add "branch.$($fixture.Branch).remote" origin
+        & git -C $fixture.Path config --add "branch.$($fixture.Branch).remote" origin
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+    }
+
+    It 'plans an attach from a valid UTF-8 path that contains U+FFFD' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive "fffd-$([char]0xFFFD)-path") -RemotePath (Join-Path $TestDrive 'fffd.git')
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'fffd-tasks')
+        $plan.Action | Should -Be 'create-local'
+        $plan.BranchMode | Should -Be 'existing'
+    }
+
+    It 'blocks an attach plan whose worktree config has an empty includeIf condition' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-empty-includeif') -RemotePath (Join-Path $TestDrive 'attach-empty-includeif.git')
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        $worktreeConfig = (& git -C $fixture.Path rev-parse --path-format=absolute --git-path config.worktree).Trim()
+        Set-Content -LiteralPath $worktreeConfig -Value "[includeIf `"`"]`n`tpath = ./extra.cfg"
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'attach-empty-includeif-tasks')
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'worktree-config-include'
     }
 
     It 'refuses to plan an attach when the worktree config path is not UTF-8' -Skip:(-not $IsLinux) {
