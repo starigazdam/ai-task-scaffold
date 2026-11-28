@@ -834,7 +834,10 @@ public static class TaskPlanner
             return null;
         }
 
-        var includes = RunGit(repositoryPath, "config", "--file", path, "--null", "--name-only", "--get-regexp", @"^include(if\..*)?\.path$");
+        // List every key and match in code: --get-regexp is locale-sensitive,
+        // and a condition byte that is not valid in the locale hides the key.
+        // Git lowercases the section and variable names.
+        var includes = RunGit(repositoryPath, "config", "--file", path, "--no-includes", "--null", "--name-only", "--list");
         if (includes.ExitCode == 1)
         {
             return null;
@@ -845,7 +848,8 @@ public static class TaskPlanner
             throw new OperationalException($"cannot read the worktree config includes in '{path}': {FirstLine(includes.StdErr)}");
         }
 
-        var key = includes.StdOut.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        var key = includes.StdOut.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault(name =>
+            name == "include.path" || (name.StartsWith("includeif.", StringComparison.Ordinal) && name.EndsWith(".path", StringComparison.Ordinal)));
         return key is null ? null : (path, key);
     }
 

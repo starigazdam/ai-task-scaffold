@@ -263,7 +263,10 @@ function Get-TaskNewBranchUpstreamRef {
     }
     else {
         $remoteBranch = Get-TaskRemoteTrackingBranchName -Reference $startRef
-        if ($mode -ceq 'always') { $upstream = $startRef }
+        # Git tracks only a branch start point: a symbolic base that resolves
+        # to a tag starts untracked even under `always`.
+        $trackable = $startRef.StartsWith('refs/heads/', [StringComparison]::Ordinal) -or $startRef.StartsWith('refs/remotes/', [StringComparison]::Ordinal)
+        if ($mode -ceq 'always') { $upstream = $(if ($trackable) { $startRef } else { $null }) }
         elseif ($mode -in @('true', '1', 'yes', 'on')) { $upstream = $(if ($remoteBranch) { $startRef } else { $null }) }
         elseif ($mode -in @('false', '0', 'no', 'off')) { $upstream = $null }
         elseif ($mode -ceq 'simple') {
@@ -305,6 +308,26 @@ function Get-TaskInheritedUpstreamConfig {
         $values[$key] = ([string]$result.Output) -replace '\r?\n\z', ''
     }
     return [pscustomobject]@{ Remote = $values['remote']; Merge = $values['merge'] }
+}
+
+function Get-TaskUpstreamRebase {
+    param([string]$RepositoryPath, [string]$UpstreamRef, [psobject]$UpstreamConfig)
+
+    # Native tracking setup also writes branch.<name>.rebase=true by
+    # branch.autoSetupRebase. Apply creates without --track, so the plan binds
+    # that decision. Only a created tracking branch uses it.
+    if (-not $UpstreamRef) { return $false }
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--get', 'branch.autoSetupRebase')
+    if ($result.ExitCode -eq 1) { return $false }
+    if ($result.ExitCode -ne 0) {
+        throw "cannot read branch.autoSetupRebase for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
+    }
+    $mode = (([string]$result.Output) -replace '\r?\n\z', '')
+    $local = if ($UpstreamConfig) { [string]$UpstreamConfig.Remote -ceq '.' } else { $UpstreamRef.StartsWith('refs/heads/', [StringComparison]::Ordinal) }
+    if ($mode -ceq 'always') { return $true }
+    if ($mode -ceq 'local') { return $local }
+    if ($mode -ceq 'remote') { return -not $local }
+    return $false
 }
 
 function Get-TaskBranchUpstreamRef {
@@ -361,12 +384,18 @@ function Get-TaskWorktreeConfigInclude {
     if (-not $path) { throw "cannot resolve the worktree config path for '$RepositoryPath'" }
     # A native check: Test-Path treats a backslash in a Linux path as a separator.
     if (-not [IO.File]::Exists($path)) { return $null }
-    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--file', $path, '--null', '--name-only', '--get-regexp', '^include(if\..*)?\.path$')
+    # List every key and match in code: --get-regexp is locale-sensitive, and a
+    # condition byte that is not valid in the locale hides the key from it.
+    # Git lowercases the section and variable names, so the prefix and suffix
+    # match ordinally.
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--file', $path, '--no-includes', '--null', '--name-only', '--list')
     if ($result.ExitCode -eq 1) { return $null }
     if ($result.ExitCode -ne 0) {
         throw "cannot read the worktree config includes in '$path': $(Get-TaskGitDiagnostic -Text $result.Text)"
     }
-    $key = @($result.Output -split "`0" | Where-Object { $_ }) | Select-Object -First 1
+    $key = @($result.Output -split "`0" | Where-Object {
+            $_ -ceq 'include.path' -or ($_.StartsWith('includeif.', [StringComparison]::Ordinal) -and $_.EndsWith('.path', [StringComparison]::Ordinal))
+        }) | Select-Object -First 1
     if (-not $key) { return $null }
     return [pscustomobject]@{ Path = $path; Key = $key }
 }
@@ -518,7 +547,7 @@ function New-TaskWorktreePlan {
             # this operation replaces. The upstream is the canonical target
             # resolved at plan time, bound so apply never re-resolves it.
             $remoteTarget = Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $remoteBranchRef
-            return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = $remoteBranchRef; BranchMode = 'track'; Repository = $Repository.Name; SourceCommit = $startCommit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $remoteTarget; SourceTarget = $remoteTarget; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+            return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = $remoteBranchRef; BranchMode = 'track'; Repository = $Repository.Name; SourceCommit = $startCommit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $remoteTarget; UpstreamRebase = (Get-TaskUpstreamRebase -RepositoryPath $repositoryPath -UpstreamRef $remoteTarget); SourceTarget = $remoteTarget; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
         }
 
         return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $startCommit; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $startCommit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $null; SourceTarget = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -550,7 +579,7 @@ function New-TaskWorktreePlan {
         }
         # Explicit tracking, same as the pinned create-remote path above.
         $remoteTarget = Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $remoteBranchRef
-        return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = "origin/$($Repository.Branch)"; BranchMode = 'track'; Repository = $Repository.Name; SourceCommit = $remoteSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $remoteTarget; SourceTarget = $remoteTarget; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        return [pscustomobject]@{ Action = 'create-remote'; Destination = $destination; Source = "origin/$($Repository.Branch)"; BranchMode = 'track'; Repository = $Repository.Name; SourceCommit = $remoteSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $remoteTarget; UpstreamRebase = (Get-TaskUpstreamRebase -RepositoryPath $repositoryPath -UpstreamRef $remoteTarget); SourceTarget = $remoteTarget; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     $localBaseRef = "refs/heads/$($Repository.BaseBranch)"
@@ -563,7 +592,7 @@ function New-TaskWorktreePlan {
         # configuration, so a local base is not always upstream-less.
         $upstreamRef = Get-TaskNewBranchUpstreamRef -RepositoryPath $repositoryPath -Branch $Repository.Branch -StartRef $localBaseRef
         $upstreamConfig = if ($upstreamRef) { Get-TaskInheritedUpstreamConfig -RepositoryPath $repositoryPath -StartRef $localBaseRef } else { $null }
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; UpstreamConfig = $upstreamConfig; SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $Repository.BaseBranch; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $localBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; UpstreamConfig = $upstreamConfig; UpstreamRebase = (Get-TaskUpstreamRebase -RepositoryPath $repositoryPath -UpstreamRef $upstreamRef -UpstreamConfig $upstreamConfig); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $localBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     $remoteBase = if ($Repository.BaseBranch -match '^[^/]+/.+') { $Repository.BaseBranch } else { "origin/$($Repository.BaseBranch)" }
@@ -581,7 +610,7 @@ function New-TaskWorktreePlan {
         # A remote base alias can resolve to a local branch, whose raw inherit
         # configuration is copied the same way as for a local base.
         $upstreamConfig = if ($upstreamRef) { Get-TaskInheritedUpstreamConfig -RepositoryPath $repositoryPath -StartRef $remoteBaseRef } else { $null }
-        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; UpstreamConfig = $upstreamConfig; SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $remoteBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
+        return [pscustomobject]@{ Action = 'create-local'; Destination = $destination; Source = $remoteBase; BranchMode = 'new'; Repository = $Repository.Name; SourceCommit = $remoteBaseSnapshot.Commit; HeadRef = "refs/heads/$($Repository.Branch)"; UpstreamRef = $upstreamRef; UpstreamConfig = $upstreamConfig; UpstreamRebase = (Get-TaskUpstreamRebase -RepositoryPath $repositoryPath -UpstreamRef $upstreamRef -UpstreamConfig $upstreamConfig); SourceTarget = (Resolve-TaskRefTarget -RepositoryPath $repositoryPath -Reference $remoteBaseRef); TaskKey = $TaskKey; TasksRoot = $TasksRoot }
     }
 
     return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -777,7 +806,8 @@ function Assert-TaskWorktreeBranchState {
         [string]$ExpectedHeadRef,
         [switch]$RepairUpstream,
         [switch]$UpstreamMustExist,
-        [psobject]$UpstreamConfig
+        [psobject]$UpstreamConfig,
+        [switch]$UpstreamRebase
     )
 
     $expectedHeadRef = if ($ExpectedHeadRef) { $ExpectedHeadRef } else { "refs/heads/$Branch" }
@@ -845,6 +875,12 @@ function Assert-TaskWorktreeBranchState {
         if ($setResult.ExitCode -ne 0) {
             $detail = Get-TaskGitDiagnostic -Text $setResult.Text
             throw "cannot set upstream for '$RepositoryName': git config branch.$Branch.$($entry[0]) failed: $detail"
+        }
+    }
+    if ($UpstreamRebase) {
+        $rebaseResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('config', '--replace-all', "branch.$Branch.rebase", 'true')
+        if ($rebaseResult.ExitCode -ne 0) {
+            throw "cannot set upstream for '$RepositoryName': git config branch.$Branch.rebase failed: $(Get-TaskGitDiagnostic -Text $rebaseResult.Text)"
         }
     }
 
@@ -965,18 +1001,19 @@ function Invoke-TaskWorktreePlan {
     $sourceTarget = if ($Plan.PSObject.Properties['SourceTarget']) { [string]$Plan.SourceTarget } else { $null }
     $upstreamMustExist = [bool]($upstreamRef -and $upstreamRef -ceq $sourceTarget)
     $upstreamConfig = if ($Plan.PSObject.Properties['UpstreamConfig']) { $Plan.UpstreamConfig } else { $null }
+    $upstreamRebase = [bool]($Plan.PSObject.Properties['UpstreamRebase'] -and $Plan.UpstreamRebase)
     # This operation already started (its git add was admitted), so it finishes
     # its upstream write even if another chain published a failure meanwhile. The
     # gate still excludes a concurrent publication from interleaving with it.
     if ($Gate) {
         $Gate.Wait()
         try {
-            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist -UpstreamConfig $upstreamConfig
+            Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist -UpstreamConfig $upstreamConfig -UpstreamRebase:$upstreamRebase
         }
         finally { [void]$Gate.Release() }
     }
     else {
-        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist -UpstreamConfig $upstreamConfig
+        Assert-TaskWorktreeBranchState -RepositoryName $Repository.Name -WorktreePath $Plan.Destination -Branch $Repository.Branch -ExpectedCommit $sourceCommit -ExpectedHeadRef $headRef -UpstreamRef $upstreamRef -RepairUpstream:$createsBranch -UpstreamMustExist:$upstreamMustExist -UpstreamConfig $upstreamConfig -UpstreamRebase:$upstreamRebase
     }
     return $true
 }

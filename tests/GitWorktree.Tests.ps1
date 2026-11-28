@@ -881,6 +881,21 @@ Describe 'Worktree reuse verification and repair' {
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
     }
 
+    It 'sets branch.autoSetupRebase on an explicit tracking create like native --track' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'explicit-rebase') -RemotePath (Join-Path $TestDrive 'explicit-rebase.git')
+        & git -C $fixture.Path config branch.autoSetupRebase remote
+        $nativeDestination = Join-Path $TestDrive 'explicit-rebase-native'
+        & git -C $fixture.Path worktree add -q --track -b feature/NATIVE $nativeDestination "origin/$($fixture.Branch)" | Out-Null
+        $nativeRebase = [string](& git -C $fixture.Path config --get branch.feature/NATIVE.rebase)
+        $nativeRebase | Should -Be 'true'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'explicit-rebase-tasks')
+        $plan.Action | Should -Be 'create-remote'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        [string](& git -C $fixture.Path config --get "branch.$($fixture.Branch).rebase") | Should -Be $nativeRebase
+    }
+
     It 'sets the planned upstream when a tag is spelled like the remote ref' {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'tag-lookalike-upstream') -RemotePath (Join-Path $TestDrive 'tag-lookalike-upstream.git')
         $tasksRoot = Join-Path $TestDrive 'tag-lookalike-upstream-tasks'
@@ -973,6 +988,25 @@ Describe 'Worktree reuse verification and repair' {
         finally {
             & bash -c 'rm -rf "$1"' _ $raw
         }
+    }
+
+    It 'blocks an attach plan whose includeIf condition has a byte invalid in the locale' -Skip:(-not $IsLinux) {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-raw-condition') -RemotePath (Join-Path $TestDrive 'attach-raw-condition.git')
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        $worktreeConfig = (& git -C $fixture.Path rev-parse --path-format=absolute --git-path config.worktree).Trim()
+        & bash -c 'printf "[includeIf \"onbranch:[\377x]\"]\n\tpath = ./extra.cfg\n" > "$1"' _ $worktreeConfig
+        $saved = $env:LC_ALL
+        $env:LC_ALL = 'C.UTF-8'
+        try {
+            # The locale-sensitive regex the planner used before misses this key.
+            & git -C $fixture.Path config --file $worktreeConfig --name-only --get-regexp '^include(if\..*)?\.path$' | Out-Null
+            $LASTEXITCODE | Should -Not -Be 0 -Because 'the fixture must defeat --get-regexp'
+            $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+            $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'attach-raw-condition-tasks')
+            $plan.Action | Should -Be 'blocked'
+            $plan.Reason | Should -Be 'worktree-config-include'
+        }
+        finally { $env:LC_ALL = $saved }
     }
 
     It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
@@ -1814,6 +1848,51 @@ Describe 'branch.autoSetupMerge upstream preservation' {
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
         (& git -C $fixture.Path config --get branch.feature/FEATURE-123.merge) | Should -Be $nativeMerge
         (& git -C $fixture.Path config --get branch.feature/FEATURE-123.remote) | Should -Be 'origin'
+    }
+
+    It 'follows branch.autoSetupRebase like native tracking setup' {
+        foreach ($case in @(
+                @{ Rebase = 'remote'; Merge = 'true'; Base = 'origin/main' },
+                @{ Rebase = 'local'; Merge = 'always'; Base = 'base' },
+                @{ Rebase = 'always'; Merge = 'inherit'; Base = 'base' },
+                @{ Rebase = 'local'; Merge = 'true'; Base = 'origin/main' })) {
+            $caseRoot = New-AutoSetupCaseRoot
+            $fixture = New-AutoSetupFixture -Root $caseRoot
+            & git -C $fixture.Path branch base $fixture.Reviewed
+            & git -C $fixture.Path branch --set-upstream-to=origin/main base | Out-Null
+            & git -C $fixture.Path config branch.autoSetupMerge $case.Merge
+            & git -C $fixture.Path config branch.autoSetupRebase $case.Rebase
+            $startRef = if ($case.Base -eq 'base') { 'refs/heads/base' } else { "refs/remotes/$($case.Base)" }
+
+            $nativeDestination = Join-Path $caseRoot 'native'
+            & git -C $fixture.Path worktree add -q -b feature/NATIVE $nativeDestination $startRef | Out-Null
+            $nativeRebase = [string](& git -C $fixture.Path config --get branch.feature/NATIVE.rebase)
+            $nativeUpstream = ([string](& git -C $nativeDestination for-each-ref --format='%(upstream)' refs/heads/feature/NATIVE)).Trim()
+
+            $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = $case.Base; Branch = 'feature/FEATURE-123' }
+            $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
+            { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+            ([string](& git -C $plan.Destination for-each-ref --format='%(upstream)' refs/heads/feature/FEATURE-123)).Trim() | Should -Be $nativeUpstream -Because "$($case.Merge)/$($case.Rebase)"
+            [string](& git -C $fixture.Path config --get branch.feature/FEATURE-123.rebase) | Should -Be $nativeRebase -Because "$($case.Merge)/$($case.Rebase)"
+        }
+    }
+
+    It 'starts untracked from a symbolic base that resolves to a tag under always' {
+        $caseRoot = New-AutoSetupCaseRoot
+        $fixture = New-AutoSetupFixture -Root $caseRoot
+        & git -C $fixture.Path tag light $fixture.Reviewed
+        & git -C $fixture.Path symbolic-ref refs/heads/base refs/tags/light
+        & git -C $fixture.Path config branch.autoSetupMerge always
+
+        $nativeDestination = Join-Path $caseRoot 'native'
+        & git -C $fixture.Path worktree add -q -b feature/NATIVE $nativeDestination refs/heads/base | Out-Null
+        ([string](& git -C $nativeDestination for-each-ref --format='%(upstream)' refs/heads/feature/NATIVE)).Trim() | Should -Be '' -Because 'native Git does not track a tag'
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'base'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
+        $plan.UpstreamRef | Should -BeNullOrEmpty
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        ([string](& git -C $plan.Destination for-each-ref --format='%(upstream)' refs/heads/feature/FEATURE-123)).Trim() | Should -Be ''
     }
 
     It 'copies a local base upstream when branch.autoSetupMerge is inherit' {

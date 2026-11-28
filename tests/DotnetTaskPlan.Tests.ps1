@@ -546,6 +546,23 @@ Describe 'dotnet task plan' {
             }
         }
 
+        It 'blocks an attach plan whose includeIf condition has a byte invalid in the locale' -Skip:(-not $IsLinux) {
+            $repositoryPath = New-TestRepository -Name 'api-raw-condition'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            $worktreeConfig = (& git -C $repositoryPath rev-parse --path-format=absolute --git-path config.worktree).Trim()
+            & bash -c 'printf "[includeIf \"onbranch:[\377x]\"]\n\tpath = ./plan-extra.cfg\n" > "$1"' _ $worktreeConfig
+            $tasksRoot = Join-Path $TestDrive 'tasks-raw-condition'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-raw-condition.json') -Request $request
+            $saved = $env:LC_ALL
+            $env:LC_ALL = 'C.UTF-8'
+            try {
+                $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'raw condition attach plan'
+            }
+            finally { $env:LC_ALL = $saved }
+            $result.plan.worktreeOperations[0].reason | Should -Be 'worktree-config-include'
+        }
+
         It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
             $repositoryPath = New-TestRepository -Name "api-newline`npath"
             & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
