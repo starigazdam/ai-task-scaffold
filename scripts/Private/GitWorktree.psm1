@@ -304,41 +304,27 @@ function Get-TaskWorktreeConfigPath {
     return ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
 }
 
-function Get-TaskWorktreeConfigRelativeInclude {
+function Get-TaskWorktreeConfigInclude {
     param([string]$RepositoryPath)
 
     # `git worktree add` copies the source worktree's config.worktree into the
-    # new worktree as text but not the files its relative include.path entries
-    # point at, so the destination can resolve a different or no upstream. Only
-    # direct include.path entries in that file are inspected: includes are not
-    # resolved. Without extensions.worktreeConfig Git copies no worktree config
-    # and the file is ignored, so only an enabled extension is inspected.
-    $enabled = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--type=bool', '--get', 'extensions.worktreeConfig')
-    if ($enabled.ExitCode -eq 1) { return $null }
-    if ($enabled.ExitCode -ne 0) {
-        throw "cannot read extensions.worktreeConfig for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $enabled.Text)"
-    }
-    if ((([string](@($enabled.Output -split "`r?`n") | Select-Object -First 1)).Trim()).ToLowerInvariant() -cne 'true') { return $null }
-
-    # include.path and includeIf.<condition>.path both resolve a relative path
-    # against the including file. --null keeps a condition with spaces intact:
-    # each record is "key<LF>value<NUL>".
-    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--worktree', '--null', '--get-regexp', '^include(if\..+)?\.path$')
+    # new worktree. Any include in that file can resolve differently there: a
+    # relative path resolves against the new file, and an includeIf condition
+    # (onbranch, gitdir) sees the new worktree. The planner does not emulate
+    # Git's include resolution: it scans the file Git copies and reports the
+    # first include key. The file is scanned whatever extensions.worktreeConfig
+    # says, so a stale file blocks too; that is a conservative refusal.
+    $path = Get-TaskWorktreeConfigPath -RepositoryPath $RepositoryPath
+    if (-not $path) { throw "cannot resolve the worktree config path for '$RepositoryPath'" }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--file', $path, '--null', '--name-only', '--get-regexp', '^include(if\..+)?\.path$')
     if ($result.ExitCode -eq 1) { return $null }
     if ($result.ExitCode -ne 0) {
-        throw "cannot read the worktree config includes for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
+        throw "cannot read the worktree config includes in '$path': $(Get-TaskGitDiagnostic -Text $result.Text)"
     }
-    foreach ($record in @($result.Output -split "`0")) {
-        $separator = $record.IndexOf("`n")
-        if ($separator -lt 0) { continue }
-        $value = $record.Substring($separator + 1).Trim()
-        if (-not $value) { continue }
-        # Git expands ~ against the home directory independently of the config
-        # file's location, so such an include keeps the same target.
-        if ($value -ceq '~' -or $value -cmatch '^~[\\/]') { continue }
-        if (-not [IO.Path]::IsPathFullyQualified($value)) { return $value }
-    }
-    return $null
+    $key = @($result.Output -split "`0" | Where-Object { $_ }) | Select-Object -First 1
+    if (-not $key) { return $null }
+    return [pscustomobject]@{ Path = $path; Key = $key }
 }
 
 function New-TaskWorktreeAttachBlock {
@@ -350,18 +336,17 @@ function New-TaskWorktreeAttachBlock {
         [Parameter(Mandatory)][string]$TasksRoot
     )
 
-    $relativeInclude = Get-TaskWorktreeConfigRelativeInclude -RepositoryPath $RepositoryPath
-    if (-not $relativeInclude) { return $null }
-    $worktreeConfig = Get-TaskWorktreeConfigPath -RepositoryPath $RepositoryPath
+    $include = Get-TaskWorktreeConfigInclude -RepositoryPath $RepositoryPath
+    if (-not $include) { return $null }
     return [pscustomobject]@{
         Action = 'blocked'
         Destination = $Destination
-        Reason = 'worktree-config-relative-include'
+        Reason = 'worktree-config-include'
         Repository = $Repository.Name
         SourceCommit = $null
         TaskKey = $TaskKey
         TasksRoot = $TasksRoot
-        Message = "the worktree config '$worktreeConfig' includes '$relativeInclude' by a relative path; git worktree add copies that file into the new worktree without the included file, so the destination may resolve a different or no upstream; make the include path absolute, or remove it"
+        Message = "the worktree config '$($include.Path)' has '$($include.Key)'; git worktree add copies that file into the new worktree, where the include can resolve differently, so the inherited upstream cannot be verified before attach; move it to the shared repository config as an unconditional include, or remove it"
     }
 }
 

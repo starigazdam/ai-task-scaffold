@@ -881,10 +881,10 @@ Describe 'Worktree reuse verification and repair' {
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
         $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $plan.Action | Should -Be 'blocked'
-        $plan.Reason | Should -Be 'worktree-config-relative-include'
+        $plan.Reason | Should -Be 'worktree-config-include'
         $plan.Destination | Should -Be (Join-Path $tasksRoot (Join-Path 'FEATURE-123/worktrees' 'api'))
         $plan.Message | Should -Match ([regex]::Escape($worktreeConfig)) -Because 'the diagnostic must name the worktree config file'
-        $plan.Message | Should -Match 'absolute' -Because 'the diagnostic must name the fix'
+        $plan.Message | Should -Match 'shared repository config' -Because 'the diagnostic must name the fix'
         Test-Path -LiteralPath $plan.Destination | Should -BeFalse
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw "*$($plan.Reason)*"
         Test-Path -LiteralPath $plan.Destination | Should -BeFalse -Because 'a blocked plan must create no worktree'
@@ -901,19 +901,34 @@ Describe 'Worktree reuse verification and repair' {
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
         $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
         $plan.Action | Should -Be 'blocked'
-        $plan.Reason | Should -Be 'worktree-config-relative-include'
-        $plan.Message | Should -Match ([regex]::Escape('./attach-extra.cfg'))
+        $plan.Reason | Should -Be 'worktree-config-include'
+        $plan.Message | Should -Match ([regex]::Escape('includeif.onbranch:no such/x.path'))
     }
 
-    It 'plans and attaches when the source worktree config includes an absolute file' {
+    It 'blocks an attach plan whose source worktree config includes an absolute file' {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-absolute-include') -RemotePath (Join-Path $TestDrive 'attach-absolute-include.git')
         $tasksRoot = Join-Path $TestDrive 'attach-absolute-include-tasks'
         & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        # The planner does not classify include paths. Any include in the
+        # copied file blocks, even with the extension off (a stale file).
+        & git -C $fixture.Path config --file (& git -C $fixture.Path rev-parse --path-format=absolute --git-path config.worktree).Trim() include.path (Join-Path $TestDrive 'attach-absolute-extra.cfg')
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'worktree-config-include'
+    }
+
+    It 'plans and attaches when the upstream comes from an include in the shared config' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-shared-include') -RemotePath (Join-Path $TestDrive 'attach-shared-include.git')
+        $tasksRoot = Join-Path $TestDrive 'attach-shared-include-tasks'
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
         & git -C $fixture.Path config extensions.worktreeConfig true
-        # An absolute include keeps the same target in the copied worktree config.
-        $includedPath = Join-Path $TestDrive 'attach-absolute-extra.cfg'
-        Set-Content -LiteralPath $includedPath -Value "[branch `"$($fixture.Branch)`"]`n`tremote = origin`n`tmerge = refs/heads/main"
-        & git -C $fixture.Path config --worktree include.path $includedPath
+        # A shared-config include resolves against the common config file, so
+        # every worktree reads the same file.
+        $commonDir = (& git -C $fixture.Path rev-parse --path-format=absolute --git-common-dir).Trim()
+        Set-Content -LiteralPath (Join-Path $commonDir 'shared-extra.cfg') -Value "[branch `"$($fixture.Branch)`"]`n`tremote = origin`n`tmerge = refs/heads/main"
+        & git -C $fixture.Path config include.path ./shared-extra.cfg
         (& git -C $fixture.Path for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
 
         $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }

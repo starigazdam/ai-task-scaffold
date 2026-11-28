@@ -661,15 +661,14 @@ public static class TaskPlanner
         if (string.Equals(branchMode, "existing", StringComparison.Ordinal))
         {
             // Attach verifies the upstream the new worktree inherits, and Git
-            // copies the source worktree config as text only. A relative
-            // include.path therefore resolves elsewhere (or nowhere) at the
-            // destination, so block before any worktree exists.
-            var relativeInclude = GetWorktreeConfigRelativeInclude(repository.Path);
-            if (relativeInclude is not null)
+            // copies the source worktree config into it. An include in that
+            // file can resolve differently at the destination, so block
+            // before any worktree exists.
+            var include = GetWorktreeConfigInclude(repository.Path);
+            if (include is { } found)
             {
-                var worktreeConfig = GetWorktreeConfigPath(repository.Path);
-                var message = $"the worktree config '{worktreeConfig}' includes '{relativeInclude}' by a relative path; git worktree add copies that file into the new worktree without the included file, so the destination may resolve a different or no upstream; make the include path absolute, or remove it";
-                return Blocked(repository, destination, "worktree-config-relative-include", commonDir, head, message);
+                var message = $"the worktree config '{found.Path}' has '{found.Key}'; git worktree add copies that file into the new worktree, where the include can resolve differently, so the inherited upstream cannot be verified before attach; move it to the shared repository config as an unconditional include, or remove it";
+                return Blocked(repository, destination, "worktree-config-include", commonDir, head, message);
             }
         }
 
@@ -790,34 +789,23 @@ public static class TaskPlanner
         return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
     }
 
-    private static string? GetWorktreeConfigRelativeInclude(string repositoryPath)
+    private static (string Path, string Key)? GetWorktreeConfigInclude(string repositoryPath)
     {
-        // `git worktree add` copies the source worktree's config.worktree as
-        // text but not the files its relative include.path entries point at, so
-        // the destination can resolve a different or no upstream. Only direct
-        // include.path entries in that file are inspected: includes are not
-        // resolved. Without extensions.worktreeConfig Git copies no worktree
-        // config and the file is ignored.
-        var enabled = RunGit(repositoryPath, "config", "--type=bool", "--get", "extensions.worktreeConfig");
-        if (enabled.ExitCode == 1)
+        // `git worktree add` copies the source worktree's config.worktree into
+        // the new worktree. Any include in that file can resolve differently
+        // there: a relative path resolves against the new file, and an
+        // includeIf condition sees the new worktree. Do not emulate Git's
+        // include resolution: scan the file Git copies and report the first
+        // include key. A stale file blocks too, whatever
+        // extensions.worktreeConfig says; that is a conservative refusal.
+        var path = GetWorktreeConfigPath(repositoryPath)
+            ?? throw new OperationalException($"cannot resolve the worktree config path for '{repositoryPath}'");
+        if (!File.Exists(path))
         {
             return null;
         }
 
-        if (enabled.ExitCode != 0)
-        {
-            throw new OperationalException($"cannot read extensions.worktreeConfig for '{repositoryPath}': {FirstLine(enabled.StdErr)}");
-        }
-
-        if (!FirstLine(enabled.StdOut).Equals("true", StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-
-        // include.path and includeIf.<condition>.path both resolve a relative
-        // path against the including file. --null keeps a condition with spaces
-        // intact: each record is "key<LF>value<NUL>".
-        var includes = RunGit(repositoryPath, "config", "--worktree", "--null", "--get-regexp", @"^include(if\..+)?\.path$");
+        var includes = RunGit(repositoryPath, "config", "--file", path, "--null", "--name-only", "--get-regexp", @"^include(if\..+)?\.path$");
         if (includes.ExitCode == 1)
         {
             return null;
@@ -825,42 +813,11 @@ public static class TaskPlanner
 
         if (includes.ExitCode != 0)
         {
-            throw new OperationalException($"cannot read the worktree config includes for '{repositoryPath}': {FirstLine(includes.StdErr)}");
+            throw new OperationalException($"cannot read the worktree config includes in '{path}': {FirstLine(includes.StdErr)}");
         }
 
-        foreach (var record in includes.StdOut.Split('\0'))
-        {
-            var separator = record.IndexOf('\n');
-            if (separator < 0)
-            {
-                continue;
-            }
-
-            var value = record[(separator + 1)..].Trim();
-            if (value.Length == 0)
-            {
-                continue;
-            }
-
-            if (IsRelativeIncludePath(value))
-            {
-                return value;
-            }
-        }
-
-        return null;
-    }
-
-    private static bool IsRelativeIncludePath(string value)
-    {
-        // Git expands ~ against the home directory independently of the config
-        // file's location, so such an include keeps the same target.
-        if (value == "~" || value.StartsWith("~/", StringComparison.Ordinal) || value.StartsWith("~\\", StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        return !Path.IsPathFullyQualified(value);
+        var key = includes.StdOut.Split('\0', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        return key is null ? null : (path, key);
     }
 
     private static string? GetHead(string repositoryPath)

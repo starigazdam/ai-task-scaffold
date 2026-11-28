@@ -531,9 +531,9 @@ Describe 'dotnet task plan' {
             $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'relative include attach plan'
             $operation = $result.plan.worktreeOperations[0]
             $operation.action | Should -Be 'blocked'
-            $operation.reason | Should -Be 'worktree-config-relative-include'
+            $operation.reason | Should -Be 'worktree-config-include'
             $operation.message | Should -Match ([regex]::Escape($worktreeConfig)) -Because 'the diagnostic must name the worktree config file'
-            $operation.message | Should -Match 'absolute' -Because 'the diagnostic must name the fix'
+            $operation.message | Should -Match 'shared repository config' -Because 'the diagnostic must name the fix'
             Test-Path -LiteralPath $tasksRoot | Should -BeFalse -Because 'planning stays read-only'
         }
 
@@ -549,22 +549,32 @@ Describe 'dotnet task plan' {
             $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'relative includeIf attach plan'
             $operation = $result.plan.worktreeOperations[0]
             $operation.action | Should -Be 'blocked'
-            $operation.reason | Should -Be 'worktree-config-relative-include'
-            $operation.message | Should -Match ([regex]::Escape('./plan-extra.cfg'))
+            $operation.reason | Should -Be 'worktree-config-include'
+            $operation.message | Should -Match ([regex]::Escape('includeif.onbranch:no such/x.path'))
         }
 
-        It 'plans an attach when the source worktree config includes an absolute file' {
+        It 'blocks an attach plan whose source worktree config includes an absolute file' {
             $repositoryPath = New-TestRepository -Name 'api-absolute-include'
             & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
-            & git -C $repositoryPath config extensions.worktreeConfig true
-            $includedPath = Join-Path $TestDrive 'plan-absolute-extra.cfg'
-            Set-Content -LiteralPath $includedPath -Value "[branch `"feature/FEATURE-123`"]`n`tremote = origin`n`tmerge = refs/heads/main"
-            & git -C $repositoryPath config --worktree include.path $includedPath
+            & git -C $repositoryPath config --file (& git -C $repositoryPath rev-parse --path-format=absolute --git-path config.worktree).Trim() include.path (Join-Path $TestDrive 'plan-absolute-extra.cfg')
             $tasksRoot = Join-Path $TestDrive 'tasks-absolute-include'
             $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
             $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-absolute-include.json') -Request $request
 
             $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'absolute include attach plan'
+            $result.plan.worktreeOperations[0].reason | Should -Be 'worktree-config-include'
+        }
+
+        It 'plans an attach when the include is in the shared config' {
+            $repositoryPath = New-TestRepository -Name 'api-shared-include'
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            & git -C $repositoryPath config include.path ./shared-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-shared-include'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-shared-include.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'shared include attach plan'
             $operation = $result.plan.worktreeOperations[0]
             $operation.action | Should -Be 'create-local'
             $operation.branchMode | Should -Be 'existing'
