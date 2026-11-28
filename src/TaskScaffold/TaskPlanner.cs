@@ -786,7 +786,24 @@ public static class TaskPlanner
     private static string? GetWorktreeConfigPath(string repositoryPath)
     {
         var result = RunGit(repositoryPath, "rev-parse", "--path-format=absolute", "--git-path", "config.worktree");
-        return result.ExitCode == 0 ? FirstLine(result.StdOut) : null;
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
+        // Remove only Git's final line terminator: a path can contain a newline.
+        var path = result.StdOut;
+        if (path.EndsWith('\n'))
+        {
+            path = path[..^1];
+        }
+
+        if (path.EndsWith('\r'))
+        {
+            path = path[..^1];
+        }
+
+        return path;
     }
 
     private static (string Path, string Key)? GetWorktreeConfigInclude(string repositoryPath)

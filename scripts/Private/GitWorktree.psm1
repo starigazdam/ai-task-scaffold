@@ -301,7 +301,8 @@ function Get-TaskWorktreeConfigPath {
 
     $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--path-format=absolute', '--git-path', 'config.worktree')
     if ($result.ExitCode -ne 0) { return $null }
-    return ([string](@($result.Output -split "`r?`n") | Select-Object -First 1)).Trim()
+    # Remove only Git's final line terminator: a path can contain a newline.
+    return ([string]$result.Output) -replace '\r?\n\z', ''
 }
 
 function Get-TaskWorktreeConfigInclude {
@@ -834,10 +835,14 @@ function Invoke-TaskWorktreePlan {
 
     # A branch is always created at the immutable commit bound by the plan, never
     # at a ref name that can resolve to another ref or move before the git start.
+    # A bare object ID is not enough: worktree add resolves a branch literally
+    # named after the ID first. `<id>^{commit}` is a revision expression that
+    # names the object, and --no-track leaves tracking to the explicit upstream
+    # write below.
     $gitArguments =
-        if ($Plan.Action -eq 'create-remote') { @('worktree', 'add', '-b', $Repository.Branch, $Plan.Destination, $sourceCommit) }
+        if ($Plan.Action -eq 'create-remote') { @('worktree', 'add', '--no-track', '-b', $Repository.Branch, $Plan.Destination, "$sourceCommit^{commit}") }
         elseif ($Plan.BranchMode -eq 'existing') { @('worktree', 'add', $Plan.Destination, $Plan.Source) }
-        elseif ($Plan.Action -eq 'create-local') { @('worktree', 'add', '-b', $Repository.Branch, $Plan.Destination, $sourceCommit) }
+        elseif ($Plan.Action -eq 'create-local') { @('worktree', 'add', '--no-track', '-b', $Repository.Branch, $Plan.Destination, "$sourceCommit^{commit}") }
         else { throw "unsupported worktree action '$($Plan.Action)'" }
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $Plan.Destination) -Force | Out-Null

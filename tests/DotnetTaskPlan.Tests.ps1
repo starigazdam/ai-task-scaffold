@@ -514,6 +514,21 @@ Describe 'dotnet task plan' {
     }
 
     Context 'worktree config includes' {
+        It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
+            $repositoryPath = New-TestRepository -Name "api-newline`npath"
+            & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+            & git -C $repositoryPath config extensions.worktreeConfig true
+            & git -C $repositoryPath config --worktree include.path ./plan-extra.cfg
+            $tasksRoot = Join-Path $TestDrive 'tasks-newline'
+            $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-newline.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot) -Case 'newline path attach plan'
+            $operation = $result.plan.worktreeOperations[0]
+            $operation.action | Should -Be 'blocked'
+            $operation.reason | Should -Be 'worktree-config-include'
+        }
+
         It 'blocks an attach plan whose source worktree config includes a relative file' {
             $repositoryPath = New-TestRepository -Name 'api-relative-include'
             & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null

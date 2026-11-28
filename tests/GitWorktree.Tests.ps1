@@ -864,6 +864,37 @@ Describe 'Worktree reuse verification and repair' {
         (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be 'refs/remotes/origin/main'
     }
 
+    It 'creates the task branch at the reviewed commit when a branch is named after it' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'sha-named-branch') -RemotePath (Join-Path $TestDrive 'sha-named-branch.git')
+        $tasksRoot = Join-Path $TestDrive 'sha-named-branch-tasks'
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = 'feature/LOCAL-1' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-local'
+        $plan.SourceCommit | Should -Be $fixture.Head
+        # worktree add resolves a branch literally named after a bare object ID
+        # before the object itself.
+        $other = (& git -C $fixture.Path commit-tree "$($fixture.Head)^{tree}" -p $fixture.Head -m other).Trim()
+        & git -C $fixture.Path branch $fixture.Head $other 2>$null | Out-Null
+        (& git -C $fixture.Path rev-parse --verify --quiet "refs/heads/$($fixture.Head)").Trim() | Should -Be $other -Because 'the fixture must really hold the lookalike branch'
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+    }
+
+    It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive "attach-newline`npath") -RemotePath (Join-Path $TestDrive 'attach-newline.git')
+        $tasksRoot = Join-Path $TestDrive 'attach-newline-tasks'
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+        & git -C $fixture.Path config extensions.worktreeConfig true
+        & git -C $fixture.Path config --worktree include.path ./extra.cfg
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'blocked'
+        $plan.Reason | Should -Be 'worktree-config-include'
+        Test-Path -LiteralPath $plan.Destination | Should -BeFalse
+    }
+
     It 'blocks an attach plan whose source worktree config includes a relative file' {
         $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'attach-relative-include') -RemotePath (Join-Path $TestDrive 'attach-relative-include.git')
         $tasksRoot = Join-Path $TestDrive 'attach-relative-include-tasks'
