@@ -618,7 +618,7 @@ public static class TaskPlanner
         }
 
         var localBase = $"refs/heads/{repository.BaseBranch}";
-        var localBaseTip = ReadRefTip(repository.Path, localBase);
+        var localBaseTip = ReadRefTip(repository.Path, localBase, peel: true);
         if (localBaseTip.Exists)
         {
             if (localBaseTip.Commit is null)
@@ -631,7 +631,7 @@ public static class TaskPlanner
 
         var remoteBase = RemoteQualifiedPattern.IsMatch(repository.BaseBranch) ? repository.BaseBranch : $"origin/{repository.BaseBranch}";
         var remoteBaseRef = $"refs/remotes/{remoteBase}";
-        var remoteBaseTip = ReadRefTip(repository.Path, remoteBaseRef);
+        var remoteBaseTip = ReadRefTip(repository.Path, remoteBaseRef, peel: true);
         if (remoteBaseTip.Exists)
         {
             if (remoteBaseTip.Commit is null)
@@ -932,7 +932,7 @@ public static class TaskPlanner
         return current;
     }
 
-    private static (bool Exists, string? Commit) ReadRefTip(string repositoryPath, string reference)
+    private static (bool Exists, string? Commit) ReadRefTip(string repositoryPath, string reference, bool peel = false)
     {
         // Presence comes from exact name checks that never run revision DWIM:
         // show-ref --verify and symbolic-ref -q accept only the full name, so a
@@ -1004,7 +1004,15 @@ public static class TaskPlanner
         }
 
         var commit = FirstLine(verify.StdOut);
-        return (true, string.Equals(commit, objectId, StringComparison.Ordinal) ? objectId : null);
+        // A base ref may name an annotated tag (for example through a symbolic
+        // alias); native Git starts at the peeled commit. Other refs must name
+        // the commit itself.
+        if (string.Equals(commit, objectId, StringComparison.Ordinal) || (peel && ObjectIdPattern.IsMatch(commit)))
+        {
+            return (true, commit);
+        }
+
+        return (true, null);
     }
 
     private static bool HasUnsafePathComponent(string tasksRoot, string taskKey, string repositoryName)
@@ -1117,24 +1125,23 @@ public static class TaskPlanner
         }
         else
         {
-            var promisors = RunGitProcess(repositoryPath, false, "config", "--bool", "--get-regexp", @"^remote\..*\.promisor$");
+            // List every key and match in code: --get-regexp is locale-sensitive,
+            // and a remote name byte that is not valid in the locale hides the
+            // key. Each record is "key<LF>value<NUL>"; a key without a value is
+            // true.
+            var promisors = RunGitProcess(repositoryPath, false, "config", "--null", "--list");
             if (promisors.ExitCode == 0)
             {
-                foreach (var rawLine in promisors.StdOut.Split('\n'))
+                foreach (var record in promisors.StdOut.Split('\0', StringSplitOptions.RemoveEmptyEntries))
                 {
-                    var line = rawLine.Trim();
-                    if (line.Length == 0)
+                    var separator = record.IndexOf('\n');
+                    var key = separator < 0 ? record : record[..separator];
+                    if (!key.StartsWith("remote.", StringComparison.Ordinal) || !key.EndsWith(".promisor", StringComparison.Ordinal))
                     {
                         continue;
                     }
 
-                    var separator = line.IndexOfAny(new[] { ' ', '\t' });
-                    if (separator <= 0)
-                    {
-                        continue;
-                    }
-
-                    if (line[(separator + 1)..].Trim().Equals("true", StringComparison.Ordinal))
+                    if (separator < 0 || IsGitBoolTrue(record[(separator + 1)..]))
                     {
                         partial = true;
                         break;
@@ -1144,6 +1151,13 @@ public static class TaskPlanner
         }
 
         return partial;
+    }
+
+    private static bool IsGitBoolTrue(string value)
+    {
+        // Git's boolean true spellings, case-insensitive, and any nonzero integer.
+        var text = value.Trim().ToLowerInvariant();
+        return text is "true" or "yes" or "on" || (long.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var number) && number != 0);
     }
 
     private static (int ExitCode, string StdOut, string StdErr) RunGitProcess(string? repositoryPath, bool guardNoLazyFetch, params string[] arguments)

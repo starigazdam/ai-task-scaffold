@@ -43,7 +43,7 @@ function Get-GitCommitWithoutLazyFetch {
 }
 
 function Get-TaskGitRefCommit {
-    param([string]$RepositoryPath, [string]$Reference)
+    param([string]$RepositoryPath, [string]$Reference, [switch]$Peel)
 
     # Presence is decided by exact name checks that never run revision DWIM:
     # `show-ref --verify` and `symbolic-ref -q` accept only the full name, so a
@@ -94,7 +94,10 @@ function Get-TaskGitRefCommit {
     $commit = ([string](@($verify.Output -split "`r?`n") | Select-Object -First 1)).Trim()
     return [pscustomobject]@{
         Exists = $true
-        Commit = $(if ($commit -ceq $objectId) { $objectId } else { $null })
+        # A base ref may name an annotated tag (for example through a symbolic
+        # alias); native Git starts at the peeled commit. Other refs must name
+        # the commit itself.
+        Commit = $(if ($commit -ceq $objectId -or ($Peel -and $commit -cmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$')) { $commit } else { $null })
     }
 }
 
@@ -323,7 +326,10 @@ function Get-TaskUpstreamRebase {
         throw "cannot read branch.autoSetupRebase for '$RepositoryPath': $(Get-TaskGitDiagnostic -Text $result.Text)"
     }
     $mode = (([string]$result.Output) -replace '\r?\n\z', '')
-    $local = if ($UpstreamConfig) { [string]$UpstreamConfig.Remote -ceq '.' } else { $UpstreamRef.StartsWith('refs/heads/', [StringComparison]::Ordinal) }
+    # Git applies `local` only when tracking set no remote. An inherited
+    # configuration always carries a remote value, even `.`, so Git treats it
+    # as remote tracking.
+    $local = if ($UpstreamConfig) { $false } else { $UpstreamRef.StartsWith('refs/heads/', [StringComparison]::Ordinal) }
     if ($mode -ceq 'always') { return $true }
     if ($mode -ceq 'local') { return $local }
     if ($mode -ceq 'remote') { return -not $local }
@@ -583,7 +589,7 @@ function New-TaskWorktreePlan {
     }
 
     $localBaseRef = "refs/heads/$($Repository.BaseBranch)"
-    $localBaseSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $localBaseRef
+    $localBaseSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $localBaseRef -Peel
     if ($localBaseSnapshot.Exists) {
         if (-not $localBaseSnapshot.Commit) {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -597,7 +603,7 @@ function New-TaskWorktreePlan {
 
     $remoteBase = if ($Repository.BaseBranch -match '^[^/]+/.+') { $Repository.BaseBranch } else { "origin/$($Repository.BaseBranch)" }
     $remoteBaseRef = "refs/remotes/$remoteBase"
-    $remoteBaseSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $remoteBaseRef
+    $remoteBaseSnapshot = Get-TaskGitRefCommit -RepositoryPath $repositoryPath -Reference $remoteBaseRef -Peel
     if ($remoteBaseSnapshot.Exists) {
         if (-not $remoteBaseSnapshot.Commit) {
             return [pscustomobject]@{ Action = 'blocked'; Destination = $destination; Reason = 'base-branch-missing'; Repository = $Repository.Name; SourceCommit = $null; TaskKey = $TaskKey; TasksRoot = $TasksRoot }
@@ -682,16 +688,29 @@ function Test-TaskGitPartialClone {
     $extensions = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--get', 'extensions.partialClone')
     if ($extensions.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($extensions.Output)) { return $true }
 
-    $promisors = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--bool', '--get-regexp', '^remote\..*\.promisor$')
+    # List every key and match in code: --get-regexp is locale-sensitive, and a
+    # remote name byte that is not valid in the locale hides the key from it.
+    # Each record is "key<LF>value<NUL>"; a key without a value is true.
+    $promisors = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('config', '--null', '--list')
     if ($promisors.ExitCode -ne 0) { return $false }
-    foreach ($line in @($promisors.Output -split "`r?`n")) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $separator = $line.IndexOfAny([char[]]@(' ', "`t"))
-        if ($separator -le 0) { continue }
-        $value = $line.Substring($separator + 1).Trim()
-        if ($value -ceq 'true') { return $true }
+    foreach ($record in @($promisors.Output -split "`0")) {
+        $separator = $record.IndexOf("`n")
+        $key = if ($separator -lt 0) { $record } else { $record.Substring(0, $separator) }
+        if (-not ($key.StartsWith('remote.', [StringComparison]::Ordinal) -and $key.EndsWith('.promisor', [StringComparison]::Ordinal))) { continue }
+        if ($separator -lt 0) { return $true }
+        if (Test-TaskGitBoolTrue -Value $record.Substring($separator + 1)) { return $true }
     }
     return $false
+}
+
+function Test-TaskGitBoolTrue {
+    param([string]$Value)
+
+    # Git's boolean true spellings, case-insensitive, and any nonzero integer.
+    $text = $Value.Trim().ToLowerInvariant()
+    if ($text -in @('true', 'yes', 'on')) { return $true }
+    $number = 0L
+    return [long]::TryParse($text, [ref]$number) -and $number -ne 0
 }
 
 function Assert-TaskNoLazyFetchAllowed {

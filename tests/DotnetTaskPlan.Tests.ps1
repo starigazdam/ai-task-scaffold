@@ -563,6 +563,18 @@ Describe 'dotnet task plan' {
             $result.plan.worktreeOperations[0].reason | Should -Be 'worktree-config-include'
         }
 
+        It 'plans a symbolic base that resolves to an annotated tag at the peeled commit' {
+            $repositoryPath = New-TestRepository -Name 'api-annotated-base'
+            $head = (& git -C $repositoryPath rev-parse HEAD).Trim()
+            & git -C $repositoryPath tag -a annotated -m annotated $head
+            & git -C $repositoryPath symbolic-ref refs/heads/base refs/tags/annotated
+            $request = New-TaskPlanRequest -BaseBranch 'base' -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+            $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-annotated-base.json') -Request $request
+
+            $result = Assert-TaskPlanSuccess -Run (Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'tasks-annotated-base')) -Case 'annotated tag base plan'
+            $result.plan.worktreeOperations[0].action | Should -Be 'create-local'
+        }
+
         It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
             $repositoryPath = New-TestRepository -Name "api-newline`npath"
             & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
@@ -711,6 +723,26 @@ Describe 'dotnet task plan ref resolution and Git capability' {
         $run.ExitCode | Should -Be 1
         $run.StdErr | Should -Match 'partial clone'
         $run.StdErr | Should -Match '--no-lazy-fetch'
+    }
+
+    It 'fails closed on a promisor remote whose name is invalid in the locale when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = New-TestRepository -Name 'cli-raw-promisor'
+        & bash -c 'printf "[remote \"o\377x\"]\n\tpromisor = true\n" >> "$1/.git/config"' _ $repositoryPath
+        $shimDir = New-OldGitShimDirectory -Path (Join-Path $TestDrive 'cli-shim-raw-promisor')
+        $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+        $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'cli-raw-promisor.json') -Request $request
+
+        $savedPath = $env:PATH
+        $savedLocale = $env:LC_ALL
+        $env:PATH = "$($shimDir):$savedPath"
+        $env:LC_ALL = 'C.UTF-8'
+        try {
+            $run = Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot (Join-Path $TestDrive 'cli-tasks-raw-promisor')
+        }
+        finally { $env:PATH = $savedPath; $env:LC_ALL = $savedLocale }
+
+        $run.ExitCode | Should -Be 1
+        $run.StdErr | Should -Match 'partial clone'
     }
 
     It 'still plans a full clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {

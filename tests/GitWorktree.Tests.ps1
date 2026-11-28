@@ -1855,11 +1855,16 @@ Describe 'branch.autoSetupMerge upstream preservation' {
                 @{ Rebase = 'remote'; Merge = 'true'; Base = 'origin/main' },
                 @{ Rebase = 'local'; Merge = 'always'; Base = 'base' },
                 @{ Rebase = 'always'; Merge = 'inherit'; Base = 'base' },
-                @{ Rebase = 'local'; Merge = 'true'; Base = 'origin/main' })) {
+                @{ Rebase = 'local'; Merge = 'true'; Base = 'origin/main' },
+                @{ Rebase = 'remote'; Merge = 'inherit'; Base = 'base'; Upstream = 'trunk' },
+                @{ Rebase = 'local'; Merge = 'inherit'; Base = 'base'; Upstream = 'trunk' })) {
             $caseRoot = New-AutoSetupCaseRoot
             $fixture = New-AutoSetupFixture -Root $caseRoot
             & git -C $fixture.Path branch base $fixture.Reviewed
-            & git -C $fixture.Path branch --set-upstream-to=origin/main base | Out-Null
+            # The fixture has no local main; a local upstream needs its own branch.
+            if ($case.Upstream) { & git -C $fixture.Path branch $case.Upstream $fixture.Reviewed }
+            $baseUpstream = if ($case.Upstream) { "refs/heads/$($case.Upstream)" } else { 'origin/main' }
+            & git -C $fixture.Path branch --set-upstream-to=$baseUpstream base | Out-Null
             & git -C $fixture.Path config branch.autoSetupMerge $case.Merge
             & git -C $fixture.Path config branch.autoSetupRebase $case.Rebase
             $startRef = if ($case.Base -eq 'base') { 'refs/heads/base' } else { "refs/remotes/$($case.Base)" }
@@ -1892,6 +1897,27 @@ Describe 'branch.autoSetupMerge upstream preservation' {
         $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
         $plan.UpstreamRef | Should -BeNullOrEmpty
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        ([string](& git -C $plan.Destination for-each-ref --format='%(upstream)' refs/heads/feature/FEATURE-123)).Trim() | Should -Be ''
+    }
+
+    It 'starts at the peeled commit of a symbolic base that resolves to an annotated tag' {
+        $caseRoot = New-AutoSetupCaseRoot
+        $fixture = New-AutoSetupFixture -Root $caseRoot
+        & git -C $fixture.Path tag -a annotated -m annotated $fixture.Reviewed
+        & git -C $fixture.Path symbolic-ref refs/heads/base refs/tags/annotated
+        & git -C $fixture.Path config branch.autoSetupMerge always
+
+        $nativeDestination = Join-Path $caseRoot 'native'
+        & git -C $fixture.Path worktree add -q -b feature/NATIVE $nativeDestination refs/heads/base | Out-Null
+        (& git -C $nativeDestination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
+        ([string](& git -C $nativeDestination for-each-ref --format='%(upstream)' refs/heads/feature/NATIVE)).Trim() | Should -Be ''
+
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'base'; Branch = 'feature/FEATURE-123' }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $caseRoot 'tasks')
+        $plan.Action | Should -Be 'create-local'
+        $plan.SourceCommit | Should -Be $fixture.Reviewed
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Reviewed
         ([string](& git -C $plan.Destination for-each-ref --format='%(upstream)' refs/heads/feature/FEATURE-123)).Trim() | Should -Be ''
     }
 
@@ -2161,6 +2187,27 @@ Describe 'No-lazy-fetch capability' {
                 Should -Throw '*partial clone*--no-lazy-fetch*'
         }
         finally { $env:PATH = $savedPath }
+    }
+
+    It 'fails closed on a promisor remote whose name is invalid in the locale when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
+        $repositoryPath = Join-Path $TestDrive 'capability-raw-promisor'
+        New-CapabilitySourceRepository -Path $repositoryPath
+        & bash -c 'printf "[remote \"o\377x\"]\n\tpromisor = true\n" >> "$1/.git/config"' _ $repositoryPath
+        $shimDir = Join-Path $TestDrive 'capability-shim-raw-promisor'
+        New-OldGitShim -Directory $shimDir | Out-Null
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $repositoryPath; BaseBranch = 'main'; Branch = 'feature/FEATURE-123' }
+
+        $savedPath = $env:PATH
+        $savedLocale = $env:LC_ALL
+        $env:PATH = "$($shimDir):$savedPath"
+        $env:LC_ALL = 'C.UTF-8'
+        try {
+            & git -C $repositoryPath config --bool --get-regexp '^remote\..*\.promisor$' | Out-Null
+            $LASTEXITCODE | Should -Not -Be 0 -Because 'the fixture must defeat --get-regexp'
+            { New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'capability-raw-promisor-tasks') } |
+                Should -Throw '*partial clone*--no-lazy-fetch*'
+        }
+        finally { $env:PATH = $savedPath; $env:LC_ALL = $savedLocale }
     }
 
     It 'still plans a full clone when Git ignores --no-lazy-fetch' -Skip:(-not $IsLinux) {
