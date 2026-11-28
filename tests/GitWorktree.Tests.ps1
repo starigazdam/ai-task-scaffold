@@ -759,7 +759,7 @@ Describe 'Worktree reuse verification and repair' {
                 '        ;;'
                 '    esac'
                 '    ;;'
-                '  *" branch --set-upstream-to="*)'
+                '  *" config branch."*)'
                 '    "$REAL_GIT" "$@"; CODE=$?'
                 '    if [ "$MODE" = "tip" ]; then'
                 '      "$REAL_GIT" -C "$REPO" update-ref "refs/heads/$BRANCH" "$OTHER"'
@@ -879,6 +879,38 @@ Describe 'Worktree reuse verification and repair' {
 
         { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head
+    }
+
+    It 'sets the planned upstream when a tag is spelled like the remote ref' {
+        $fixture = New-TrackingRepository -Path (Join-Path $TestDrive 'tag-lookalike-upstream') -RemotePath (Join-Path $TestDrive 'tag-lookalike-upstream.git')
+        $tasksRoot = Join-Path $TestDrive 'tag-lookalike-upstream-tasks'
+        $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+        $plan = New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot $tasksRoot
+        $plan.Action | Should -Be 'create-remote'
+        # `git branch --set-upstream-to` reads this full name as ambiguous.
+        & git -C $fixture.Path tag "refs/remotes/origin/$($fixture.Branch)" $fixture.Head | Out-Null
+        & git -C $fixture.Path show-ref --verify --quiet "refs/tags/refs/remotes/origin/$($fixture.Branch)"
+        $LASTEXITCODE | Should -Be 0 -Because 'the fixture must really hold the lookalike tag'
+
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Not -Throw
+        (& git -C $plan.Destination for-each-ref --format='%(upstream)' "refs/heads/$($fixture.Branch)").Trim() | Should -Be "refs/remotes/origin/$($fixture.Branch)"
+    }
+
+    It 'refuses to plan an attach when the worktree config path is not UTF-8' -Skip:(-not $IsLinux) {
+        $raw = Join-Path $TestDrive 'raw-parent'
+        New-Item -ItemType Directory -Path $raw -Force | Out-Null
+        & bash -c 'cd "$1" && mkdir "$(printf "x\377y")" && ln -s "$(printf "x\377y")" valid-link' _ $raw
+        $fixture = New-TrackingRepository -Path (Join-Path $raw 'valid-link/api') -RemotePath (Join-Path $TestDrive 'raw-api.git')
+        & git -C $fixture.Path branch --no-track $fixture.Branch $fixture.Head | Out-Null
+
+        try {
+            $repository = [pscustomobject]@{ Name = 'api'; Path = $fixture.Path; BaseBranch = 'main'; Branch = $fixture.Branch }
+            { New-TaskWorktreePlan -Repository $repository -TaskKey 'FEATURE-123' -TasksRoot (Join-Path $TestDrive 'raw-tasks') } | Should -Throw '*not valid UTF-8*'
+        }
+        finally {
+            # Pester cannot delete a TestDrive entry whose name is not UTF-8.
+            & bash -c 'rm -rf "$1"' _ $raw
+        }
     }
 
     It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
@@ -1363,7 +1395,7 @@ Describe 'Worktree reuse verification and repair' {
         # The remote ref is pruned between planning and the upstream step.
         & git -C $fixture.Path update-ref -d "refs/remotes/origin/$($fixture.Branch)"
 
-        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*set-upstream-to failed*'
+        { Invoke-TaskWorktreePlan -Repository $repository -Plan $plan } | Should -Throw '*does not exist*'
         Test-Path -LiteralPath $plan.Destination -PathType Container | Should -BeTrue
         (& git -C $plan.Destination symbolic-ref -q --no-recurse HEAD) | Should -Be "refs/heads/$($fixture.Branch)"
         (& git -C $plan.Destination rev-parse HEAD).Trim() | Should -Be $fixture.Head

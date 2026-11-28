@@ -302,7 +302,14 @@ function Get-TaskWorktreeConfigPath {
     $result = Invoke-TaskWorktreeGitCommand -RepositoryPath $RepositoryPath -Arguments @('rev-parse', '--path-format=absolute', '--git-path', 'config.worktree')
     if ($result.ExitCode -ne 0) { return $null }
     # Remove only Git's final line terminator: a path can contain a newline.
-    return ([string]$result.Output) -replace '\r?\n\z', ''
+    $path = ([string]$result.Output) -replace '\r?\n\z', ''
+    # Output is decoded as UTF-8. A path byte that is not UTF-8 decodes to
+    # U+FFFD and cannot be opened again, so fail closed instead of reading it
+    # as absent.
+    if ($path.Contains([char]0xFFFD)) {
+        throw "cannot read the worktree config path for '$RepositoryPath': Git returned a path that is not valid UTF-8"
+    }
+    return $path
 }
 
 function Get-TaskWorktreeConfigInclude {
@@ -759,11 +766,33 @@ function Assert-TaskWorktreeBranchState {
     if ($guard) {
         throw "branch '$Branch' for '$RepositoryName' acquired upstream '$guard' while apply was preparing to set '$UpstreamRef'; replan and approve again"
     }
-    $setResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('branch', "--set-upstream-to=$UpstreamRef", $Branch)
-    if ($setResult.ExitCode -ne 0) {
-        $detail = Get-TaskGitDiagnostic -Text $setResult.Text
-        if ($detail) { throw "git branch --set-upstream-to failed for '$RepositoryName': $detail" }
-        throw "git branch --set-upstream-to failed for '$RepositoryName'"
+    # `git branch --set-upstream-to` resolves its argument with ref DWIM, so a
+    # tag spelled like the full remote ref makes it ambiguous. Check the exact
+    # ref, then write branch.<name>.remote/merge directly under the default
+    # fetch mapping; the post-write verification proves the mapping (#29).
+    $exists = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('show-ref', '--verify', '--quiet', $UpstreamRef)
+    if ($exists.ExitCode -ne 0) {
+        throw "cannot set upstream for '$RepositoryName': the planned upstream '$UpstreamRef' does not exist; replan and approve again"
+    }
+    if ($UpstreamRef.StartsWith('refs/heads/', [StringComparison]::Ordinal)) {
+        $remote = '.'
+        $merge = $UpstreamRef
+    }
+    else {
+        $remotes = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('remote')
+        $matching = @(@($remotes.Output -split "`r?`n") | Where-Object { $_ -and $UpstreamRef.StartsWith("refs/remotes/$_/", [StringComparison]::Ordinal) })
+        if ($remotes.ExitCode -ne 0 -or $matching.Count -ne 1) {
+            throw "cannot set upstream for '$RepositoryName': no single remote maps to '$UpstreamRef'; replan and approve again"
+        }
+        $remote = $matching[0]
+        $merge = 'refs/heads/' + $UpstreamRef.Substring("refs/remotes/$remote/".Length)
+    }
+    foreach ($entry in @(@('remote', $remote), @('merge', $merge))) {
+        $setResult = Invoke-TaskWorktreeGitCommand -RepositoryPath $WorktreePath -Arguments @('config', "branch.$Branch.$($entry[0])", $entry[1])
+        if ($setResult.ExitCode -ne 0) {
+            $detail = Get-TaskGitDiagnostic -Text $setResult.Text
+            throw "cannot set upstream for '$RepositoryName': git config branch.$Branch.$($entry[0]) failed: $detail"
+        }
     }
 
     # Re-verify the tip, immediate HEAD target and upstream after the write; the

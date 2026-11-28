@@ -803,6 +803,14 @@ public static class TaskPlanner
             path = path[..^1];
         }
 
+        // Output is decoded as UTF-8. A path byte that is not UTF-8 decodes to
+        // U+FFFD and cannot be opened again, so fail closed instead of reading
+        // it as absent.
+        if (path.Contains('\uFFFD'))
+        {
+            throw new OperationalException($"cannot read the worktree config path for '{repositoryPath}': Git returned a path that is not valid UTF-8");
+        }
+
         return path;
     }
 

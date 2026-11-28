@@ -514,6 +514,27 @@ Describe 'dotnet task plan' {
     }
 
     Context 'worktree config includes' {
+        It 'refuses to plan an attach when the worktree config path is not UTF-8' -Skip:(-not $IsLinux) {
+            $raw = Join-Path $TestDrive 'raw-parent'
+            New-Item -ItemType Directory -Path $raw -Force | Out-Null
+            & bash -c 'cd "$1" && mkdir "$(printf "x\377y")" && ln -s "$(printf "x\377y")" valid-link' _ $raw
+            try {
+                $repositoryPath = New-TestRepository -Name 'api' -Root (Join-Path $raw 'valid-link')
+                & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
+                $tasksRoot = Join-Path $TestDrive 'tasks-raw'
+                $request = New-TaskPlanRequest -Repositories @([pscustomobject]@{ Name = 'api'; Path = $repositoryPath })
+                $requestPath = Write-TaskPlanRequest -Path (Join-Path $TestDrive 'task-request-raw.json') -Request $request
+
+                $run = Invoke-TaskPlanCli -RequestPath $requestPath -TasksRoot $tasksRoot
+                $run.ExitCode | Should -Not -Be 0
+                $run.StdErr | Should -Match 'not valid UTF-8'
+            }
+            finally {
+                # Pester cannot delete a TestDrive entry whose name is not UTF-8.
+                & bash -c 'rm -rf "$1"' _ $raw
+            }
+        }
+
         It 'blocks an attach plan when the source path contains a newline' -Skip:(-not $IsLinux) {
             $repositoryPath = New-TestRepository -Name "api-newline`npath"
             & git -C $repositoryPath branch feature/FEATURE-123 main | Out-Null
